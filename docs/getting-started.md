@@ -120,6 +120,21 @@ try app.use(&poweredBy);
 
 Return a response *without* calling `next` to short-circuit (e.g. auth → 401).
 
+### Errors
+
+Return a canonical error to produce a status, or let an extractor failure map
+itself:
+
+```zig
+fn getUser(s: zax.State(*const Store), p: zax.Path(struct { id: u64 })) !zax.Response {
+    if (p.value.id == 0) return error.NotFound; // -> 404
+    return zax.Response.text("found\n");
+}
+```
+
+A bad `:id` (non-numeric) is a `400`, a malformed `Json` body a `422`. Customize
+error bodies with `app.onError(&renderFn)`.
+
 ## 5. Validate
 
 **Unit-test handlers without a server.** Each extractor is a struct with a public

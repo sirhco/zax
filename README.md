@@ -120,6 +120,39 @@ curl localhost:8080/users/42                      # user 42
 curl -X POST localhost:8080/users -d '{"name":"ada"}'   # zax-demo: created user ada
 ```
 
+## Error handling
+
+Extractor failures and handler errors map to real HTTP statuses (not a blanket
+500). Handlers raise typed statuses with the canonical `zax.Error` set:
+
+```zig
+fn getUser(s: zax.State(*const Db), p: zax.Path(struct { id: u64 })) !zax.Response {
+    const user = s.value.lookup(p.value.id) orelse return error.NotFound; // -> 404
+    return zax.Response.text(user.name);
+}
+```
+
+A non-numeric `:id` becomes `400`, a malformed `Json` body `422`, `error.Conflict`
+`409`, and any unrecognized error `500`. Customize rendering (e.g. JSON bodies)
+with one hook:
+
+```zig
+fn renderError(e: anyerror, info: zax.ErrorInfo, ctx: *const Api.Context) zax.Response {
+    _ = e;
+    const body = std.fmt.allocPrint(ctx.arena, "{{\"error\":\"{s}\"}}", .{info.reason}) catch
+        return zax.Response.fromStatus(info.status);
+    var r = zax.Response.jsonRaw(body);
+    r.status = info.status;
+    return r;
+}
+
+app.onError(&renderError); // applies to extractor, handler, 404, and 405 responses
+```
+
+Note: classification keys off the error value, so handlers should use the
+canonical `zax.Error` set; an unrecognized error is treated as `500`, and
+`on_error` can re-classify by inspecting the raw error.
+
 ## Performance
 
 Zax aims for low per-request overhead, but treat that as a design goal backed by
@@ -152,7 +185,7 @@ keep-alive, middleware, graceful drain, and HTTPS via reverse-proxy termination
 (forwarded-header trust).
 
 **Not yet built:** in-process TLS (blocked on std — use a proxy), `Headers`/
-`Form`/`Cookie` extractors, a full rejection-type taxonomy, chunked request
+`Form`/`Cookie` extractors, chunked request
 bodies (rejected with 411), HTTP/2, and the experimental `Io.Evented` backend
 (its std networking is incomplete in 0.16.0, so Zax runs on `Io.Threaded`).
 
