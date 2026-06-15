@@ -4,6 +4,9 @@ An [Axum](https://github.com/tokio-rs/axum)-style HTTP web framework for **Zig 0
 Typed handlers, comptime extractors, a radix router, read-only shared state, and
 graceful shutdown — built from scratch on the new `std.Io` interface.
 
+**New here?** Read [`docs/getting-started.md`](docs/getting-started.md) and run the
+standalone consumer in [`examples/hello-service/`](examples/hello-service).
+
 ```zig
 const zax = @import("zax");
 
