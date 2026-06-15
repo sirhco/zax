@@ -29,6 +29,7 @@ const radix = @import("router/radix.zig");
 const Param = radix.Param;
 const extract = @import("extract/extract.zig");
 const middleware = @import("middleware.zig");
+const err_mod = @import("error.zig");
 
 /// Maximum path parameters captured per request (compile-time, sizes the
 /// stack capture buffer).
@@ -67,11 +68,16 @@ pub fn App(comptime AppState: type) type {
         /// Cursor passed to middleware; call `.run()` to continue the chain.
         pub const Next = Chn.Next;
 
+        /// Renders an error into a Response. Receives the raw error, a computed
+        /// default classification, and the request context. Infallible.
+        pub const ErrorHandler = *const fn (err: anyerror, info: err_mod.ErrorInfo, ctx: *const Ctx) Response;
+
         gpa: std.mem.Allocator,
         state: AppState,
         router: R,
         opts: Options,
         mws: std.ArrayListUnmanaged(Chn.Middleware) = .empty,
+        on_error: ?ErrorHandler = null,
         server: ?net.Server = null,
         shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -89,6 +95,11 @@ pub fn App(comptime AppState: type) type {
         /// routing, so 404/405 short-circuit before the chain).
         pub fn use(self: *Self, mw: Chn.Middleware) std.mem.Allocator.Error!void {
             try self.mws.append(self.gpa, mw);
+        }
+
+        /// Set a custom error renderer (e.g. to emit JSON error bodies).
+        pub fn onError(self: *Self, h: ErrorHandler) void {
+            self.on_error = h;
         }
 
         /// Register `handler` for `method` at `pattern`. The handler's signature
@@ -201,23 +212,36 @@ pub fn App(comptime AppState: type) type {
 
         /// Route one already-read request and run its handler. Every failure
         /// path maps to an HTTP status rather than propagating.
+        fn makeCtx(self: *Self, req: *const request.Request, params: []const Param, arena: *std.heap.ArenaAllocator) Ctx {
+            return .{
+                .req = req,
+                .params = params,
+                .state = self.state,
+                .arena = arena.allocator(),
+                .trust_forwarded = self.opts.trust_forwarded,
+            };
+        }
+
+        /// Classify an error and render it, using the app's on_error hook if set.
+        fn renderError(self: *Self, e: anyerror, ctx: *const Ctx) Response {
+            const info = err_mod.classify(e);
+            if (self.on_error) |h| return h(e, info, ctx);
+            return .{ .status = info.status, .body = info.reason };
+        }
+
         fn dispatch(self: *Self, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
             var params_buf: [max_params]Param = undefined;
-            const outcome = self.router.match(req.method, req.path, &params_buf) catch
-                return Response.fromStatus(.bad_request);
+            const outcome = self.router.match(req.method, req.path, &params_buf) catch {
+                const ctx = self.makeCtx(req, &.{}, arena);
+                return self.renderError(err_mod.Error.BadRequest, &ctx);
+            };
 
             switch (outcome) {
                 .not_found => return Response.fromStatus(.not_found),
                 .method_not_allowed => return Response.fromStatus(.method_not_allowed),
                 .found => |f| {
-                    const ctx = Ctx{
-                        .req = req,
-                        .params = f.params,
-                        .state = self.state,
-                        .arena = arena.allocator(),
-                        .trust_forwarded = self.opts.trust_forwarded,
-                    };
-                    return Chn.run(self.mws.items, f.handler, &ctx) catch Response.fromStatus(.internal_server_error);
+                    const ctx = self.makeCtx(req, f.params, arena);
+                    return Chn.run(self.mws.items, f.handler, &ctx) catch |e| self.renderError(e, &ctx);
                 },
             }
         }
@@ -558,6 +582,76 @@ test "forwarded: trusted reads X-Forwarded-Proto, untrusted ignores it" {
         app.requestShutdown(io);
         loop_fut.await(io);
     }
+}
+
+fn failNotFound() !Response {
+    return err_mod.Error.NotFound;
+}
+fn failConflict() !Response {
+    return err_mod.Error.Conflict;
+}
+fn failUnknown() !Response {
+    return error.SomeAppSpecificThing;
+}
+
+fn jsonErrorRenderer(_: anyerror, info: err_mod.ErrorInfo, ctx: *const TestApp.Context) Response {
+    const body = std.fmt.allocPrint(ctx.arena, "{{\"error\":\"{s}\"}}", .{info.reason}) catch
+        return Response.fromStatus(info.status);
+    var r = Response.jsonRaw(body);
+    r.status = info.status;
+    return r;
+}
+
+test "errors: extractor failures map to 4xx, handler errors to mapped status" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/users/:id", echoId);
+    try app.post("/u", jsonHandler);
+    try app.get("/nf", failNotFound);
+    try app.get("/conflict", failConflict);
+    try app.get("/boom", failUnknown);
+
+    const port: u16 = 18100;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /users/abc HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "400 Bad Request") != null);
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "POST /u HTTP/1.1\r\nContent-Length: 9\r\n\r\n{not json", &rb), "422 Unprocessable Entity") != null);
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /nf HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "404 Not Found") != null);
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /conflict HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "409 Conflict") != null);
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /boom HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "500 Internal Server Error") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "errors: on_error hook renders custom JSON bodies" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    app.onError(&jsonErrorRenderer);
+    try app.get("/nf", failNotFound);
+
+    const port: u16 = 18101;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const r = doRequest(io, port, "GET /nf HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "404 Not Found") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "content-type: application/json") != null);
+    try testing.expect(std.mem.endsWith(u8, r, "{\"error\":\"not found\"}"));
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
 }
 
 test "middleware: auth short-circuit and post-process header injection" {
