@@ -237,8 +237,16 @@ pub fn App(comptime AppState: type) type {
             };
 
             switch (outcome) {
-                .not_found => return Response.fromStatus(.not_found),
-                .method_not_allowed => return Response.fromStatus(.method_not_allowed),
+                .not_found => {
+                    const ctx = self.makeCtx(req, &.{}, arena);
+                    return self.renderError(err_mod.Error.NotFound, &ctx);
+                },
+                .method_not_allowed => |allowed| {
+                    const ctx = self.makeCtx(req, &.{}, arena);
+                    var resp = self.renderError(err_mod.Error.MethodNotAllowed, &ctx);
+                    resp = resp.withHeader(ctx.arena, "allow", allowHeader(ctx.arena, allowed)) catch resp;
+                    return resp;
+                },
                 .found => |f| {
                     const ctx = self.makeCtx(req, f.params, arena);
                     return Chn.run(self.mws.items, f.handler, &ctx) catch |e| self.renderError(e, &ctx);
@@ -253,6 +261,19 @@ fn writeResponse(w: *Io.Writer, resp: Response) bool {
     resp.write(w) catch return false;
     w.flush() catch return false;
     return true;
+}
+
+/// Build a comma-separated `Allow` header value from a method set, into `arena`.
+fn allowHeader(arena: std.mem.Allocator, allowed: router.MethodSet) []const u8 {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    var it = allowed.iterator();
+    var first = true;
+    while (it.next()) |m| {
+        if (!first) list.appendSlice(arena, ", ") catch return list.items;
+        list.appendSlice(arena, @tagName(m)) catch return list.items;
+        first = false;
+    }
+    return list.items;
 }
 
 const ReadError = error{ HeadTooLarge, IncompleteRequest };
@@ -649,6 +670,37 @@ test "errors: on_error hook renders custom JSON bodies" {
     try testing.expect(std.mem.indexOf(u8, r, "404 Not Found") != null);
     try testing.expect(std.mem.indexOf(u8, r, "content-type: application/json") != null);
     try testing.expect(std.mem.endsWith(u8, r, "{\"error\":\"not found\"}"));
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "errors: 404/405 go through the renderer and 405 carries Allow" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    app.onError(&jsonErrorRenderer);
+    try app.get("/ping", pingHandler);
+    try app.post("/ping", pingHandler);
+
+    const port: u16 = 18102;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const r404 = doRequest(io, port, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r404, "404 Not Found") != null);
+    try testing.expect(std.mem.endsWith(u8, r404, "{\"error\":\"not found\"}"));
+
+    var rb2: [2048]u8 = undefined;
+    const r405 = doRequest(io, port, "DELETE /ping HTTP/1.1\r\nHost: x\r\n\r\n", &rb2);
+    try testing.expect(std.mem.indexOf(u8, r405, "405 Method Not Allowed") != null);
+    try testing.expect(std.mem.indexOf(u8, r405, "allow: ") != null);
+    try testing.expect(std.mem.indexOf(u8, r405, "GET") != null);
+    try testing.expect(std.mem.indexOf(u8, r405, "POST") != null);
 
     app.requestShutdown(io);
     loop_fut.await(io);
