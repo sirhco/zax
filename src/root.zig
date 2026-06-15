@@ -33,6 +33,12 @@ pub const State = @import("extract/state.zig").State;
 pub const Alloc = @import("extract/alloc.zig").Alloc;
 pub const Forwarded = @import("extract/forwarded.zig").Forwarded;
 
+// --- Error model ---
+pub const err = @import("error.zig");
+pub const ErrorInfo = err.ErrorInfo;
+pub const Error = err.Error;
+pub const classify = err.classify;
+
 // --- Middleware ---
 pub const middleware = @import("middleware.zig");
 pub const Chain = middleware.Chain;
