@@ -22,6 +22,7 @@ pub const Status = enum(u16) {
     method_not_allowed = 405,
     conflict = 409,
     length_required = 411,
+    too_many_requests = 429,
     unprocessable_entity = 422,
     internal_server_error = 500,
     not_implemented = 501,
@@ -47,6 +48,7 @@ pub const Status = enum(u16) {
             .method_not_allowed => "Method Not Allowed",
             .conflict => "Conflict",
             .length_required => "Length Required",
+            .too_many_requests => "Too Many Requests",
             .unprocessable_entity => "Unprocessable Entity",
             .internal_server_error => "Internal Server Error",
             .not_implemented => "Not Implemented",
@@ -159,6 +161,11 @@ test "status-only response has empty body and right reason" {
     try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 404 Not Found\r\n"));
     try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
     try testing.expect(std.mem.indexOf(u8, out, "content-length: 0\r\n") != null);
+}
+
+test "too_many_requests status code and reason" {
+    try testing.expectEqual(@as(u16, 429), Status.too_many_requests.code());
+    try testing.expectEqualStrings("Too Many Requests", Status.too_many_requests.reason());
 }
 
 test "keep_alive toggles the Connection header" {
