@@ -31,6 +31,11 @@ pub const Query = @import("extract/query.zig").Query;
 pub const Json = @import("extract/json.zig").Json;
 pub const State = @import("extract/state.zig").State;
 pub const Alloc = @import("extract/alloc.zig").Alloc;
+pub const Forwarded = @import("extract/forwarded.zig").Forwarded;
+
+// --- Middleware ---
+pub const middleware = @import("middleware.zig");
+pub const Chain = middleware.Chain;
 
 // --- Server (Phase 4) ---
 pub const server = @import("server.zig");

@@ -115,6 +115,23 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // Benchmark harness: a separate ReleaseFast executable, run via `zig build
+    // bench`. Kept out of the default build and the test suite.
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zax", .module = mod },
+            },
+        }),
+    });
+    const bench_run = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run benchmarks (ReleaseFast)");
+    bench_step.dependOn(&bench_run.step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Writer = std.Io.Writer;
+const Header = @import("request.zig").Header;
 
 pub const Status = enum(u16) {
     ok = 200,
@@ -20,6 +21,7 @@ pub const Status = enum(u16) {
     not_found = 404,
     method_not_allowed = 405,
     conflict = 409,
+    length_required = 411,
     unprocessable_entity = 422,
     internal_server_error = 500,
     not_implemented = 501,
@@ -44,6 +46,7 @@ pub const Status = enum(u16) {
             .not_found => "Not Found",
             .method_not_allowed => "Method Not Allowed",
             .conflict => "Conflict",
+            .length_required => "Length Required",
             .unprocessable_entity => "Unprocessable Entity",
             .internal_server_error => "Internal Server Error",
             .not_implemented => "Not Implemented",
@@ -57,6 +60,12 @@ pub const Response = struct {
     content_type: []const u8 = "text/plain; charset=utf-8",
     /// Borrowed body bytes. Valid for the request lifetime.
     body: []const u8 = "",
+    /// Extra response headers (beyond content-length/type/connection). Borrowed;
+    /// typically arena-allocated via `withHeader`. Empty by default (zero-alloc).
+    headers: []const Header = &.{},
+    /// Whether to advertise a persistent connection. The server sets this from
+    /// the request; default `false` keeps `connection: close` behavior.
+    keep_alive: bool = false,
 
     pub fn text(body: []const u8) Response {
         return .{ .body = body };
@@ -70,12 +79,27 @@ pub const Response = struct {
         return .{ .status = s, .body = "" };
     }
 
+    /// Return a copy of `self` with `(name, value)` appended to its headers,
+    /// using `arena` for the (re)allocated header slice. Borrowed name/value
+    /// must outlive the response (request-scoped).
+    pub fn withHeader(self: Response, arena: std.mem.Allocator, name: []const u8, value: []const u8) std.mem.Allocator.Error!Response {
+        const list = try arena.alloc(Header, self.headers.len + 1);
+        @memcpy(list[0..self.headers.len], self.headers);
+        list[self.headers.len] = .{ .name = name, .value = value };
+        var r = self;
+        r.headers = list;
+        return r;
+    }
+
     /// Serialize a complete HTTP/1.1 response (head + body) to `w`.
     pub fn write(self: Response, w: *Writer) Writer.Error!void {
         try w.print("HTTP/1.1 {d} {s}\r\n", .{ self.status.code(), self.status.reason() });
         try w.print("content-length: {d}\r\n", .{self.body.len});
         try w.print("content-type: {s}\r\n", .{self.content_type});
-        try w.writeAll("connection: close\r\n");
+        for (self.headers) |h| {
+            try w.print("{s}: {s}\r\n", .{ h.name, h.value });
+        }
+        try w.writeAll(if (self.keep_alive) "connection: keep-alive\r\n" else "connection: close\r\n");
         try w.writeAll("\r\n");
         try w.writeAll(self.body);
     }
@@ -135,6 +159,36 @@ test "status-only response has empty body and right reason" {
     try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 404 Not Found\r\n"));
     try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
     try testing.expect(std.mem.indexOf(u8, out, "content-length: 0\r\n") != null);
+}
+
+test "keep_alive toggles the Connection header" {
+    var buf: [256]u8 = undefined;
+    var r = Response.text("x");
+    r.keep_alive = true;
+    const out = serialize(&buf, r);
+    try testing.expect(std.mem.indexOf(u8, out, "connection: keep-alive\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "connection: close") == null);
+}
+
+test "withHeader appends extra headers in order before connection" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+
+    const r = try (try Response.text("hi").withHeader(a, "x-request-id", "abc"))
+        .withHeader(a, "x-cache", "MISS");
+    const out = serialize(&buf, r);
+
+    const id_at = std.mem.indexOf(u8, out, "x-request-id: abc\r\n").?;
+    const cache_at = std.mem.indexOf(u8, out, "x-cache: MISS\r\n").?;
+    const conn_at = std.mem.indexOf(u8, out, "connection: close\r\n").?;
+    const ct_at = std.mem.indexOf(u8, out, "content-type:").?;
+    // Order: content-type < x-request-id < x-cache < connection.
+    try testing.expect(ct_at < id_at);
+    try testing.expect(id_at < cache_at);
+    try testing.expect(cache_at < conn_at);
+    try testing.expect(std.mem.endsWith(u8, out, "hi"));
 }
 
 test "json response sets content-type" {

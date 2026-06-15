@@ -11,6 +11,14 @@ const zax = @import("zax");
 /// Read-only application state, shared across all handlers without locks.
 const Db = struct { banner: []const u8 };
 
+const Api = zax.App(*const Db);
+
+/// Example middleware: stamp every response with a header (post-processing).
+fn poweredBy(ctx: *const Api.Context, next: *Api.Next) anyerror!zax.Response {
+    const r = try next.run();
+    return r.withHeader(ctx.arena, "x-powered-by", "zax");
+}
+
 fn index() zax.Response {
     return zax.Response.text("Hello from Zax\n");
 }
@@ -34,9 +42,10 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var db = Db{ .banner = "zax-demo" };
-    var app = try zax.App(*const Db).init(init.gpa, &db, .{});
+    var app = try Api.init(init.gpa, &db, .{});
     defer app.deinit();
 
+    try app.use(&poweredBy);
     try app.get("/", index);
     try app.get("/users/:id", getUser);
     try app.post("/users", createUser);

@@ -18,6 +18,9 @@ pub fn Context(comptime AppState: type) type {
         params: []const Param,
         state: AppState,
         arena: std.mem.Allocator,
+        /// Whether `X-Forwarded-*` headers should be trusted (set by the server
+        /// from `Options.trust_forwarded`; only true behind a controlled proxy).
+        trust_forwarded: bool = false,
     };
 }
 

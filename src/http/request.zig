@@ -57,4 +57,62 @@ pub const Request = struct {
         const v = self.header("content-length") orelse return null;
         return std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch null;
     }
+
+    /// Whether the connection should be kept alive after this request.
+    /// HTTP/1.1 defaults to keep-alive (unless `Connection: close`); HTTP/1.0
+    /// defaults to close (unless `Connection: keep-alive`).
+    pub fn isPersistent(self: *const Request) bool {
+        if (self.header("connection")) |c| {
+            if (hasToken(c, "close")) return false;
+            if (hasToken(c, "keep-alive")) return true;
+        }
+        return self.version_minor >= 1;
+    }
+
+    /// Whether the request body uses chunked transfer-encoding (unsupported in
+    /// v1.1 — the server rejects these with 411).
+    pub fn isChunked(self: *const Request) bool {
+        const te = self.header("transfer-encoding") orelse return false;
+        return hasToken(te, "chunked");
+    }
 };
+
+/// Case-insensitive membership test over a comma-separated header value.
+fn hasToken(value: []const u8, token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |t| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, t, " \t"), token)) return true;
+    }
+    return false;
+}
+
+const testing = std.testing;
+
+fn reqWith(version_minor: u8, headers: []const Header) Request {
+    return .{
+        .method = .GET,
+        .target = "/",
+        .path = "/",
+        .query = "",
+        .version_minor = version_minor,
+        .headers = headers,
+        .body = "",
+    };
+}
+
+test "isPersistent honors version defaults and Connection header" {
+    // HTTP/1.1 default keep-alive; HTTP/1.0 default close.
+    try testing.expect(reqWith(1, &.{}).isPersistent());
+    try testing.expect(!reqWith(0, &.{}).isPersistent());
+    // Explicit override either way, case-insensitive, token in a list.
+    try testing.expect(!reqWith(1, &.{.{ .name = "Connection", .value = "close" }}).isPersistent());
+    try testing.expect(reqWith(0, &.{.{ .name = "connection", .value = "keep-alive" }}).isPersistent());
+    try testing.expect(!reqWith(1, &.{.{ .name = "Connection", .value = "Keep-Alive, Close" }}).isPersistent());
+}
+
+test "isChunked detects chunked transfer-encoding" {
+    try testing.expect(reqWith(1, &.{.{ .name = "Transfer-Encoding", .value = "chunked" }}).isChunked());
+    try testing.expect(reqWith(1, &.{.{ .name = "transfer-encoding", .value = "gzip, chunked" }}).isChunked());
+    try testing.expect(!reqWith(1, &.{.{ .name = "Transfer-Encoding", .value = "gzip" }}).isChunked());
+    try testing.expect(!reqWith(1, &.{}).isChunked());
+}

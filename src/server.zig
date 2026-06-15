@@ -28,6 +28,7 @@ const router = @import("router/router.zig");
 const radix = @import("router/radix.zig");
 const Param = radix.Param;
 const extract = @import("extract/extract.zig");
+const middleware = @import("middleware.zig");
 
 /// Maximum path parameters captured per request (compile-time, sizes the
 /// stack capture buffer).
@@ -36,22 +37,41 @@ pub const max_params = 16;
 pub const Options = struct {
     read_buffer_size: usize = 16 * 1024,
     write_buffer_size: usize = 8 * 1024,
+    /// Allow persistent (keep-alive) connections.
+    keep_alive: bool = true,
+    /// Cap on requests served per connection before closing (bounds resource
+    /// use on long-lived connections).
+    max_keep_alive_requests: usize = 100,
+    /// Trust `X-Forwarded-Proto/Host/For` headers. Enable ONLY when Zax sits
+    /// behind a reverse proxy you control (it terminates TLS and sets these);
+    /// otherwise clients could spoof them. See docs/deploy-https.md.
+    trust_forwarded: bool = false,
 };
 
 /// `App(AppState)` — a server bound to one concrete, read-only app-state type.
 pub fn App(comptime AppState: type) type {
     return struct {
         const Self = @This();
-        const Ctx = extract.Context(AppState);
+        /// Per-request context the extractors and middleware receive. Exposed so
+        /// users can spell middleware signatures: `fn (*const App(S).Context, *App(S).Next)`.
+        pub const Context = extract.Context(AppState);
+        const Ctx = Context;
+        const Chn = middleware.Chain(Ctx);
         /// Type-erased handler: every typed handler is wrapped into this single
         /// shape so the router can store them uniformly.
-        const ErasedHandler = *const fn (ctx: *const Ctx) anyerror!Response;
+        const ErasedHandler = Chn.Handler;
         const R = router.Router(ErasedHandler);
+
+        /// Middleware function type for this app. See `use`.
+        pub const Middleware = Chn.Middleware;
+        /// Cursor passed to middleware; call `.run()` to continue the chain.
+        pub const Next = Chn.Next;
 
         gpa: std.mem.Allocator,
         state: AppState,
         router: R,
         opts: Options,
+        mws: std.ArrayListUnmanaged(Chn.Middleware) = .empty,
         server: ?net.Server = null,
         shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -60,7 +80,15 @@ pub fn App(comptime AppState: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            self.mws.deinit(self.gpa);
             self.router.deinit();
+        }
+
+        /// Append a middleware to the global chain. Middleware run in
+        /// registration order, wrapping the matched route handler (after
+        /// routing, so 404/405 short-circuit before the chain).
+        pub fn use(self: *Self, mw: Chn.Middleware) std.mem.Allocator.Error!void {
+            try self.mws.append(self.gpa, mw);
         }
 
         /// Register `handler` for `method` at `pattern`. The handler's signature
@@ -122,33 +150,60 @@ pub fn App(comptime AppState: type) type {
             if (self.server) |*s| s.socket.close(io);
         }
 
+        /// Serve a connection: a keep-alive loop of request/response cycles over
+        /// one stream. Read/write buffers and the request arena persist for the
+        /// whole connection; the arena is reset (capacity retained) each request.
         fn handleConn(self: *Self, io: Io, stream_in: net.Stream) void {
             var stream = stream_in;
             defer stream.close(io);
 
+            const read_buf = self.gpa.alloc(u8, self.opts.read_buffer_size) catch return;
+            defer self.gpa.free(read_buf);
+            const write_buf = self.gpa.alloc(u8, self.opts.write_buffer_size) catch return;
+            defer self.gpa.free(write_buf);
+
             var arena = std.heap.ArenaAllocator.init(self.gpa);
             defer arena.deinit();
 
-            const read_buf = arena.allocator().alloc(u8, self.opts.read_buffer_size) catch return;
-            const write_buf = arena.allocator().alloc(u8, self.opts.write_buffer_size) catch return;
-
             var sr = stream.reader(io, read_buf);
             var sw = stream.writer(io, write_buf);
+            const r = &sr.interface;
+            const w = &sw.interface;
 
-            const resp = self.handleOne(io, &sr.interface, &arena);
-            resp.write(&sw.interface) catch return;
-            sw.interface.flush() catch return;
+            var served: usize = 0;
+            while (true) {
+                _ = arena.reset(.retain_capacity);
+
+                var hs: [request.max_headers]Header = undefined;
+                var parsed = readHead(r, &hs) catch break; // EOF or malformed head -> close
+
+                // Chunked request bodies are unsupported: reject and close.
+                if (parsed.request.isChunked()) {
+                    _ = writeResponse(w, Response.fromStatus(.length_required));
+                    break;
+                }
+                attachBody(r, &parsed) catch break;
+                const consumed = parsed.head_len + parsed.request.body.len;
+
+                const persistent = self.opts.keep_alive and
+                    parsed.request.isPersistent() and
+                    (served + 1) < self.opts.max_keep_alive_requests;
+
+                var resp = self.dispatch(&parsed.request, &arena);
+                resp.keep_alive = persistent;
+                if (!writeResponse(w, resp)) break;
+
+                r.toss(consumed);
+                served += 1;
+                if (!persistent) break;
+            }
         }
 
-        /// Read one request, route it, run the handler, and return a Response.
-        /// Every failure path maps to an HTTP status rather than propagating.
-        fn handleOne(self: *Self, io: Io, r: *Io.Reader, arena: *std.heap.ArenaAllocator) Response {
-            _ = io;
-            var hs: [request.max_headers]Header = undefined;
-            const parsed = readRequest(r, &hs) catch return Response.fromStatus(.bad_request);
-
+        /// Route one already-read request and run its handler. Every failure
+        /// path maps to an HTTP status rather than propagating.
+        fn dispatch(self: *Self, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
             var params_buf: [max_params]Param = undefined;
-            const outcome = self.router.match(parsed.request.method, parsed.request.path, &params_buf) catch
+            const outcome = self.router.match(req.method, req.path, &params_buf) catch
                 return Response.fromStatus(.bad_request);
 
             switch (outcome) {
@@ -156,42 +211,51 @@ pub fn App(comptime AppState: type) type {
                 .method_not_allowed => return Response.fromStatus(.method_not_allowed),
                 .found => |f| {
                     const ctx = Ctx{
-                        .req = &parsed.request,
+                        .req = req,
                         .params = f.params,
                         .state = self.state,
                         .arena = arena.allocator(),
+                        .trust_forwarded = self.opts.trust_forwarded,
                     };
-                    return f.handler(&ctx) catch Response.fromStatus(.internal_server_error);
+                    return Chn.run(self.mws.items, f.handler, &ctx) catch Response.fromStatus(.internal_server_error);
                 },
             }
         }
     };
 }
 
+/// Write and flush a response; returns false on a write error (caller closes).
+fn writeResponse(w: *Io.Writer, resp: Response) bool {
+    resp.write(w) catch return false;
+    w.flush() catch return false;
+    return true;
+}
+
 const ReadError = error{ HeadTooLarge, IncompleteRequest };
 
-/// Fill the reader until the full request head (and body, per Content-Length) is
-/// buffered, then return a `Parsed` whose slices point into the reader buffer.
-fn readRequest(r: *Io.Reader, hs: *[request.max_headers]Header) ReadError!parser.Parsed {
-    var parsed: parser.Parsed = while (true) {
+/// Fill the reader until a full request head is buffered, returning a `Parsed`
+/// whose slices point into the reader buffer (body not yet attached).
+fn readHead(r: *Io.Reader, hs: *[request.max_headers]Header) ReadError!parser.Parsed {
+    while (true) {
         if (parser.parseHead(r.buffered(), hs)) |p| {
-            break p;
+            return p;
         } else |err| switch (err) {
             error.Incomplete => {},
             else => return error.IncompleteRequest,
         }
-        // Need more bytes for the head.
         r.fillMore() catch return error.IncompleteRequest;
         if (r.buffered().len == r.buffer.len) return error.HeadTooLarge;
-    };
+    }
+}
 
+/// Ensure the Content-Length body is buffered and attach it as a zero-copy slice.
+fn attachBody(r: *Io.Reader, parsed: *parser.Parsed) ReadError!void {
     if (parsed.request.contentLength()) |clen| {
         while (r.buffered().len < parsed.head_len + clen) {
             r.fillMore() catch return error.IncompleteRequest;
         }
         parsed.request.body = r.buffered()[parsed.head_len .. parsed.head_len + clen];
     }
-    return parsed;
 }
 
 // ----------------------------------------------------------------------------
@@ -200,6 +264,7 @@ fn readRequest(r: *Io.Reader, hs: *[request.max_headers]Header) ReadError!parser
 const testing = std.testing;
 const Path = @import("extract/path.zig").Path;
 const State = @import("extract/state.zig").State;
+const Forwarded = @import("extract/forwarded.zig").Forwarded;
 
 const Db = struct { msg: []const u8 };
 const TestApp = App(*const Db);
@@ -213,27 +278,43 @@ fn echoId(p: Path(struct { id: u64 })) Response {
     return if (p.value.id == 42) Response.text("forty-two") else Response.fromStatus(.not_found);
 }
 
-fn readAll(io: Io, stream: *net.Stream, buf: []u8) []const u8 {
-    var cr = stream.reader(io, buf);
-    const r = &cr.interface;
-    var total: usize = 0;
-    while (true) {
-        const n = r.readSliceShort(buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
+fn parseClen(head: []const u8) usize {
+    const key = "content-length: ";
+    const start = std.mem.indexOf(u8, head, key) orelse return 0;
+    const i = start + key.len;
+    const end = std.mem.indexOfScalarPos(u8, head, i, '\r') orelse return 0;
+    return std.fmt.parseInt(usize, head[i..end], 10) catch 0;
+}
+
+/// Read exactly one HTTP response (head + Content-Length body) from `r`, copy it
+/// into `out`, and consume it from the reader buffer. Works on both keep-alive
+/// and close connections (does not rely on EOF to frame the response).
+fn readResp(r: *Io.Reader, out: []u8) []const u8 {
+    while (std.mem.indexOf(u8, r.buffered(), "\r\n\r\n") == null) {
+        r.fillMore() catch break;
     }
-    return buf[0..total];
+    const he = (std.mem.indexOf(u8, r.buffered(), "\r\n\r\n") orelse return out[0..0]) + 4;
+    const clen = parseClen(r.buffered()[0..he]);
+    while (r.buffered().len < he + clen) {
+        r.fillMore() catch break;
+    }
+    const total = @min(he + clen, r.buffered().len);
+    @memcpy(out[0..total], r.buffered()[0..total]);
+    r.toss(total);
+    return out[0..total];
 }
 
 fn doRequest(io: Io, port: u16, raw: []const u8, resp_buf: []u8) []const u8 {
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
     defer cs.close(io);
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
     var wb: [512]u8 = undefined;
     var cw = cs.writer(io, &wb);
     cw.interface.writeAll(raw) catch unreachable;
     cw.interface.flush() catch unreachable;
-    return readAll(io, &cs, resp_buf);
+    return readResp(&cr.interface, resp_buf);
 }
 
 test "end-to-end: routes, extractors, and graceful drain" {
@@ -273,6 +354,242 @@ test "end-to-end: routes, extractors, and graceful drain" {
     try testing.expect(std.mem.indexOf(u8, r4, "405 Method Not Allowed") != null);
 
     // Graceful shutdown: loop exits and drains.
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+fn startTestApp(io: Io, app: *TestApp, port: u16) Io.Future(void) {
+    app.bind(io, .{ .ip4 = .loopback(port) }) catch unreachable;
+    return io.async(TestApp.acceptLoop, .{ app, io });
+}
+
+test "keep-alive: multiple requests reuse one connection" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ping", pingHandler);
+
+    const port: u16 = 18091;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    // Two sequential requests on the SAME connection.
+    inline for (0..2) |_| {
+        cw.interface.writeAll("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+        cw.interface.flush() catch unreachable;
+        var out: [1024]u8 = undefined;
+        const resp = readResp(&cr.interface, &out);
+        try testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
+        try testing.expect(std.mem.indexOf(u8, resp, "connection: keep-alive") != null);
+        try testing.expect(std.mem.endsWith(u8, resp, "pong"));
+    }
+
+    // Pipelined: two requests written back-to-back, two framed responses read.
+    cw.interface.writeAll("GET /ping HTTP/1.1\r\nHost: x\r\n\r\nGET /ping HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var pout1: [1024]u8 = undefined;
+    var pout2: [1024]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, readResp(&cr.interface, &pout1), "pong"));
+    try testing.expect(std.mem.endsWith(u8, readResp(&cr.interface, &pout2), "pong"));
+
+    cs.close(io);
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "keep-alive: Connection: close ends the connection" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ping", pingHandler);
+
+    const port: u16 = 18092;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    cw.interface.writeAll("GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var out: [1024]u8 = undefined;
+    const resp = readResp(&cr.interface, &out);
+    try testing.expect(std.mem.indexOf(u8, resp, "connection: close") != null);
+    // Server closed: the next fill hits EOF (no more bytes).
+    try testing.expectError(error.EndOfStream, cr.interface.fillMore());
+
+    cs.close(io);
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "keep-alive: chunked request body is rejected with 411" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.post("/ping", pingHandler);
+
+    const port: u16 = 18093;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const resp = doRequest(io, port, "POST /ping HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, resp, "411 Length Required") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+fn requireAuth(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
+    if (ctx.req.header("authorization") == null) return Response.fromStatus(.unauthorized);
+    return next.run();
+}
+fn requestId(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
+    const r = try next.run();
+    return r.withHeader(ctx.arena, "x-request-id", "abc123");
+}
+
+fn schemeHandler(f: Forwarded) Response {
+    return Response.text(f.scheme);
+}
+
+const Json = @import("extract/json.zig").Json;
+fn jsonHandler(body: Json(struct { name: []const u8 })) Response {
+    return Response.text(body.value.name);
+}
+
+test "hot path: static-handler dispatch + serialize make zero heap allocations" {
+    // The per-request arena is backed by a FailingAllocator that merely counts.
+    // A handler that uses no allocating extractor must never touch the backing.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var arena = std.heap.ArenaAllocator.init(failing.allocator());
+    defer arena.deinit();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{}); // router uses testing.allocator
+    defer app.deinit();
+    try app.get("/ping", pingHandler);
+
+    var hs: [request.max_headers]Header = undefined;
+    const parsed = parser.parseHead("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", &hs) catch unreachable;
+
+    const resp = app.dispatch(&parsed.request, &arena);
+    try testing.expectEqualStrings("pong", resp.body);
+
+    var ob: [256]u8 = undefined;
+    var w = Io.Writer.fixed(&ob);
+    resp.write(&w) catch unreachable;
+
+    // Parse + route + extract + handler + serialize: nothing hit the backing.
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+    try testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+}
+
+test "contrast: Json handler does allocate (discriminates the alloc check)" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var arena = std.heap.ArenaAllocator.init(failing.allocator());
+    defer arena.deinit();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.post("/u", jsonHandler);
+
+    var hs: [request.max_headers]Header = undefined;
+    const raw = "POST /u HTTP/1.1\r\nContent-Length: 16\r\n\r\n{\"name\":\"grace\"}";
+    var parsed = parser.parseHead(raw, &hs) catch unreachable;
+    parsed.request.body = raw[parsed.head_len .. parsed.head_len + parsed.request.contentLength().?];
+
+    const resp = app.dispatch(&parsed.request, &arena);
+    try testing.expectEqualStrings("grace", resp.body);
+    try testing.expect(failing.allocations > 0); // JSON parse used the arena
+}
+
+test "forwarded: trusted reads X-Forwarded-Proto, untrusted ignores it" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db = Db{ .msg = "" };
+
+    // trust_forwarded = true: handler sees the proxied scheme.
+    {
+        var app = try TestApp.init(testing.allocator, &db, .{ .trust_forwarded = true });
+        defer app.deinit();
+        try app.get("/scheme", schemeHandler);
+        const port: u16 = 18095;
+        var loop_fut = startTestApp(io, &app, port);
+        var rb: [1024]u8 = undefined;
+        const r = doRequest(io, port, "GET /scheme HTTP/1.1\r\nHost: x\r\nX-Forwarded-Proto: https\r\n\r\n", &rb);
+        try testing.expect(std.mem.endsWith(u8, r, "https"));
+        app.requestShutdown(io);
+        loop_fut.await(io);
+    }
+    // trust_forwarded = false (default): the header is ignored, scheme = http.
+    {
+        var app = try TestApp.init(testing.allocator, &db, .{});
+        defer app.deinit();
+        try app.get("/scheme", schemeHandler);
+        const port: u16 = 18096;
+        var loop_fut = startTestApp(io, &app, port);
+        var rb: [1024]u8 = undefined;
+        const r = doRequest(io, port, "GET /scheme HTTP/1.1\r\nHost: x\r\nX-Forwarded-Proto: https\r\n\r\n", &rb);
+        try testing.expect(std.mem.endsWith(u8, r, "http"));
+        app.requestShutdown(io);
+        loop_fut.await(io);
+    }
+}
+
+test "middleware: auth short-circuit and post-process header injection" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.use(&requireAuth);
+    try app.use(&requestId);
+    try app.get("/ping", pingHandler);
+
+    const port: u16 = 18094;
+    var loop_fut = startTestApp(io, &app, port);
+
+    // No Authorization -> auth middleware short-circuits with 401; requestId
+    // never runs, so no x-request-id header.
+    var rb1: [2048]u8 = undefined;
+    const r1 = doRequest(io, port, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", &rb1);
+    try testing.expect(std.mem.indexOf(u8, r1, "401 Unauthorized") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "x-request-id") == null);
+
+    // With Authorization -> chain runs through; handler responds and requestId
+    // post-processes the response, adding the header.
+    var rb2: [2048]u8 = undefined;
+    const r2 = doRequest(io, port, "GET /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer t\r\n\r\n", &rb2);
+    try testing.expect(std.mem.indexOf(u8, r2, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, r2, "x-request-id: abc123") != null);
+    try testing.expect(std.mem.endsWith(u8, r2, "pong"));
+
     app.requestShutdown(io);
     loop_fut.await(io);
 }
