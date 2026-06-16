@@ -32,6 +32,7 @@ pub const Json = @import("extract/json.zig").Json;
 pub const State = @import("extract/state.zig").State;
 pub const Alloc = @import("extract/alloc.zig").Alloc;
 pub const Forwarded = @import("extract/forwarded.zig").Forwarded;
+pub const url = @import("url.zig");
 
 // --- Error model ---
 pub const err = @import("error.zig");
