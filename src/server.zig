@@ -86,6 +86,7 @@ pub fn App(comptime AppState: type) type {
         router: R,
         opts: Options,
         mws: std.ArrayListUnmanaged(Chn.Middleware) = .empty,
+        fallback_handler: ?ErasedHandler = null,
         on_error: ?ErrorHandler = null,
         server: ?net.Server = null,
         shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -104,6 +105,19 @@ pub fn App(comptime AppState: type) type {
         /// routing, so 404/405 short-circuit before the chain).
         pub fn use(self: *Self, mw: Chn.Middleware) std.mem.Allocator.Error!void {
             try self.mws.append(self.gpa, mw);
+        }
+
+        /// Set the handler run for requests that match no route (a custom 404 or
+        /// an SPA index fallback). Runs through the global middleware chain;
+        /// applies to not-found only (not method-not-allowed). The handler must
+        /// not use `Path` (an unmatched route has no captured params).
+        pub fn fallback(self: *Self, comptime handler: anytype) std.mem.Allocator.Error!void {
+            const Wrap = struct {
+                fn call(ctx: *const Ctx) anyerror!Response {
+                    return extract.callHandler(handler, ctx.*);
+                }
+            };
+            self.fallback_handler = &Wrap.call;
         }
 
         /// Set a custom error renderer (e.g. to emit JSON error bodies).
@@ -261,6 +275,8 @@ pub fn App(comptime AppState: type) type {
             switch (outcome) {
                 .not_found => {
                     const ctx = self.makeCtx(io, req, &.{}, arena);
+                    if (self.fallback_handler) |fb|
+                        return Chn.run(self.mws.items, fb, &ctx) catch |e| self.renderError(e, &ctx);
                     return self.renderError(err_mod.Error.NotFound, &ctx);
                 },
                 .method_not_allowed => |allowed| {
@@ -1166,6 +1182,69 @@ test "responses: redirect over a real connection" {
     const r = doRequest(io, port, "GET /old HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
     try testing.expect(std.mem.indexOf(u8, r, "302 Found") != null);
     try testing.expect(std.mem.indexOf(u8, r, "location: /next\r\n") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+fn customNotFound() Response {
+    return .{ .status = .not_found, .body = "custom-404" };
+}
+fn spaIndex() Response {
+    return Response.text("spa-index");
+}
+fn fallbackTagMw(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
+    const r = try next.run();
+    return r.withHeader(ctx.arena, "x-fallback", "1");
+}
+
+test "fallback: custom 404 handler for unmatched routes" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ping", pingHandler);
+    try app.fallback(customNotFound);
+
+    const port: u16 = 18170;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const r = doRequest(io, port, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "404 Not Found") != null);
+    try testing.expect(std.mem.endsWith(u8, r, "custom-404"));
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "fallback: SPA-style 200 + middleware applies; 405 unaffected" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.use(&fallbackTagMw);
+    try app.get("/ping", pingHandler);
+    try app.fallback(spaIndex);
+
+    const port: u16 = 18171;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const r = doRequest(io, port, "GET /anything HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "x-fallback: 1\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, r, "spa-index"));
+
+    var rb2: [2048]u8 = undefined;
+    const r2 = doRequest(io, port, "DELETE /ping HTTP/1.1\r\nHost: x\r\n\r\n", &rb2);
+    try testing.expect(std.mem.indexOf(u8, r2, "405 Method Not Allowed") != null);
 
     app.requestShutdown(io);
     loop_fut.await(io);
