@@ -192,9 +192,11 @@ pub fn App(comptime AppState: type) type {
                 const G = @This();
                 app: *Self,
 
+                /// Mirror of `App.route`, with this group's prefix and middleware applied.
                 pub fn route(self: G, method: request.Method, comptime pattern: []const u8, comptime handler: anytype) !void {
                     return self.app.routeWith(method, prefix ++ pattern, group_mws, handler);
                 }
+                /// Mirror of `App.routeWith`; this group's middleware run before `mws`.
                 pub fn routeWith(self: G, method: request.Method, comptime pattern: []const u8, comptime mws: anytype, comptime handler: anytype) !void {
                     return self.app.routeWith(method, prefix ++ pattern, group_mws ++ mws, handler);
                 }
@@ -1593,6 +1595,42 @@ test "group: shared middleware short-circuits group routes only" {
     try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /api/secret HTTP/1.1\r\nHost: x\r\nAuthorization: t\r\n\r\n", &rb2), "200 OK") != null);
     var rb3: [2048]u8 = undefined;
     try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /open HTTP/1.1\r\nHost: x\r\n\r\n", &rb3), "200 OK") != null);
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "group: non-GET verb registers under the group prefix" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    const api = app.group("/api", .{});
+    try api.post("/things", pingHandler);
+    const port: u16 = 18181;
+    var loop_fut = startTestApp(io, &app, port);
+    var rb: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "POST /api/things HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "200 OK") != null);
+    var rb2: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /api/things HTTP/1.1\r\nHost: x\r\n\r\n", &rb2), "405 Method Not Allowed") != null);
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "group: empty pattern registers the group root" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    const api = app.group("/api", .{});
+    try api.get("", pingHandler);
+    const port: u16 = 18182;
+    var loop_fut = startTestApp(io, &app, port);
+    var rb: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /api HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "200 OK") != null);
     app.requestShutdown(io);
     loop_fut.await(io);
 }
