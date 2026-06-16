@@ -23,6 +23,7 @@ pub const CountingAllocator = struct {
     }
 
     /// Cumulative bytes requested across all successful (re)allocations.
+    /// This is a running total — it is NOT decremented on free and does NOT reflect live/current footprint.
     pub fn bytesAllocated(self: *const CountingAllocator) usize {
         return self.bytes.load(.monotonic);
     }
@@ -80,6 +81,26 @@ test "reset zeroes the counter" {
     defer a.free(p);
     c.reset();
     try testing.expectEqual(@as(usize, 0), c.bytesAllocated());
+}
+
+test "resize grow counts only the delta; shrink counts nothing" {
+    var backing: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var c = CountingAllocator{ .child = fba.allocator() };
+    const a = c.allocator();
+
+    var buf = try a.alloc(u8, 64);
+    try testing.expectEqual(@as(usize, 64), c.bytesAllocated());
+
+    // Grow the last allocation in place: counts only the +16 delta.
+    try testing.expect(a.resize(buf, 80));
+    buf.len = 80;
+    try testing.expectEqual(@as(usize, 80), c.bytesAllocated());
+
+    // Shrink: never counted.
+    try testing.expect(a.resize(buf, 40));
+    buf.len = 40;
+    try testing.expectEqual(@as(usize, 80), c.bytesAllocated());
 }
 
 test "delegates correctly (allocations are usable)" {
