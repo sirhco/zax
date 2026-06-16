@@ -317,6 +317,10 @@ const ConnReader = struct {
         if (self.end == self.buf.len) return error.BufferFull;
         const msg = self.socket.receiveTimeout(self.io, self.buf[self.end..], timeout) catch |err| switch (err) {
             error.Timeout => return error.Timeout,
+            // Every other receive failure ends this connection: peer reset/close,
+            // cancellation during graceful shutdown (error.Canceled), and resource
+            // exhaustion all mean "stop reading and close" — handleConn closes the
+            // socket on error.Closed regardless, so distinct handling would be unused.
             else => return error.Closed,
         };
         if (msg.data.len == 0) return error.Closed;
