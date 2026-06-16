@@ -189,6 +189,22 @@ fn handler(a: zax.Alloc) !zax.Response {
 }
 ```
 
+For Server-Sent Events, `Response.sse(Ctx, ctx, fn)` sets `text/event-stream` and
+hands the handler an `Sse` writer (each `send` is flushed):
+
+```zig
+const Feed = struct { n: usize };
+fn feed(f: *const Feed, s: *zax.Sse) anyerror!void {
+    var i: usize = 0;
+    while (i < f.n) : (i += 1) try s.send(.{ .event = "tick", .data = "hi" });
+}
+fn handler(a: zax.Alloc) !zax.Response {
+    const f = try a.value.create(Feed);
+    f.* = .{ .n = 10 };
+    return zax.Response.sse(Feed, f, feed);
+}
+```
+
 ## Limits & timeouts
 
 Configurable via `ServerOptions`:
