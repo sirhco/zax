@@ -129,6 +129,12 @@ Return a response *without* calling `next` to short-circuit (e.g. auth → 401).
 `deleteWith`/`routeWith`) runs middleware for that route only — after the global
 chain, before the handler, in tuple order.
 
+### Route groups
+
+`app.group(prefix, .{ &mw })` groups routes under a shared prefix and middleware;
+groups nest. `const api = app.group("/api", .{&auth}); try api.get("/users", h);`
+registers `GET /api/users`, running global → group → handler.
+
 ### Errors
 
 Return a canonical error to produce a status, or let an extractor failure map

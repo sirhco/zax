@@ -103,6 +103,20 @@ try app.getWith("/admin", .{&requireAuth}, adminHandler);
 try app.get("/", homeHandler); // unchanged, no per-route middleware
 ```
 
+### Route groups
+
+`app.group(prefix, .{ ...middleware })` returns a group that shares a path prefix
+and middleware across its routes. Groups nest and reuse the same verbs
+(`get`/`post`/… and `getWith`/…). Order is global → group → route → handler:
+
+```zig
+const api = app.group("/api", .{&requireAuth});
+try api.get("/users", listUsers);      // GET /api/users (global -> requireAuth -> handler)
+
+const v1 = api.group("/v1", .{&requestId});
+try v1.post("/items", createItem);     // POST /api/v1/items
+```
+
 ## Fallback
 
 Register a handler for requests that match no route — a custom 404 or an SPA
