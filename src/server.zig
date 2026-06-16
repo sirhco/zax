@@ -276,6 +276,54 @@ fn allowHeader(arena: std.mem.Allocator, allowed: router.MethodSet) []const u8 {
     return list.items;
 }
 
+/// Build an Io.Timeout from milliseconds; 0 means no timeout (blocking).
+fn msTimeout(ms_val: u32) Io.Timeout {
+    if (ms_val == 0) return .none;
+    return .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(@intCast(ms_val)), .clock = .awake } };
+}
+
+/// A manual, timeout-capable connection reader. Owns a fixed buffer and a
+/// [start, end) window of received-but-unconsumed bytes. Compaction runs only at
+/// request boundaries, so slices the parser hands out never move mid-request.
+const ConnReader = struct {
+    socket: net.Socket,
+    io: Io,
+    buf: []u8,
+    start: usize = 0,
+    end: usize = 0,
+
+    const FillError = error{ Timeout, BufferFull, Closed };
+
+    fn buffered(self: *const ConnReader) []const u8 {
+        return self.buf[self.start..self.end];
+    }
+
+    fn consume(self: *ConnReader, n: usize) void {
+        self.start += n;
+    }
+
+    fn compact(self: *ConnReader) void {
+        if (self.start == 0) return;
+        const len = self.end - self.start;
+        std.mem.copyForwards(u8, self.buf[0..len], self.buf[self.start..self.end]);
+        self.start = 0;
+        self.end = len;
+    }
+
+    /// Receive more bytes (up to the buffer's free tail) with `timeout`. Never
+    /// compacts (callers keep start==0 during a request), so returns BufferFull
+    /// when the buffer is full rather than moving in-use slices.
+    fn fill(self: *ConnReader, timeout: Io.Timeout) FillError!void {
+        if (self.end == self.buf.len) return error.BufferFull;
+        const msg = self.socket.receiveTimeout(self.io, self.buf[self.end..], timeout) catch |err| switch (err) {
+            error.Timeout => return error.Timeout,
+            else => return error.Closed,
+        };
+        if (msg.data.len == 0) return error.Closed;
+        self.end += msg.data.len;
+    }
+};
+
 const ReadError = error{ HeadTooLarge, IncompleteRequest };
 
 /// Fill the reader until a full request head is buffered, returning a `Parsed`
@@ -738,4 +786,23 @@ test "middleware: auth short-circuit and post-process header injection" {
 
     app.requestShutdown(io);
     loop_fut.await(io);
+}
+
+test "ConnReader buffer mechanics: buffered/consume/compact" {
+    var backing: [16]u8 = "ABCDEFGH________".*;
+    var cr = ConnReader{ .socket = undefined, .io = undefined, .buf = &backing, .start = 0, .end = 8 };
+    try testing.expectEqualStrings("ABCDEFGH", cr.buffered());
+    cr.consume(3); // drop "ABC"
+    try testing.expectEqualStrings("DEFGH", cr.buffered());
+    cr.compact(); // move "DEFGH" to front
+    try testing.expectEqual(@as(usize, 0), cr.start);
+    try testing.expectEqual(@as(usize, 5), cr.end);
+    try testing.expectEqualStrings("DEFGH", cr.buffered());
+    try testing.expectEqualStrings("DEFGH", backing[0..5]);
+}
+
+test "msTimeout: 0 disables, n builds a duration" {
+    try testing.expect(msTimeout(0) == .none);
+    const t = msTimeout(100);
+    try testing.expect(t == .duration);
 }
