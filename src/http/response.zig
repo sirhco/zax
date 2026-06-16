@@ -132,10 +132,11 @@ pub const Response = struct {
         return r;
     }
 
-    /// Serialize a complete HTTP/1.1 response (head + body) to `w`.
-    pub fn write(self: Response, w: *Writer) Writer.Error!void {
+    /// Emit the response head. `content_length` is emitted only when given
+    /// (a streamed response omits it).
+    fn writeHeaders(self: Response, w: *Writer, content_length: ?usize) Writer.Error!void {
         try w.print("HTTP/1.1 {d} {s}\r\n", .{ self.status.code(), self.status.reason() });
-        try w.print("content-length: {d}\r\n", .{self.body.len});
+        if (content_length) |n| try w.print("content-length: {d}\r\n", .{n});
         try w.print("content-type: {s}\r\n", .{self.content_type});
         for (self.headers) |h| {
             try w.print("{s}: {s}\r\n", .{ h.name, h.value });
@@ -143,7 +144,18 @@ pub const Response = struct {
         if (self.location) |loc| try w.print("location: {s}\r\n", .{loc});
         try w.writeAll(if (self.keep_alive) "connection: keep-alive\r\n" else "connection: close\r\n");
         try w.writeAll("\r\n");
+    }
+
+    /// Serialize a complete HTTP/1.1 response (head + buffered body) to `w`.
+    pub fn write(self: Response, w: *Writer) Writer.Error!void {
+        try self.writeHeaders(w, self.body.len);
         try w.writeAll(self.body);
+    }
+
+    /// Write the head for a streamed (connection-close) response: no
+    /// content-length, no body. The caller writes the body afterward.
+    pub fn writeHead(self: Response, w: *Writer) Writer.Error!void {
+        try self.writeHeaders(w, null);
     }
 };
 
@@ -321,4 +333,16 @@ test "json serializes a value into the arena" {
     const r = try Response.json(arena.allocator(), .{ .a = @as(u32, 1), .b = "x" });
     try testing.expectEqualStrings("application/json", r.content_type);
     try testing.expectEqualStrings("{\"a\":1,\"b\":\"x\"}", r.body);
+}
+
+test "writeHead omits content-length and sets connection close" {
+    var buf: [256]u8 = undefined;
+    var w = Writer.fixed(&buf);
+    const r = Response{ .content_type = "text/plain; charset=utf-8" };
+    r.writeHead(&w) catch unreachable;
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "content-length:") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "connection: close\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "content-type: text/plain; charset=utf-8\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n")); // head ends at the blank line; no body
 }
