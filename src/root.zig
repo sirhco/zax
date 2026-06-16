@@ -42,6 +42,7 @@ pub const urlencoded = @import("extract/urlencoded.zig");
 pub const Form = @import("extract/form.zig").Form;
 pub const Cookies = @import("extract/cookie.zig").Cookies;
 pub const Bytes = @import("extract/bytes.zig").Bytes;
+pub const files = @import("extract/files.zig");
 
 // --- Error model ---
 pub const err = @import("error.zig");
