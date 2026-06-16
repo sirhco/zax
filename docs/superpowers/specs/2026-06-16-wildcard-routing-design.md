@@ -37,8 +37,9 @@ the path. Axum's router has `/*path` for this purpose; Zax has no equivalent.
    recursive (depth = number of path segments).
 
 4. **Catch-all is terminal** — `*name` must be the last segment in a pattern.
-   Registering `/a/*tail/b` is a logic error; the implementation stops
-   descending after consuming the wildcard and sets the slot on the wildcard node.
+   The slot lives on the wildcard node, and `match` reads it only there, so any
+   segments registered after `*name` (`/a/*tail/b`) produce an unreachable route.
+   This is treated as a caller error (a future hardening could assert/reject it).
 
 ## Architecture
 
@@ -54,10 +55,11 @@ tree walk: "assets" → static child
 The wildcard child is a pointer on each `Node`, parallel to `param_child`.
 `getOrPutSlot` recognises a `*name` segment and routes to/creates
 `wildcard_child`, storing the capture name in `param_name` (the existing field,
-reused). `match` consults `wildcard_child` as a last resort at any node: when
-the current segment matches neither static nor param, and a `wildcard_child`
-exists, the remainder of the path string (from the start of the current segment
-to the end of `path`) is captured in one slice and the walk terminates.
+reused). `match` is recursive (`matchNode`): at each node it tries static, then
+param, then `wildcard_child`, in that order, and backtracks to the next kind if a
+chosen subtree dead-ends. When the wildcard is taken, the remainder of the path
+string (from the start of the current segment to the end of `path`) is captured
+in one zero-copy slice and that branch returns.
 
 No changes are needed to `router.zig`, `path.zig`, `server.zig`, or the extract
 layer. The wildcard is registered and dispatched as an ordinary named param; the
@@ -78,7 +80,7 @@ holds the terminal payload.
 ### 2. `getOrPutSlot` — wildcard branch
 
 ```zig
-if (seg[0] == '*') {
+} else if (seg[0] == '*') {
     const name = seg[1..];
     if (node.wildcard_child == null) {
         const child = try self.gpa.create(Node);
@@ -86,49 +88,53 @@ if (seg[0] == '*') {
         node.wildcard_child = child;
     }
     node = node.wildcard_child.?;
-    break; // catch-all is terminal — no further segments
 }
 ```
 
-Inserted after the `:name` branch, before the static branch. The `break`
-enforces terminality: any segments after `*name` in the pattern are silently
-ignored (the plan phase may add an assertion/error instead).
+Inserted as an `else if` between the `:name` branch and the static `else`
+branch. There is no early `break`: terminality is a convention (the slot lives on
+the wildcard node and `match` only reads it there), so segments after `*name`
+just build an unreachable subtree (caller error).
 
-### 3. `match` — wildcard fallback, with offset tracking
+### 3. `match` — recursive, with backtracking and offset tracking
 
-The match loop needs the byte offset of the current segment within `path` so
-the wildcard capture can be a zero-copy slice of the tail. Add an `offset`
-tracker alongside `segs`:
+`match` delegates to a recursive `matchNode` that resolves the next non-empty
+segment and tries children in precedence order, returning on the first non-null
+result and falling through otherwise. The segment iterator is passed by value so
+each branch resumes independently. The wildcard capture is a zero-copy slice of
+the tail, computed by pointer arithmetic (`seg` is always a subslice of `path`):
 
 ```zig
-var offset: usize = 0;
-var segs = std.mem.splitScalar(u8, path, '/');
-while (segs.next()) |seg| {
-    if (seg.len == 0) { offset += 1; continue; }
-    if (node.static.get(seg)) |child| {
-        node = child;
-    } else if (node.param_child) |child| {
+fn matchNode(node, path, segs, params_buf, n) MatchError!?Match {
+    var it = segs;
+    const seg = while (it.next()) |s| { if (s.len != 0) break s; } else {
+        const value = node.slot orelse return null;       // no more segments
+        return .{ .value = value, .params = params_buf[0..n] };
+    };
+
+    if (node.static.get(seg)) |child| {                   // 1. static
+        if (try matchNode(child, path, it, params_buf, n)) |m| return m;
+    }
+    if (node.param_child) |child| {                       // 2. param
         if (n == params_buf.len) return error.TooManyParams;
         params_buf[n] = .{ .name = child.param_name, .value = seg };
-        n += 1;
-        node = child;
-    } else if (node.wildcard_child) |child| {
-        if (n == params_buf.len) return error.TooManyParams;
-        // Capture from offset to end of path (tail includes all slashes).
-        params_buf[n] = .{ .name = child.param_name, .value = path[offset..] };
-        n += 1;
-        const value = child.slot orelse return null;
-        return .{ .value = value, .params = params_buf[0..n] };
-    } else {
-        return null;
+        if (try matchNode(child, path, it, params_buf, n + 1)) |m| return m;
     }
-    offset += seg.len + 1; // +1 for the '/' separator
+    if (node.wildcard_child) |child| {                    // 3. wildcard (terminal)
+        if (child.slot) |value| {
+            if (n == params_buf.len) return error.TooManyParams;
+            const offset = @intFromPtr(seg.ptr) - @intFromPtr(path.ptr);
+            params_buf[n] = .{ .name = child.param_name, .value = path[offset..] };
+            return .{ .value = value, .params = params_buf[0 .. n + 1] };
+        }
+    }
+    return null;
 }
 ```
 
-Because the wildcard match returns immediately (it is terminal), the main
-`node.slot` check at the bottom of `match` is reached only for non-wildcard
-paths — behaviour is unchanged for existing routes.
+An abandoned param branch leaves a stale write at `params_buf[n]`, but a later
+wildcard overwrites that same index and returns `params_buf[0 .. n + 1]`, so no
+stale param leaks. Behaviour for existing static/param routes is unchanged.
 
 ### 4. `deinit` — recurse into wildcard child
 
