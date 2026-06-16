@@ -173,7 +173,7 @@ See [`docs/deploy-https.md`](docs/deploy-https.md).
 ## Run
 
 ```sh
-zig build test     # 52 tests
+zig build test     # full unit + integration suite
 zig build run      # demo server on :8080
 zig build bench    # micro + loopback load benchmarks (ReleaseFast); warmup + multi-sample
 ```
