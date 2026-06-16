@@ -133,7 +133,7 @@ pub fn group(self: *Self, comptime prefix: []const u8, comptime mws: anytype) Gr
   /api/v1/items`, body `G(Grp(V1(H)))` (global → group → subgroup → handler).
 - **Short-circuit scoping:** group with `requireAuth` → every group route 401
   without auth, 200 with; a route registered directly on `app` is unaffected.
-- **Group root route:** `api.get("", ping)` (or `"/"`) registers `/api`.
+- **Group root route:** `api.get("", ping)` registers the bare prefix `/api`.
 - **Flakiness:** real-socket tests run 3×.
 
 ## Files
