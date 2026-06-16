@@ -123,6 +123,12 @@ try app.use(&poweredBy);
 
 Return a response *without* calling `next` to short-circuit (e.g. auth → 401).
 
+### Per-route middleware
+
+`app.getWith(pattern, .{ &mwA, &mwB }, handler)` (also `postWith`/`putWith`/
+`deleteWith`/`routeWith`) runs middleware for that route only — after the global
+chain, before the handler, in tuple order.
+
 ### Errors
 
 Return a canonical error to produce a status, or let an extractor failure map

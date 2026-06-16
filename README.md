@@ -87,6 +87,22 @@ try app.use(&requestId);
 
 Middleware run after routing, so `404`/`405` short-circuit before the chain.
 
+### Per-route middleware
+
+`getWith` / `postWith` / `putWith` / `deleteWith` (and the generic `routeWith`)
+attach middleware to a single route. They run after the global chain and before
+the handler, in tuple order:
+
+```zig
+fn requireAuth(ctx: *const Api.Context, next: *Api.Next) anyerror!zax.Response {
+    if (ctx.req.header("authorization") == null) return zax.Response.fromStatus(.unauthorized);
+    return next.run();
+}
+
+try app.getWith("/admin", .{&requireAuth}, adminHandler);
+try app.get("/", homeHandler); // unchanged, no per-route middleware
+```
+
 ## Fallback
 
 Register a handler for requests that match no route — a custom 404 or an SPA
