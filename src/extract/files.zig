@@ -32,6 +32,7 @@ pub fn safeJoin(arena: std.mem.Allocator, root: []const u8, requested: []const u
     while (it.next()) |seg| {
         if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return null;
         if (std.mem.indexOfScalar(u8, seg, '\\') != null) return null;
+        for (seg) |c| if (c < 0x20) return null; // reject NUL and other control bytes
     }
     return std.fmt.allocPrint(arena, "{s}/{s}", .{ root, requested }) catch null;
 }
@@ -60,7 +61,9 @@ pub const Files = struct {
         return .{ .content_type = contentType(path), .body = bytes };
     }
 
-    /// Safely serve `requested` under `root`. Traversal (`..`/absolute) → 404.
+    /// Safely serve `requested` under `root`, guarding TEXTUAL traversal
+    /// (`..`/absolute/control bytes → 404). Note: symlinks inside `root` are
+    /// followed (not resolved against `root`).
     pub fn dir(self: Files, root: []const u8, requested: []const u8) !Response {
         const joined = safeJoin(self.arena, root, requested) orelse return error.NotFound;
         return self.file(joined);
@@ -103,6 +106,17 @@ test "Files.dir rejects traversal -> NotFound" {
     try testing.expectError(error.NotFound, f.dir(".", "../secret"));
 }
 
+test "Files.dir serves a safe path under root" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f = Files{ .io = io, .arena = arena.allocator() };
+    const r = try f.dir(".", "build.zig");
+    try testing.expect(std.mem.indexOf(u8, r.body, "pub fn build") != null);
+}
+
 test "contentType maps known extensions, defaults otherwise" {
     try testing.expectEqualStrings("text/html; charset=utf-8", contentType("index.html"));
     try testing.expectEqualStrings("text/css", contentType("a/b/style.css"));
@@ -124,4 +138,10 @@ test "safeJoin joins safe paths and rejects traversal" {
     try testing.expect(safeJoin(a, "static", "/etc/passwd") == null);
     try testing.expect(safeJoin(a, "static", "./x") == null);
     try testing.expect(safeJoin(a, "static", "a//b") == null);
+}
+
+test "safeJoin rejects control bytes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect(safeJoin(arena.allocator(), "static", "a\x00b") == null);
 }
