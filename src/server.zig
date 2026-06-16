@@ -745,6 +745,64 @@ test "per-route middleware: order is global -> route -> handler" {
     loop_fut.await(io);
 }
 
+test "per-route middleware: postWith/putWith/deleteWith register the intended method" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.postWith("/p", .{}, pingHandler);
+    try app.putWith("/u", .{}, pingHandler);
+    try app.deleteWith("/d", .{}, pingHandler);
+
+    const port: u16 = 18175;
+    var loop_fut = startTestApp(io, &app, port);
+
+    // POST /p -> 200 (correct method)
+    var b1: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "POST /p HTTP/1.1\r\nHost: x\r\n\r\n", &b1), "200 OK") != null);
+    // GET /p -> 405 (wrong method, proving it was registered as POST not GET)
+    var b2: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /p HTTP/1.1\r\nHost: x\r\n\r\n", &b2), "405 Method Not Allowed") != null);
+    // PUT /u -> 200
+    var b3: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "PUT /u HTTP/1.1\r\nHost: x\r\n\r\n", &b3), "200 OK") != null);
+    // GET /u -> 405 (wrong method)
+    var b4: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /u HTTP/1.1\r\nHost: x\r\n\r\n", &b4), "405 Method Not Allowed") != null);
+    // DELETE /d -> 200
+    var b5: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "DELETE /d HTTP/1.1\r\nHost: x\r\n\r\n", &b5), "200 OK") != null);
+    // GET /d -> 405 (wrong method)
+    var b6: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /d HTTP/1.1\r\nHost: x\r\n\r\n", &b6), "405 Method Not Allowed") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "per-route middleware: empty tuple behaves like a plain route" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.getWith("/e", .{}, pingHandler);
+
+    const port: u16 = 18176;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /e HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "200 OK") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
 fn schemeHandler(f: Forwarded) Response {
     return Response.text(f.scheme);
 }
