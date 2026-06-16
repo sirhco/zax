@@ -156,6 +156,21 @@ Note: classification keys off the error value, so handlers should use the
 canonical `zax.Error` set; an unrecognized error is treated as `500`, and
 `on_error` can re-classify by inspecting the raw error.
 
+## Responses
+
+Build responses with the `Response` constructors:
+
+| Constructor | Result |
+|---|---|
+| `Response.text(s)` | `text/plain` body |
+| `Response.html(s)` | `text/html` body |
+| `Response.json(arena, value)` | JSON-serialized body (`application/json`) |
+| `Response.jsonRaw(s)` | pre-serialized JSON string |
+| `Response.redirect(status, loc)` | redirect with a `Location` header |
+| `Response.seeOther/temporaryRedirect/permanentRedirect(loc)` | 303 / 307 / 308 redirects |
+| `Response.fromStatus(s)` | bare status |
+| `r.withHeader(arena, name, value)` | add a response header |
+
 ## Limits & timeouts
 
 Configurable via `ServerOptions`:

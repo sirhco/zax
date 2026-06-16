@@ -138,6 +138,12 @@ fn getUser(s: zax.State(*const Store), p: zax.Path(struct { id: u64 })) !zax.Res
 A bad `:id` (non-numeric) is a `400`, a malformed `Json` body a `422`. Customize
 error bodies with `app.onError(&renderFn)`.
 
+### Responses
+
+`Response.text` / `.html` / `.json(arena, value)` / `.redirect(.found, "/path")` /
+`.fromStatus(.created)` cover the common cases; `r.withHeader(arena, n, v)` adds
+headers.
+
 ### Limits & timeouts
 
 Harden the server via options: `max_body_size` (413 over-limit), `read_timeout_ms`
