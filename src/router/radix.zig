@@ -4,8 +4,18 @@
 //! into the path passed to `match` (zero-copy); parameter names are slices into
 //! the pattern stored at insert time.
 //!
-//! Static segments take priority over a parameter segment at the same node, so
-//! "/users/me" wins over "/users/:id" for the path "/users/me".
+//! A segment written "*name" is a catch-all: it must be the terminal
+//! (last) segment and matches one or more remaining segments, capturing the
+//! entire tail (slashes included) zero-copy into the named param. The empty
+//! tail is not matched ("/assets/*path" matches "/assets/x" and "/assets/a/b"
+//! but not bare "/assets" or "/assets/").
+//!
+//! Precedence at a node is static > param > wildcard: "/users/me" wins over
+//! "/users/:id" for the path "/users/me", and a static or single-segment param
+//! match wins over a catch-all at the same node. If a higher-precedence subtree
+//! dead-ends, the matcher falls back to the next kind, so a catch-all still
+//! captures paths that a sibling param could not complete (e.g. with both
+//! "/a/:id" and "/a/*rest", the path "/a/x/y" falls through to "*rest").
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -30,6 +40,7 @@ pub fn Tree(comptime T: type) type {
             static: std.StringHashMapUnmanaged(*Node) = .{},
             param_child: ?*Node = null,
             param_name: []const u8 = "",
+            wildcard_child: ?*Node = null,
             slot: ?T = null,
 
             fn deinit(node: *Node, gpa: Allocator) void {
@@ -37,6 +48,7 @@ pub fn Tree(comptime T: type) type {
                 while (it.next()) |child| child.*.deinit(gpa);
                 node.static.deinit(gpa);
                 if (node.param_child) |child| child.deinit(gpa);
+                if (node.wildcard_child) |child| child.deinit(gpa);
                 gpa.destroy(node);
             }
         };
@@ -71,6 +83,14 @@ pub fn Tree(comptime T: type) type {
                         node.param_child = child;
                     }
                     node = node.param_child.?;
+                } else if (seg[0] == '*') {
+                    const name = seg[1..];
+                    if (node.wildcard_child == null) {
+                        const child = try self.gpa.create(Node);
+                        child.* = .{ .param_name = name };
+                        node.wildcard_child = child;
+                    }
+                    node = node.wildcard_child.?;
                 } else {
                     const gop = try node.static.getOrPut(self.gpa, seg);
                     if (!gop.found_existing) {
@@ -87,24 +107,55 @@ pub fn Tree(comptime T: type) type {
         /// Match `path`, filling captured params into `params_buf`. Returns null
         /// when no route's terminal payload is set for the path.
         pub fn match(self: *Self, path: []const u8, params_buf: []Param) MatchError!?Match {
-            var node = self.root;
-            var n: usize = 0;
-            var segs = std.mem.splitScalar(u8, path, '/');
-            while (segs.next()) |seg| {
-                if (seg.len == 0) continue;
-                if (node.static.get(seg)) |child| {
-                    node = child;
-                } else if (node.param_child) |child| {
+            const segs = std.mem.splitScalar(u8, path, '/');
+            return matchNode(self.root, path, segs, params_buf, 0);
+        }
+
+        /// Recursive matcher. Tries children in precedence order static > param >
+        /// wildcard, falling back to the next kind when a chosen subtree
+        /// dead-ends. `n` is the number of params captured so far in
+        /// `params_buf`. The segment iterator is passed by value so each branch
+        /// resumes from the same position independently.
+        fn matchNode(
+            node: *Node,
+            path: []const u8,
+            segs: std.mem.SplitIterator(u8, .scalar),
+            params_buf: []Param,
+            n: usize,
+        ) MatchError!?Match {
+            // Advance to the next non-empty segment.
+            var it = segs;
+            const seg = while (it.next()) |s| {
+                if (s.len != 0) break s;
+            } else {
+                // No more segments: this node is the terminal for the path.
+                const value = node.slot orelse return null;
+                return .{ .value = value, .params = params_buf[0..n] };
+            };
+
+            // 1. Static child (exact literal) wins first.
+            if (node.static.get(seg)) |child| {
+                if (try matchNode(child, path, it, params_buf, n)) |m| return m;
+            }
+
+            // 2. Param child (single segment capture) next.
+            if (node.param_child) |child| {
+                if (n == params_buf.len) return error.TooManyParams;
+                params_buf[n] = .{ .name = child.param_name, .value = seg };
+                if (try matchNode(child, path, it, params_buf, n + 1)) |m| return m;
+            }
+
+            // 3. Wildcard child (catch-all) last: captures the rest of the path.
+            if (node.wildcard_child) |child| {
+                if (child.slot) |value| {
                     if (n == params_buf.len) return error.TooManyParams;
-                    params_buf[n] = .{ .name = child.param_name, .value = seg };
-                    n += 1;
-                    node = child;
-                } else {
-                    return null;
+                    const offset = @intFromPtr(seg.ptr) - @intFromPtr(path.ptr);
+                    params_buf[n] = .{ .name = child.param_name, .value = path[offset..] };
+                    return .{ .value = value, .params = params_buf[0 .. n + 1] };
                 }
             }
-            const value = node.slot orelse return null;
-            return .{ .value = value, .params = params_buf[0..n] };
+
+            return null;
         }
     };
 }
@@ -194,4 +245,52 @@ test "TooManyParams when capture buffer is too small" {
     try put(&tree, "/:a/:b/:c", 1);
     var pb: [2]Param = undefined;
     try testing.expectError(error.TooManyParams, tree.match("/1/2/3", &pb));
+}
+
+test "catch-all captures multi-segment tail" {
+    var tree = try Tree(usize).init(testing.allocator);
+    defer tree.deinit();
+    try put(&tree, "/assets/*path", 1);
+
+    const p = "/assets/css/app.css";
+    var pb: [8]Param = undefined;
+    const m = (try tree.match(p, &pb)).?;
+    try testing.expectEqual(@as(usize, 1), m.value);
+    try testing.expectEqual(@as(usize, 1), m.params.len);
+    try testing.expectEqualStrings("path", m.params[0].name);
+    try testing.expectEqualStrings("css/app.css", m.params[0].value);
+    // Zero-copy: tail points inside `p`.
+    const base = @intFromPtr(p.ptr);
+    const vp = @intFromPtr(m.params[0].value.ptr);
+    try testing.expect(vp >= base and vp < base + p.len);
+}
+
+test "catch-all captures a single-segment tail" {
+    var tree = try Tree(usize).init(testing.allocator);
+    defer tree.deinit();
+    try put(&tree, "/assets/*path", 1);
+    var pb: [8]Param = undefined;
+    const m = (try tree.match("/assets/x", &pb)).?;
+    try testing.expectEqualStrings("x", m.params[0].value);
+}
+
+test "catch-all does NOT match the bare prefix (empty tail)" {
+    var tree = try Tree(usize).init(testing.allocator);
+    defer tree.deinit();
+    try put(&tree, "/assets/*path", 1);
+    var pb: [8]Param = undefined;
+    try testing.expect((try tree.match("/assets", &pb)) == null);
+    try testing.expect((try tree.match("/assets/", &pb)) == null);
+}
+
+test "static and param beat catch-all at the same node" {
+    var tree = try Tree(usize).init(testing.allocator);
+    defer tree.deinit();
+    try put(&tree, "/a/*rest", 1);
+    try put(&tree, "/a/:id", 2);
+    try put(&tree, "/a/exact", 3);
+    var pb: [8]Param = undefined;
+    try testing.expectEqual(@as(usize, 3), (try tree.match("/a/exact", &pb)).?.value); // static
+    try testing.expectEqual(@as(usize, 2), (try tree.match("/a/99", &pb)).?.value);    // param (single seg)
+    try testing.expectEqual(@as(usize, 1), (try tree.match("/a/x/y", &pb)).?.value);   // wildcard (deeper)
 }
