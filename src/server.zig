@@ -184,6 +184,63 @@ pub fn App(comptime AppState: type) type {
             return self.routeWith(.DELETE, pattern, mws, h);
         }
 
+        /// A route group: a shared comptime `prefix` and shared `group_mws` (a
+        /// comptime middleware tuple) applied to every route registered through
+        /// it. Created by `App.group`; nestable via `Group.group`.
+        pub fn Group(comptime prefix: []const u8, comptime group_mws: anytype) type {
+            return struct {
+                const G = @This();
+                app: *Self,
+
+                pub fn route(self: G, method: request.Method, comptime pattern: []const u8, comptime handler: anytype) !void {
+                    return self.app.routeWith(method, prefix ++ pattern, group_mws, handler);
+                }
+                pub fn routeWith(self: G, method: request.Method, comptime pattern: []const u8, comptime mws: anytype, comptime handler: anytype) !void {
+                    return self.app.routeWith(method, prefix ++ pattern, group_mws ++ mws, handler);
+                }
+
+                pub fn get(self: G, comptime p: []const u8, comptime h: anytype) !void {
+                    return self.route(.GET, p, h);
+                }
+                pub fn post(self: G, comptime p: []const u8, comptime h: anytype) !void {
+                    return self.route(.POST, p, h);
+                }
+                pub fn put(self: G, comptime p: []const u8, comptime h: anytype) !void {
+                    return self.route(.PUT, p, h);
+                }
+                pub fn delete(self: G, comptime p: []const u8, comptime h: anytype) !void {
+                    return self.route(.DELETE, p, h);
+                }
+
+                pub fn getWith(self: G, comptime p: []const u8, comptime mws: anytype, comptime h: anytype) !void {
+                    return self.routeWith(.GET, p, mws, h);
+                }
+                pub fn postWith(self: G, comptime p: []const u8, comptime mws: anytype, comptime h: anytype) !void {
+                    return self.routeWith(.POST, p, mws, h);
+                }
+                pub fn putWith(self: G, comptime p: []const u8, comptime mws: anytype, comptime h: anytype) !void {
+                    return self.routeWith(.PUT, p, mws, h);
+                }
+                pub fn deleteWith(self: G, comptime p: []const u8, comptime mws: anytype, comptime h: anytype) !void {
+                    return self.routeWith(.DELETE, p, mws, h);
+                }
+
+                /// Nest a sub-group: prefixes concatenate, middleware tuples
+                /// concatenate (outer group middleware run before inner).
+                pub fn group(self: G, comptime sub: []const u8, comptime more_mws: anytype) Group(prefix ++ sub, group_mws ++ more_mws) {
+                    return .{ .app = self.app };
+                }
+            };
+        }
+
+        /// Open a route group with a shared comptime `prefix` and shared
+        /// middleware `mws` (a comptime tuple). Routes registered through the
+        /// returned `Group` are registered at `prefix ++ pattern` with `mws`
+        /// prepended to their chain. Pass `.{}` for a prefix-only group.
+        pub fn group(self: *Self, comptime prefix: []const u8, comptime mws: anytype) Group(prefix, mws) {
+            return .{ .app = self };
+        }
+
         /// Bind and start listening. Separated from `acceptLoop` so callers can
         /// guarantee the socket is listening before driving traffic (e.g. tests
         /// that spawn the loop and then connect).
@@ -195,13 +252,13 @@ pub fn App(comptime AppState: type) type {
         /// Accept connections until shutdown, handling each in a Group task, then
         /// drain in-flight connections. Returns when fully drained.
         pub fn acceptLoop(self: *Self, io: Io) void {
-            var group: Io.Group = .init;
+            var conn_group: Io.Group = .init;
             while (!self.shutting_down.load(.acquire)) {
                 const srv = if (self.server) |*s| s else break;
                 const stream = srv.accept(io) catch break;
-                group.async(io, handleConn, .{ self, io, stream });
+                conn_group.async(io, handleConn, .{ self, io, stream });
             }
-            group.await(io) catch {};
+            conn_group.await(io) catch {};
         }
 
         /// Convenience: bind then run the accept loop on the current task.
@@ -691,6 +748,14 @@ fn wrapR2(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
 }
 fn bodyH() Response {
     return Response.text("H");
+}
+fn wrapGrp(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
+    const r = try next.run();
+    return Response.text(try std.fmt.allocPrint(ctx.arena, "Grp({s})", .{r.body}));
+}
+fn wrapV1(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
+    const r = try next.run();
+    return Response.text(try std.fmt.allocPrint(ctx.arena, "V1({s})", .{r.body}));
 }
 
 test "per-route middleware: scoped to its route + short-circuits" {
@@ -1445,6 +1510,89 @@ test "wildcard: catch-all captures the path tail end-to-end" {
     const r3 = doRequest(io, port, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", &rb3);
     try testing.expect(std.mem.indexOf(u8, r3, "200 OK") != null);
 
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "group: prefixes routes; non-prefixed path 404s" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    const api = app.group("/api", .{});
+    try api.get("/users", pingHandler);
+    const port: u16 = 18177;
+    var loop_fut = startTestApp(io, &app, port);
+    var rb: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /api/users HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "200 OK") != null);
+    var rb2: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /users HTTP/1.1\r\nHost: x\r\n\r\n", &rb2), "404 Not Found") != null);
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "group: group middleware applies in order global -> group -> route -> handler" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.use(&wrapG);
+    const api = app.group("/api", .{&wrapGrp});
+    try api.getWith("/x", .{&wrapR}, bodyH);
+    try app.get("/plain", bodyH);
+    const port: u16 = 18178;
+    var loop_fut = startTestApp(io, &app, port);
+    var rb: [2048]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, doRequest(io, port, "GET /api/x HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "G(Grp(R(H)))"));
+    var rb2: [2048]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, doRequest(io, port, "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n", &rb2), "G(H)"));
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "group: nested groups compose prefix and middleware" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.use(&wrapG);
+    const api = app.group("/api", .{&wrapGrp});
+    const v1 = api.group("/v1", .{&wrapV1});
+    try v1.get("/items", bodyH);
+    const port: u16 = 18179;
+    var loop_fut = startTestApp(io, &app, port);
+    var rb: [2048]u8 = undefined;
+    const r = doRequest(io, port, "GET /api/v1/items HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+    try testing.expect(std.mem.endsWith(u8, r, "G(Grp(V1(H)))"));
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "group: shared middleware short-circuits group routes only" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    const api = app.group("/api", .{&requireAuth});
+    try api.get("/secret", pingHandler);
+    try app.get("/open", pingHandler);
+    const port: u16 = 18180;
+    var loop_fut = startTestApp(io, &app, port);
+    var rb: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /api/secret HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "401 Unauthorized") != null);
+    var rb2: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /api/secret HTTP/1.1\r\nHost: x\r\nAuthorization: t\r\n\r\n", &rb2), "200 OK") != null);
+    var rb3: [2048]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /open HTTP/1.1\r\nHost: x\r\n\r\n", &rb3), "200 OK") != null);
     app.requestShutdown(io);
     loop_fut.await(io);
 }
