@@ -18,6 +18,7 @@ pub fn Context(comptime AppState: type) type {
         params: []const Param,
         state: AppState,
         arena: std.mem.Allocator,
+        io: std.Io,
         /// Whether `X-Forwarded-*` headers should be trusted (set by the server
         /// from `Options.trust_forwarded`; only true behind a controlled proxy).
         trust_forwarded: bool = false,
@@ -120,7 +121,7 @@ fn makeCtx(db: *const Db, params: []const Param, query: []const u8, body: []cons
         .headers = &.{},
         .body = body,
     };
-    return .{ .req = &S.req, .params = params, .state = db, .arena = arena };
+    return .{ .req = &S.req, .params = params, .state = db, .arena = arena, .io = undefined };
 }
 
 // Handlers under test.

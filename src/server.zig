@@ -219,7 +219,7 @@ pub fn App(comptime AppState: type) type {
                     parsed.request.isPersistent() and
                     (served + 1) < self.opts.max_keep_alive_requests;
 
-                var resp = self.dispatch(&parsed.request, &arena);
+                var resp = self.dispatch(io, &parsed.request, &arena);
                 const streamed = resp.streamer != null;
                 resp.keep_alive = persistent and !streamed;
                 if (!writeResponse(w, resp)) break;
@@ -233,12 +233,13 @@ pub fn App(comptime AppState: type) type {
 
         /// Route one already-read request and run its handler. Every failure
         /// path maps to an HTTP status rather than propagating.
-        fn makeCtx(self: *Self, req: *const request.Request, params: []const Param, arena: *std.heap.ArenaAllocator) Ctx {
+        fn makeCtx(self: *Self, io: Io, req: *const request.Request, params: []const Param, arena: *std.heap.ArenaAllocator) Ctx {
             return .{
                 .req = req,
                 .params = params,
                 .state = self.state,
                 .arena = arena.allocator(),
+                .io = io,
                 .trust_forwarded = self.opts.trust_forwarded,
             };
         }
@@ -250,26 +251,26 @@ pub fn App(comptime AppState: type) type {
             return .{ .status = info.status, .body = info.reason };
         }
 
-        fn dispatch(self: *Self, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
+        fn dispatch(self: *Self, io: Io, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
             var params_buf: [max_params]Param = undefined;
             const outcome = self.router.match(req.method, req.path, &params_buf) catch {
-                const ctx = self.makeCtx(req, &.{}, arena);
+                const ctx = self.makeCtx(io, req, &.{}, arena);
                 return self.renderError(err_mod.Error.BadRequest, &ctx);
             };
 
             switch (outcome) {
                 .not_found => {
-                    const ctx = self.makeCtx(req, &.{}, arena);
+                    const ctx = self.makeCtx(io, req, &.{}, arena);
                     return self.renderError(err_mod.Error.NotFound, &ctx);
                 },
                 .method_not_allowed => |allowed| {
-                    const ctx = self.makeCtx(req, &.{}, arena);
+                    const ctx = self.makeCtx(io, req, &.{}, arena);
                     var resp = self.renderError(err_mod.Error.MethodNotAllowed, &ctx);
                     resp = resp.withHeader(ctx.arena, "allow", allowHeader(ctx.arena, allowed)) catch resp;
                     return resp;
                 },
                 .found => |f| {
-                    const ctx = self.makeCtx(req, f.params, arena);
+                    const ctx = self.makeCtx(io, req, f.params, arena);
                     return Chn.run(self.mws.items, f.handler, &ctx) catch |e| self.renderError(e, &ctx);
                 },
             }
@@ -463,7 +464,7 @@ fn doRequest(io: Io, port: u16, raw: []const u8, resp_buf: []u8) []const u8 {
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
     defer cs.close(io);
-    var rb: [4096]u8 = undefined;
+    var rb: [64 * 1024]u8 = undefined;
     var cr = cs.reader(io, &rb);
     var wb: [512]u8 = undefined;
     var cw = cs.writer(io, &wb);
@@ -649,7 +650,7 @@ test "hot path: static-handler dispatch + serialize make zero heap allocations" 
     var hs: [request.max_headers]Header = undefined;
     const parsed = parser.parseHead("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", &hs) catch unreachable;
 
-    const resp = app.dispatch(&parsed.request, &arena);
+    const resp = app.dispatch(undefined, &parsed.request, &arena);
     try testing.expectEqualStrings("pong", resp.body);
 
     var ob: [256]u8 = undefined;
@@ -676,7 +677,7 @@ test "contrast: Json handler does allocate (discriminates the alloc check)" {
     var parsed = parser.parseHead(raw, &hs) catch unreachable;
     parsed.request.body = raw[parsed.head_len .. parsed.head_len + parsed.request.contentLength().?];
 
-    const resp = app.dispatch(&parsed.request, &arena);
+    const resp = app.dispatch(undefined, &parsed.request, &arena);
     try testing.expectEqualStrings("grace", resp.body);
     try testing.expect(failing.allocations > 0); // JSON parse used the arena
 }
@@ -1106,6 +1107,43 @@ test "sse: event stream over a real connection" {
     try testing.expect(std.mem.indexOf(u8, resp, "connection: close\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, resp, "event: tick\nid: 1\ndata: hi\n\n") != null);
     try testing.expect(std.mem.indexOf(u8, resp, ": bye\n") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+const Files = @import("extract/files.zig").Files;
+fn serveBuild(files: Files) !Response {
+    return files.file("build.zig");
+}
+const PathRest = struct { rest: []const u8 };
+fn serveAsset(p: @import("extract/path.zig").Path(PathRest), files: Files) !Response {
+    return files.dir(".", p.value.rest);
+}
+
+test "files: serve a file and reject traversal over a real connection" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/build", serveBuild);
+    try app.get("/assets/:rest", serveAsset);
+
+    const port: u16 = 18160;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [64 * 1024]u8 = undefined;
+    const r1 = doRequest(io, port, "GET /build HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r1, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "content-length:") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "pub fn build") != null);
+
+    var rb2: [2048]u8 = undefined;
+    const r2 = doRequest(io, port, "GET /assets/.. HTTP/1.1\r\nHost: x\r\n\r\n", &rb2);
+    try testing.expect(std.mem.indexOf(u8, r2, "404 Not Found") != null);
 
     app.requestShutdown(io);
     loop_fut.await(io);
