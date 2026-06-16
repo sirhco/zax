@@ -6,6 +6,7 @@
 const std = @import("std");
 const Writer = std.Io.Writer;
 const Header = @import("request.zig").Header;
+const sse_mod = @import("sse.zig");
 
 pub const Status = enum(u16) {
     ok = 200,
@@ -150,6 +151,23 @@ pub const Response = struct {
             .streamer = .{ .context = context, .func = &Erased.call },
             .keep_alive = false,
         };
+    }
+
+    /// Build an SSE (`text/event-stream`) streamed response. `func` receives the
+    /// arena-allocated `context` and an `Sse` event writer. Connection-close
+    /// framing (like `stream`); each event is flushed as it is sent.
+    pub fn sse(
+        comptime Ctx: type,
+        context: *const Ctx,
+        comptime func: fn (*const Ctx, *sse_mod.Sse) anyerror!void,
+    ) Response {
+        const Wrap = struct {
+            fn run(c: *const Ctx, w: *Writer) anyerror!void {
+                var s = sse_mod.Sse{ .w = w };
+                return func(c, &s);
+            }
+        };
+        return Response.stream(Ctx, context, Wrap.run, "text/event-stream");
     }
 
     /// Return a copy of `self` with `(name, value)` appended to its headers,
