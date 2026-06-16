@@ -43,6 +43,7 @@ pub const Form = @import("extract/form.zig").Form;
 pub const Cookies = @import("extract/cookie.zig").Cookies;
 pub const Bytes = @import("extract/bytes.zig").Bytes;
 pub const files = @import("extract/files.zig");
+pub const Files = files.Files;
 
 // --- Error model ---
 pub const err = @import("error.zig");

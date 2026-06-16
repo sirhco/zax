@@ -42,6 +42,7 @@ pub fn classify(e: anyerror) ErrorInfo {
         error.Internal => .{ .status = .internal_server_error, .reason = "internal server error" },
         error.NotImplemented => .{ .status = .not_implemented, .reason = "not implemented" },
         error.ServiceUnavailable => .{ .status = .service_unavailable, .reason = "service unavailable" },
+        error.PayloadTooLarge => .{ .status = .payload_too_large, .reason = "payload too large" },
 
         // Extractor tags (from path.zig/query.zig/json.zig/scalar.zig).
         error.MissingPathParam => .{ .status = .bad_request, .reason = "missing path parameter" },
@@ -73,6 +74,10 @@ test "classify maps extractor tags to 4xx" {
     try testing.expectEqual(Status.bad_request, classify(error.MissingQueryParam).status);
     try testing.expectEqual(Status.unprocessable_entity, classify(error.InvalidJson).status);
     try testing.expectEqualStrings("invalid JSON body", classify(error.InvalidJson).reason);
+}
+
+test "classify maps PayloadTooLarge to 413" {
+    try testing.expectEqual(Status.payload_too_large, classify(error.PayloadTooLarge).status);
 }
 
 test "classify maps unknown errors to 500" {

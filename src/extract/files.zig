@@ -36,7 +36,72 @@ pub fn safeJoin(arena: std.mem.Allocator, root: []const u8, requested: []const u
     return std.fmt.allocPrint(arena, "{s}/{s}", .{ root, requested }) catch null;
 }
 
+pub const Files = struct {
+    io: std.Io,
+    arena: std.mem.Allocator,
+
+    pub const zax_is_extractor = true;
+    pub const zax_is_body = false;
+
+    pub fn fromContext(ctx: anytype) error{}!Files {
+        return .{ .io = ctx.io, .arena = ctx.arena };
+    }
+
+    /// Serve an explicit (handler-controlled) file path, relative to the cwd.
+    pub fn file(self: Files, path: []const u8) !Response {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            self.io, path, self.arena, std.Io.Limit.limited(default_max_file_size),
+        ) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir, error.IsDir => return error.NotFound,
+            error.AccessDenied, error.PermissionDenied => return error.Forbidden,
+            error.StreamTooLong => return error.PayloadTooLarge,
+            else => return error.Internal,
+        };
+        return .{ .content_type = contentType(path), .body = bytes };
+    }
+
+    /// Safely serve `requested` under `root`. Traversal (`..`/absolute) → 404.
+    pub fn dir(self: Files, root: []const u8, requested: []const u8) !Response {
+        const joined = safeJoin(self.arena, root, requested) orelse return error.NotFound;
+        return self.file(joined);
+    }
+};
+
 const testing = std.testing;
+const Io = std.Io;
+
+test "Files.file reads an existing file and sets content type" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const f = Files{ .io = io, .arena = arena.allocator() };
+    const r = try f.file("build.zig"); // present at the repo root (test cwd)
+    try testing.expect(std.mem.indexOf(u8, r.body, "pub fn build") != null);
+    try testing.expectEqualStrings("application/octet-stream", r.content_type); // .zig unmapped
+}
+
+test "Files.file missing path -> NotFound" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f = Files{ .io = io, .arena = arena.allocator() };
+    try testing.expectError(error.NotFound, f.file("this-does-not-exist.txt"));
+}
+
+test "Files.dir rejects traversal -> NotFound" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f = Files{ .io = io, .arena = arena.allocator() };
+    try testing.expectError(error.NotFound, f.dir(".", "../secret"));
+}
 
 test "contentType maps known extensions, defaults otherwise" {
     try testing.expectEqualStrings("text/html; charset=utf-8", contentType("index.html"));
