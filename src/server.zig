@@ -43,6 +43,15 @@ pub const Options = struct {
     /// Cap on requests served per connection before closing (bounds resource
     /// use on long-lived connections).
     max_keep_alive_requests: usize = 100,
+    /// Reject a body whose Content-Length exceeds this (413). 0 = bounded only
+    /// by the read buffer. Effective limit = min(max_body_size, read_buffer_size
+    /// − head length).
+    max_body_size: usize = 0,
+    /// Deadline (ms) to receive a request's full head+body once its first byte
+    /// arrives. Defeats slow-trickle. 0 = no timeout.
+    read_timeout_ms: u32 = 30_000,
+    /// Max wait (ms) for the next request on a keep-alive connection. 0 = none.
+    idle_timeout_ms: u32 = 60_000,
     /// Trust `X-Forwarded-Proto/Host/For` headers. Enable ONLY when Zax sits
     /// behind a reverse proxy you control (it terminates TLS and sets these);
     /// otherwise clients could spoof them. See docs/deploy-https.md.
@@ -176,24 +185,34 @@ pub fn App(comptime AppState: type) type {
             var arena = std.heap.ArenaAllocator.init(self.gpa);
             defer arena.deinit();
 
-            var sr = stream.reader(io, read_buf);
+            var cr = ConnReader{ .socket = stream.socket, .io = io, .buf = read_buf };
             var sw = stream.writer(io, write_buf);
-            const r = &sr.interface;
             const w = &sw.interface;
+
+            const read_to = msTimeout(self.opts.read_timeout_ms);
+            const idle_to = msTimeout(self.opts.idle_timeout_ms);
 
             var served: usize = 0;
             while (true) {
                 _ = arena.reset(.retain_capacity);
+                cr.compact(); // request boundary: move pipelined leftover to front (start=0)
 
                 var hs: [request.max_headers]Header = undefined;
-                var parsed = readHead(r, &hs) catch break; // EOF or malformed head -> close
+                var parsed = readHead(&cr, &hs, read_to, idle_to) catch |e| {
+                    terminalResponse(w, e);
+                    break;
+                };
 
                 // Chunked request bodies are unsupported: reject and close.
                 if (parsed.request.isChunked()) {
                     _ = writeResponse(w, Response.fromStatus(.length_required));
                     break;
                 }
-                attachBody(r, &parsed) catch break;
+
+                readBody(&cr, &parsed, self.opts.max_body_size, read_to) catch |e| {
+                    terminalResponse(w, e);
+                    break;
+                };
                 const consumed = parsed.head_len + parsed.request.body.len;
 
                 const persistent = self.opts.keep_alive and
@@ -204,7 +223,7 @@ pub fn App(comptime AppState: type) type {
                 resp.keep_alive = persistent;
                 if (!writeResponse(w, resp)) break;
 
-                r.toss(consumed);
+                cr.consume(consumed);
                 served += 1;
                 if (!persistent) break;
             }
@@ -328,30 +347,59 @@ const ConnReader = struct {
     }
 };
 
-const ReadError = error{ HeadTooLarge, IncompleteRequest };
+const RequestError = error{
+    HeaderFieldsTooLarge, // -> 431
+    BodyTooLarge, // -> 413
+    Timeout, // -> 408
+    Malformed, // -> 400
+    Closed, // -> close, no response
+};
 
-/// Fill the reader until a full request head is buffered, returning a `Parsed`
-/// whose slices point into the reader buffer (body not yet attached).
-fn readHead(r: *Io.Reader, hs: *[request.max_headers]Header) ReadError!parser.Parsed {
+/// Fill until a full head is parsed. The first receive (no bytes yet for this
+/// request) uses the idle deadline; subsequent receives use the read deadline.
+fn readHead(cr: *ConnReader, hs: *[request.max_headers]Header, read_to: Io.Timeout, idle_to: Io.Timeout) RequestError!parser.Parsed {
     while (true) {
-        if (parser.parseHead(r.buffered(), hs)) |p| {
+        if (parser.parseHead(cr.buffered(), hs)) |p| {
             return p;
         } else |err| switch (err) {
             error.Incomplete => {},
-            else => return error.IncompleteRequest,
+            error.TooManyHeaders => return error.HeaderFieldsTooLarge,
+            else => return error.Malformed,
         }
-        r.fillMore() catch return error.IncompleteRequest;
-        if (r.buffered().len == r.buffer.len) return error.HeadTooLarge;
+        const waiting_for_first_byte = cr.buffered().len == 0;
+        cr.fill(if (waiting_for_first_byte) idle_to else read_to) catch |e| switch (e) {
+            error.Timeout => return if (waiting_for_first_byte) error.Closed else error.Timeout,
+            error.BufferFull => return error.HeaderFieldsTooLarge,
+            error.Closed => return error.Closed,
+        };
     }
 }
 
-/// Ensure the Content-Length body is buffered and attach it as a zero-copy slice.
-fn attachBody(r: *Io.Reader, parsed: *parser.Parsed) ReadError!void {
-    if (parsed.request.contentLength()) |clen| {
-        while (r.buffered().len < parsed.head_len + clen) {
-            r.fillMore() catch return error.IncompleteRequest;
-        }
-        parsed.request.body = r.buffered()[parsed.head_len .. parsed.head_len + clen];
+/// Validate Content-Length against the effective limit, then fill until the body
+/// is buffered and attach it as a zero-copy slice.
+fn readBody(cr: *ConnReader, parsed: *parser.Parsed, max_body: usize, read_to: Io.Timeout) RequestError!void {
+    const clen = parsed.request.contentLength() orelse return;
+    const buf_bound = cr.buf.len - parsed.head_len;
+    const limit = if (max_body == 0) buf_bound else @min(max_body, buf_bound);
+    if (clen > limit) return error.BodyTooLarge;
+    while (cr.buffered().len < parsed.head_len + clen) {
+        cr.fill(read_to) catch |e| switch (e) {
+            error.Timeout => return error.Timeout,
+            error.BufferFull => return error.BodyTooLarge,
+            error.Closed => return error.Closed,
+        };
+    }
+    parsed.request.body = cr.buffered()[parsed.head_len .. parsed.head_len + clen];
+}
+
+/// Send the terminal response for a RequestError (or nothing for Closed).
+fn terminalResponse(w: *Io.Writer, e: RequestError) void {
+    switch (e) {
+        error.HeaderFieldsTooLarge => _ = writeResponse(w, Response.fromStatus(.request_header_fields_too_large)),
+        error.BodyTooLarge => _ = writeResponse(w, Response.fromStatus(.payload_too_large)),
+        error.Timeout => _ = writeResponse(w, Response.fromStatus(.request_timeout)),
+        error.Malformed => _ = writeResponse(w, Response.fromStatus(.bad_request)),
+        error.Closed => {},
     }
 }
 
@@ -809,4 +857,47 @@ test "msTimeout: 0 disables, n builds a duration" {
     try testing.expect(msTimeout(0) == .none);
     const t = msTimeout(100);
     try testing.expect(t == .duration);
+}
+
+test "limits: oversized body returns 413" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{ .max_body_size = 10 });
+    defer app.deinit();
+    try app.post("/u", pingHandler);
+
+    const port: u16 = 18110;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const r = doRequest(io, port, "POST /u HTTP/1.1\r\nContent-Length: 20\r\n\r\n01234567890123456789", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "413 Payload Too Large") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "limits: oversized header block returns 431" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{ .read_buffer_size = 64 });
+    defer app.deinit();
+    try app.get("/", pingHandler);
+
+    const port: u16 = 18111;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const long = "GET / HTTP/1.1\r\nX-Long: " ++ ("a" ** 120) ++ "\r\n\r\n";
+    const r = doRequest(io, port, long, &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "431 Request Header Fields Too Large") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
 }
