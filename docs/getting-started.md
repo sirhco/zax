@@ -143,6 +143,13 @@ error bodies with `app.onError(&renderFn)`.
 `app.fallback(handler)` handles unmatched requests (custom 404 or SPA index); it
 runs through the global middleware chain.
 
+### Wildcard / catch-all routes
+
+`*name` captures the rest of the path (with slashes) into one param — useful for
+serving a static directory: `app.get("/assets/*path", handler)` with
+`Path(struct { path: []const u8 })`. Catch-all must be last and does not match
+the bare prefix.
+
 ### Responses
 
 `Response.text` / `.html` / `.json(arena, value)` / `.redirect(.found, "/path")` /

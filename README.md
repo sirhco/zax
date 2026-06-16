@@ -102,6 +102,21 @@ fn spa(files: zax.Files) !zax.Response { return files.file("static/index.html");
 try app.fallback(spa);
 ```
 
+## Wildcard routes
+
+A `*name` segment is a catch-all: it matches one or more remaining path
+segments and captures the tail (slashes included) into `name`. It must be the
+last segment, and does not match the bare prefix (`/assets/*path` matches
+`/assets/a/b` but not `/assets`). Static and `:param` routes take priority.
+
+```zig
+fn serveAsset(p: zax.Path(struct { path: []const u8 }), files: zax.Files) !zax.Response {
+    return files.dir("static", p.value.path);
+}
+try app.get("/assets/*path", serveAsset);
+// GET /assets/css/app.css -> path = "css/app.css"
+```
+
 ## Design notes
 
 - **Zero-copy.** The HTTP/1.1 parser and router return `[]const u8` slices
