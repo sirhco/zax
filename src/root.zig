@@ -33,6 +33,7 @@ pub const State = @import("extract/state.zig").State;
 pub const Alloc = @import("extract/alloc.zig").Alloc;
 pub const Forwarded = @import("extract/forwarded.zig").Forwarded;
 pub const url = @import("url.zig");
+pub const urlencoded = @import("extract/urlencoded.zig");
 
 // --- Error model ---
 pub const err = @import("error.zig");
