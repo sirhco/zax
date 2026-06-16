@@ -335,4 +335,5 @@ test {
     // (the bench test target builds this module; runtime use alone does not
     // pull in an imported file's test blocks).
     _ = @import("bench/metrics.zig");
+    _ = @import("bench/counting.zig");
 }
