@@ -1,14 +1,10 @@
 //! `Query(T)` — bind URL query-string fields to struct `T`. Each field maps to a
 //! `key=value` pair. Optional fields (`?T`) default to null when absent; required
-//! fields error if missing. Values are parsed via the shared scalar parser.
-//!
-//! v1 limitation: no percent-decoding yet (raw bytes), and repeated keys take the
-//! first occurrence. Both are noted for a later pass.
+//! fields error (`error.MissingField`) if missing. Binding, percent/plus decoding,
+//! and scalar parsing are delegated to `urlencoded.bind` over `ctx.req.query`.
 
 const std = @import("std");
-const scalar = @import("scalar.zig");
-
-pub const Error = error{ MissingQueryParam, InvalidScalar, InvalidEnum };
+const urlencoded = @import("urlencoded.zig");
 
 pub fn Query(comptime T: type) type {
     if (@typeInfo(T) != .@"struct") @compileError("Query(T): T must be a struct");
@@ -18,43 +14,20 @@ pub fn Query(comptime T: type) type {
         pub const zax_is_extractor = true;
         pub const zax_is_body = false;
 
-        pub fn fromContext(ctx: anytype) Error!@This() {
-            var v: T = undefined;
-            inline for (@typeInfo(T).@"struct".fields) |f| {
-                const raw = find(ctx.req.query, f.name);
-                switch (@typeInfo(f.type)) {
-                    .optional => |o| {
-                        @field(v, f.name) = if (raw) |r| try scalar.parse(o.child, r) else null;
-                    },
-                    else => {
-                        const r = raw orelse return error.MissingQueryParam;
-                        @field(v, f.name) = try scalar.parse(f.type, r);
-                    },
-                }
-            }
-            return .{ .value = v };
+        pub fn fromContext(ctx: anytype) !@This() {
+            return .{ .value = try urlencoded.bind(T, ctx.req.query, ctx.arena) };
         }
     };
-}
-
-/// Find the first `key=value` whose key equals `name` in a `&`-separated query.
-fn find(query: []const u8, name: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, query, '&');
-    while (it.next()) |pair| {
-        if (pair.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
-    }
-    return null;
 }
 
 // ----------------------------------------------------------------------------
 const testing = std.testing;
 const Request = @import("../http/request.zig").Request;
 
-fn ctxWithQuery(q: []const u8) struct { req: *const Request } {
+fn ctxWithQuery(q: []const u8) struct { req: *const Request, arena: std.mem.Allocator } {
     const S = struct {
         var req: Request = undefined;
+        var arena: std.heap.ArenaAllocator = undefined;
     };
     S.req = .{
         .method = .GET,
@@ -65,7 +38,8 @@ fn ctxWithQuery(q: []const u8) struct { req: *const Request } {
         .headers = &.{},
         .body = "",
     };
-    return .{ .req = &S.req };
+    S.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    return .{ .req = &S.req, .arena = S.arena.allocator() };
 }
 
 test "Query binds required and optional fields" {
@@ -78,5 +52,11 @@ test "Query binds required and optional fields" {
 
 test "Query missing required field errors" {
     const Q = Query(struct { active: bool });
-    try testing.expectError(error.MissingQueryParam, Q.fromContext(ctxWithQuery("page=1")));
+    try testing.expectError(error.MissingField, Q.fromContext(ctxWithQuery("page=1")));
+}
+
+test "Query decodes percent and plus" {
+    const Q = Query(struct { q: []const u8 });
+    const r = try Q.fromContext(ctxWithQuery("q=a+b%26c"));
+    try testing.expectEqualStrings("a b&c", r.value.q);
 }
