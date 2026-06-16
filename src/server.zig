@@ -410,6 +410,8 @@ const testing = std.testing;
 const Path = @import("extract/path.zig").Path;
 const State = @import("extract/state.zig").State;
 const Forwarded = @import("extract/forwarded.zig").Forwarded;
+const Form = @import("extract/form.zig").Form;
+const Cookies = @import("extract/cookie.zig").Cookies;
 
 const Db = struct { msg: []const u8 };
 const TestApp = App(*const Db);
@@ -967,6 +969,36 @@ test "timeout: idle keep-alive connection is closed after idle_timeout" {
     // Now stall past idle_timeout; the server should close the connection.
     Io.sleep(io, Io.Duration.fromMilliseconds(300), .awake) catch {};
     try testing.expectError(error.EndOfStream, rdr.interface.fillMore());
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+fn formCookieHandler(c: Cookies, a: @import("extract/alloc.zig").Alloc, body: Form(struct { name: []const u8 })) !Response {
+    const sid = c.get("sid") orelse "none";
+    const out = try std.fmt.allocPrint(a.value, "{s}|{s}", .{ body.value.name, sid });
+    return Response.text(out);
+}
+
+test "input parity: Form + Cookies over a real connection" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.post("/submit", formCookieHandler);
+
+    const port: u16 = 18120;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    // urlencoded body "name=ada+lovelace" (17 bytes); cookie sid=xyz.
+    const raw = "POST /submit HTTP/1.1\r\nHost: x\r\nCookie: sid=xyz\r\nContent-Length: 17\r\n\r\nname=ada+lovelace";
+    const r = doRequest(io, port, raw, &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+    try testing.expect(std.mem.endsWith(u8, r, "ada lovelace|xyz"));
 
     app.requestShutdown(io);
     loop_fut.await(io);
