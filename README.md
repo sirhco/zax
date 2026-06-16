@@ -87,6 +87,21 @@ try app.use(&requestId);
 
 Middleware run after routing, so `404`/`405` short-circuit before the chain.
 
+## Fallback
+
+Register a handler for requests that match no route — a custom 404 or an SPA
+index fallback. It runs through the global middleware chain (not-found only;
+method-not-allowed still returns 405):
+
+```zig
+fn notFound() zax.Response { return zax.Response.fromStatus(.not_found); }
+try app.fallback(notFound);
+
+// SPA: serve index.html for any unknown path
+fn spa(files: zax.Files) !zax.Response { return files.file("static/index.html"); }
+try app.fallback(spa);
+```
+
 ## Design notes
 
 - **Zero-copy.** The HTTP/1.1 parser and router return `[]const u8` slices

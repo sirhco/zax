@@ -138,6 +138,11 @@ fn getUser(s: zax.State(*const Store), p: zax.Path(struct { id: u64 })) !zax.Res
 A bad `:id` (non-numeric) is a `400`, a malformed `Json` body a `422`. Customize
 error bodies with `app.onError(&renderFn)`.
 
+### Fallback
+
+`app.fallback(handler)` handles unmatched requests (custom 404 or SPA index); it
+runs through the global middleware chain.
+
 ### Responses
 
 `Response.text` / `.html` / `.json(arena, value)` / `.redirect(.found, "/path")` /
