@@ -1249,3 +1249,41 @@ test "fallback: SPA-style 200 + middleware applies; 405 unaffected" {
     app.requestShutdown(io);
     loop_fut.await(io);
 }
+
+fn echoTail(p: Path(struct { path: []const u8 })) Response {
+    return Response.text(p.value.path);
+}
+
+test "wildcard: catch-all captures the path tail end-to-end" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ping", pingHandler);
+    try app.get("/assets/*path", echoTail);
+
+    const port: u16 = 18172;
+    var loop_fut = startTestApp(io, &app, port);
+
+    // Multi-segment tail captured (slashes preserved).
+    var rb: [2048]u8 = undefined;
+    const r = doRequest(io, port, "GET /assets/css/app.css HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+    try testing.expect(std.mem.endsWith(u8, r, "css/app.css"));
+
+    // Bare prefix does NOT match the catch-all -> 404.
+    var rb2: [2048]u8 = undefined;
+    const r2 = doRequest(io, port, "GET /assets HTTP/1.1\r\nHost: x\r\n\r\n", &rb2);
+    try testing.expect(std.mem.indexOf(u8, r2, "404 Not Found") != null);
+
+    // An unrelated static route still works (wildcard didn't shadow it).
+    var rb3: [2048]u8 = undefined;
+    const r3 = doRequest(io, port, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", &rb3);
+    try testing.expect(std.mem.indexOf(u8, r3, "200 OK") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
