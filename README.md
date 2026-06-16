@@ -153,6 +153,20 @@ Note: classification keys off the error value, so handlers should use the
 canonical `zax.Error` set; an unrecognized error is treated as `500`, and
 `on_error` can re-classify by inspecting the raw error.
 
+## Limits & timeouts
+
+Configurable via `ServerOptions`:
+
+| Option | Default | Effect |
+|---|---|---|
+| `max_body_size` | `0` (buffer-bound) | Content-Length over the limit → `413` |
+| `read_timeout_ms` | `30000` | full head+body must arrive within this once started → `408` |
+| `idle_timeout_ms` | `60000` | max wait for the next keep-alive request → connection closed |
+
+Request bodies are buffered in the read buffer, so they are bounded by
+`read_buffer_size`; oversized header blocks return `431`. Set a timeout to `0` to
+disable it.
+
 ## Performance
 
 Zax aims for low per-request overhead, but treat that as a design goal backed by
@@ -181,15 +195,13 @@ comparison against `std.http.Server`, http.zig, or non-Zig servers exists yet.
 ## Status & limitations
 
 A focused HTTP/1.1 framework. **Shipped:** routing, comptime extractors,
-keep-alive, middleware, graceful drain, and HTTPS via reverse-proxy termination
-(forwarded-header trust).
+keep-alive, middleware, graceful drain, HTTPS via reverse-proxy termination
+(forwarded-header trust), request size limits, and read/idle timeouts.
 
 **Not yet built:** in-process TLS (blocked on std — use a proxy), `Headers`/
 `Form`/`Cookie` extractors, chunked request
 bodies (rejected with 411), HTTP/2, and the experimental `Io.Evented` backend
 (its std networking is incomplete in 0.16.0, so Zax runs on `Io.Threaded`).
 
-A keep-alive **idle timeout** is not yet wired (connections close on client
-disconnect or the per-connection request cap); and a `SIGINT`/`SIGTERM` handler
-is not auto-installed (`Io.Threaded` uses signals for cancellation) — wire one to
-call `app.requestShutdown(io)`.
+A `SIGINT`/`SIGTERM` handler is not auto-installed (`Io.Threaded` uses signals
+for cancellation) — wire one to call `app.requestShutdown(io)`.

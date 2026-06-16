@@ -135,6 +135,19 @@ fn getUser(s: zax.State(*const Store), p: zax.Path(struct { id: u64 })) !zax.Res
 A bad `:id` (non-numeric) is a `400`, a malformed `Json` body a `422`. Customize
 error bodies with `app.onError(&renderFn)`.
 
+### Limits & timeouts
+
+Harden the server via options: `max_body_size` (413 over-limit), `read_timeout_ms`
+(408 on slow requests), `idle_timeout_ms` (close idle keep-alive connections):
+
+```zig
+var app = try Api.init(init.gpa, &store, .{
+    .max_body_size = 1 << 20,
+    .read_timeout_ms = 15_000,
+    .idle_timeout_ms = 30_000,
+});
+```
+
 ## 5. Validate
 
 **Unit-test handlers without a server.** Each extractor is a struct with a public
