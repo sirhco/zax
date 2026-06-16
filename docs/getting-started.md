@@ -229,4 +229,5 @@ See [`deploy-https.md`](deploy-https.md).
 
 - API reference and design notes: [`../README.md`](../README.md)
 - Verified 0.16.0 primitives Zax is built on: [`zig016-api-notes.md`](zig016-api-notes.md)
-- Performance: `zig build bench` (read the caveats).
+- Performance: `zig build bench` runs warmup + multi-sample benchmarks (median ns/op ± stddev).
+  Flags via `--`: `--samples`, `--warmup`, `--iters`, `--conns`, `--reqs`. Read the caveats in `README.md`.

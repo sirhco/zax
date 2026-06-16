@@ -175,7 +175,7 @@ See [`docs/deploy-https.md`](docs/deploy-https.md).
 ```sh
 zig build test     # 52 tests
 zig build run      # demo server on :8080
-zig build bench    # micro + loopback load benchmarks (ReleaseFast)
+zig build bench    # micro + loopback load benchmarks (ReleaseFast); warmup + multi-sample
 ```
 
 ```sh
@@ -300,8 +300,23 @@ anything else. What is actually validated:
   handler that uses no allocating extractor (`server.zig`). `Json` is the only
   extractor that allocates, and a contrast test confirms it does.
 - **Reproducible micro + load benchmarks** — `zig build bench` (ReleaseFast)
-  prints per-op cost for parse/route/serialize and an end-to-end loopback
-  keep-alive throughput + latency-percentile run.
+  runs a discarded warmup pass then N timed samples, reporting
+  `median ns/op +/- stddev` for micro-benchmarks (parse/route/serialize) and
+  median throughput with latency percentiles for the end-to-end loopback run.
+  Configurable via flags forwarded after `--`:
+
+  | Flag | Default | Meaning |
+  |------|---------|---------|
+  | `--iters N` | 2 000 000 | micro-benchmark loop size |
+  | `--samples N` | 5 | timed passes (median is taken across these) |
+  | `--warmup N` | 1 | discarded warmup passes (0 = skip) |
+  | `--conns N` | 8 | keep-alive connections for e2e load |
+  | `--reqs N` | 5 000 | requests per connection |
+
+  Example: `zig build bench -- --conns 64 --reqs 2000 --samples 5 --warmup 1`
+
+  `iters`, `conns`, `reqs`, and `samples` must be ≥ 1; a bad or zero value
+  prints a usage line and exits nonzero.
 
 **Read the benchmark caveats.** The e2e numbers are **loopback, in-process,
 single-machine, and not comparative** — the client shares the process and Io
