@@ -294,3 +294,40 @@ test "static and param beat catch-all at the same node" {
     try testing.expectEqual(@as(usize, 2), (try tree.match("/a/99", &pb)).?.value);    // param (single seg)
     try testing.expectEqual(@as(usize, 1), (try tree.match("/a/x/y", &pb)).?.value);   // wildcard (deeper)
 }
+
+test "root-level catch-all captures the whole path" {
+    var tree = try Tree(usize).init(testing.allocator);
+    defer tree.deinit();
+    try put(&tree, "/*rest", 1);
+    var pb: [8]Param = undefined;
+    const m = (try tree.match("/x/y", &pb)).?;
+    try testing.expectEqual(@as(usize, 1), m.value);
+    try testing.expectEqualStrings("rest", m.params[0].name);
+    try testing.expectEqualStrings("x/y", m.params[0].value);
+    // Root with empty tail is not a match.
+    try testing.expect((try tree.match("/", &pb)) == null);
+}
+
+test "params before a catch-all all capture" {
+    var tree = try Tree(usize).init(testing.allocator);
+    defer tree.deinit();
+    try put(&tree, "/:a/:b/*rest", 1);
+    var pb: [8]Param = undefined;
+    const m = (try tree.match("/1/2/x/y", &pb)).?;
+    try testing.expectEqual(@as(usize, 1), m.value);
+    try testing.expectEqual(@as(usize, 3), m.params.len);
+    try testing.expectEqualStrings("a", m.params[0].name);
+    try testing.expectEqualStrings("1", m.params[0].value);
+    try testing.expectEqualStrings("b", m.params[1].name);
+    try testing.expectEqualStrings("2", m.params[1].value);
+    try testing.expectEqualStrings("rest", m.params[2].name);
+    try testing.expectEqualStrings("x/y", m.params[2].value);
+}
+
+test "TooManyParams when a catch-all overflows the buffer" {
+    var tree = try Tree(usize).init(testing.allocator);
+    defer tree.deinit();
+    try put(&tree, "/:a/*rest", 1);
+    var pb: [1]Param = undefined; // room for :a only; the wildcard needs a 2nd slot
+    try testing.expectError(error.TooManyParams, tree.match("/1/x", &pb));
+}
