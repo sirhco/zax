@@ -36,10 +36,11 @@ pub fn parse(args: []const []const u8) ParseError!Config {
         i += 1;
         field.* = std.fmt.parseInt(usize, args[i], 10) catch return error.BadValue;
     }
-    if (cfg.samples == 0) return error.BadValue;
+    if (cfg.samples == 0) return error.BadValue; // samples is the only field required >= 1; warmup/reqs/iters may be 0
     return cfg;
 }
 
+/// Sorts `samples` in place and returns the median (mean of the two middle values for even length; 0 for empty).
 pub fn median(samples: []f64) f64 {
     if (samples.len == 0) return 0;
     std.mem.sort(f64, samples, {}, std.sort.asc(f64));
@@ -115,4 +116,17 @@ test "percentile: p50/p99/edges" {
     try testing.expectEqual(@as(i96, 100), percentile(&s, 99));
     try testing.expectEqual(@as(i96, 100), percentile(&s, 100));
     try testing.expectEqual(@as(i96, 10), percentile(&s, 0));
+}
+
+test "parse: rejects negative and overflowing integers" {
+    try testing.expectError(error.BadValue, parse(&.{ "--conns", "-1" }));
+    try testing.expectError(error.BadValue, parse(&.{ "--iters", "99999999999999999999999" }));
+}
+
+test "median/stddev/percentile: empty inputs return 0" {
+    var empty: [0]f64 = .{};
+    try testing.expectApproxEqAbs(@as(f64, 0), median(&empty), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0), stddev(&empty), 1e-9);
+    const es: [0]i96 = .{};
+    try testing.expectEqual(@as(i96, 0), percentile(&es, 50));
 }
