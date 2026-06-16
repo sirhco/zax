@@ -159,6 +159,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Run `test` blocks from the bench module (e.g. src/bench/metrics.zig).
+    const bench_tests = b.addTest(.{ .root_module = bench_exe.root_module });
+    test_step.dependOn(&b.addRunArtifact(bench_tests).step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

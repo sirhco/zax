@@ -17,6 +17,11 @@ const zax = @import("zax");
 const Io = std.Io;
 const net = std.Io.net;
 
+const metrics = @import("bench/metrics.zig");
+comptime {
+    _ = metrics;
+} // ensure metrics tests are discovered by the bench test target
+
 const clock: Io.Clock = .awake; // monotonic
 
 fn nowNs(io: Io) i96 {
