@@ -18,6 +18,7 @@ const Io = std.Io;
 const net = std.Io.net;
 
 const metrics = @import("bench/metrics.zig");
+const counting = @import("bench/counting.zig");
 const Config = metrics.Config;
 
 const clock: Io.Clock = .awake; // monotonic
@@ -62,6 +63,8 @@ pub fn main(init: std.process.Init) !void {
     try out.writeAll("=== Zax benchmark (ReleaseFast recommended) ===\n\n");
     try microBenchmarks(io, gpa, out, cfg);
     try endToEnd(io, gpa, out, cfg);
+    try out.writeAll("\n");
+    try memoryMetrics(io, gpa, out, cfg);
     try out.flush();
 }
 
@@ -280,6 +283,67 @@ fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void 
     try out.print("  latency p90     {d:.1} us\n", .{us(metrics.percentile(all, 90))});
     try out.print("  latency p99     {d:.1} us\n", .{us(metrics.percentile(all, 99))});
     try out.print("  latency max     {d:.1} us\n", .{us(all[all.len - 1])});
+}
+
+// ---------------------------------------------------------------------------
+// Section C: memory metrics (bytes/req + peak RSS)
+// ---------------------------------------------------------------------------
+// Kept separate from `endToEnd` so the throughput numbers there stay free of
+// the CountingAllocator's atomic-counter overhead. Only the SERVER's allocator
+// is wrapped; the client side (runLoad) uses the raw gpa, so client
+// allocations are not counted.
+fn memoryMetrics(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void {
+    try out.print("-- memory (loopback, {d} conns x {d} reqs) --\n", .{ cfg.conns, cfg.reqs });
+
+    var ca = counting.CountingAllocator{ .child = gpa };
+    const cgpa = ca.allocator(); // server allocations counted
+
+    var db = Db{};
+    var app = try Api.init(cgpa, &db, .{});
+    defer app.deinit();
+    try app.get("/bench", benchHandler);
+
+    const port: u16 = 18098;
+    try app.bind(io, .{ .ip4 = .loopback(port) });
+    var loop_fut = io.async(Api.acceptLoop, .{ &app, io });
+    defer {
+        app.requestShutdown(io);
+        loop_fut.await(io);
+    }
+
+    const total = cfg.conns * cfg.reqs;
+
+    // Warmup load(s): client uses the raw gpa (not counted).
+    var w: usize = 0;
+    while (w < cfg.warmup) : (w += 1) {
+        const scratch = try gpa.alloc(i96, total);
+        defer gpa.free(scratch);
+        _ = try runLoad(io, gpa, port, cfg.conns, cfg.reqs, scratch);
+    }
+
+    const lat = try gpa.alloc(i96, total);
+    defer gpa.free(lat);
+    const before = ca.bytesAllocated();
+    _ = try runLoad(io, gpa, port, cfg.conns, cfg.reqs, lat);
+    const after = ca.bytesAllocated();
+
+    const per_req: f64 = @as(f64, @floatFromInt(after - before)) / @as(f64, @floatFromInt(total));
+    try out.print("  bytes/req       {d:.1}\n", .{per_req});
+    const rss = peakRssMb();
+    if (rss < 0) {
+        try out.writeAll("  peak RSS        n/a\n");
+    } else {
+        try out.print("  peak RSS        {d:.1} MB (process)\n", .{rss});
+    }
+}
+
+fn peakRssMb() f64 {
+    const builtin = @import("builtin");
+    const ru = std.posix.getrusage(std.posix.rusage.SELF);
+    const maxrss: f64 = @floatFromInt(ru.maxrss);
+    // darwin/ios report bytes; linux reports KiB.
+    const bytes = if (builtin.os.tag == .macos or builtin.os.tag == .ios) maxrss else maxrss * 1024.0;
+    return bytes / (1024.0 * 1024.0);
 }
 
 fn worker(io: Io, port: u16, out_lat: []i96) void {
