@@ -147,6 +147,9 @@ writes the body incrementally (connection-close, no Content-Length). `Response.s
 streams Server-Sent Events: `fn` gets an `Sse` writer and calls
 `s.send(.{ .event = "...", .data = "..." })` per event.
 
+Serve files with the `Files` extractor: `files.file("static/app.css")` or the
+traversal-safe `files.dir("static", requested)`.
+
 ### Limits & timeouts
 
 Harden the server via options: `max_body_size` (413 over-limit), `read_timeout_ms`

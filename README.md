@@ -61,6 +61,7 @@ extractor must come last** (enforced at compile time).
 | `Form(T)` | urlencoded request body → struct fields (must be last) |
 | `Cookies` | request cookies via `.get(name)` |
 | `Bytes` | the raw request body (`[]const u8`, must be last) |
+| `Files` | serve files: `files.file(path)` / `files.dir(root, requested)` (traversal-safe) |
 
 Handlers return anything that satisfies `IntoResponse`: a `Response`, a `Status`,
 a byte-string, or a custom type with `pub fn intoResponse(self) Response`. A
@@ -204,6 +205,11 @@ fn handler(a: zax.Alloc) !zax.Response {
     return zax.Response.sse(Feed, f, feed);
 }
 ```
+
+Serve static files with the `Files` extractor — `files.file("static/index.html")`
+for an explicit path, or `files.dir("static", requested)` to safely serve a
+request-derived path under a root (rejects `..`/absolute → 404). Files are
+buffered (Content-Length set), content-type inferred by extension.
 
 ## Limits & timeouts
 
