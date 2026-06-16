@@ -327,3 +327,10 @@ fn parseClen(head: []const u8) usize {
 fn us(ns: i96) f64 {
     return @as(f64, @floatFromInt(@as(i64, @intCast(ns)))) / 1000.0;
 }
+
+test {
+    // Ensure the metrics module's unit tests run under `zig build test`
+    // (the bench test target builds this module; runtime use alone does not
+    // pull in an imported file's test blocks).
+    _ = @import("bench/metrics.zig");
+}
