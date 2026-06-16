@@ -186,10 +186,14 @@ Added alongside the existing `param_child` cleanup.
   `safeJoin` splits on `/` and rejects empty segments (trailing slash produces
   an empty final segment) — `Files.dir` returns `error.NotFound` → 404.
   Correct; no special handling needed.
-- **Recursive matching:** the matcher backtracks across sibling node kinds, so
-  recursion depth equals the number of path segments. Path length is bounded by
-  the server's request-line limit, keeping depth bounded; extremely deep paths
-  are the theoretical cost of fallback (vs. the previous iterative walk).
+- **Recursive matching:** the matcher backtracks across sibling node kinds, so it
+  is recursive. Recursion only descends into a child that exists in the tree, so
+  depth is bounded by the **registered route tree depth** (developer-controlled),
+  not by attacker-supplied path length — a deep junk path reaches a node with no
+  matching child and returns null at once. Param chains are further capped by
+  `max_params = 16`. The request head is also bounded by `read_buffer_size`
+  (16 KiB). Depth is therefore small in practice; no explicit depth limit is
+  imposed.
 - **Param budget:** the wildcard capture consumes one slot of the `max_params`
   budget (16 in the server). A pattern with 16 prior `:name` segments and a
   `*tail` would overflow `TooManyParams`. In practice this is not a concern for
