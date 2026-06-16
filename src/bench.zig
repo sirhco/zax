@@ -240,6 +240,8 @@ fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void 
 
     // Measured samples: throughput per sample, plus per-sample latency buffers
     // so we can report percentiles from the median-throughput sample.
+    // Memory scales as ~samples × conns × reqs × 16 B (all samples retained
+    // because the median-throughput sample is not known until all finish).
     const thr = try gpa.alloc(f64, cfg.samples);
     defer gpa.free(thr);
     const lat_per_sample = try gpa.alloc([]i96, cfg.samples);

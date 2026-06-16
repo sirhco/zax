@@ -36,7 +36,12 @@ pub fn parse(args: []const []const u8) ParseError!Config {
         i += 1;
         field.* = std.fmt.parseInt(usize, args[i], 10) catch return error.BadValue;
     }
-    if (cfg.samples == 0) return error.BadValue; // samples is the only field required >= 1; warmup/reqs/iters may be 0
+    // Only `warmup` may be 0 (means "skip warmup").
+    // `iters`, `conns`, `reqs`, and `samples` must be >= 1: zero iters gives
+    // a 0/0 ns/op NaN in micro-benchmarks, and zero conns/reqs/samples cause
+    // an out-of-bounds index into the latency slice in the e2e section.
+    if (cfg.iters == 0 or cfg.conns == 0 or cfg.reqs == 0 or cfg.samples == 0)
+        return error.BadValue;
     return cfg;
 }
 
@@ -94,6 +99,10 @@ test "parse: errors" {
     try testing.expectError(error.MissingValue, parse(&.{"--conns"}));
     try testing.expectError(error.BadValue, parse(&.{ "--conns", "x" }));
     try testing.expectError(error.BadValue, parse(&.{ "--samples", "0" }));
+    // iters/conns/reqs must be >= 1; zero panics or produces NaN at runtime.
+    try testing.expectError(error.BadValue, parse(&.{ "--iters", "0" }));
+    try testing.expectError(error.BadValue, parse(&.{ "--conns", "0" }));
+    try testing.expectError(error.BadValue, parse(&.{ "--reqs", "0" }));
 }
 
 test "median: odd and even, unsorted" {
