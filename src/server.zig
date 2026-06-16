@@ -220,8 +220,10 @@ pub fn App(comptime AppState: type) type {
                     (served + 1) < self.opts.max_keep_alive_requests;
 
                 var resp = self.dispatch(&parsed.request, &arena);
-                resp.keep_alive = persistent;
+                const streamed = resp.streamer != null;
+                resp.keep_alive = persistent and !streamed;
                 if (!writeResponse(w, resp)) break;
+                if (streamed) break; // connection-close framing: close after a stream
 
                 cr.consume(consumed);
                 served += 1;
@@ -277,6 +279,12 @@ pub fn App(comptime AppState: type) type {
 
 /// Write and flush a response; returns false on a write error (caller closes).
 fn writeResponse(w: *Io.Writer, resp: Response) bool {
+    if (resp.streamer) |s| {
+        resp.writeHead(w) catch return false;
+        s.func(s.context, w) catch return false;
+        w.flush() catch return false;
+        return true;
+    }
     resp.write(w) catch return false;
     w.flush() catch return false;
     return true;
@@ -1006,6 +1014,53 @@ test "input parity: Form + Cookies over a real connection" {
 
 fn redirectHandler() Response {
     return Response.redirect(.found, "/next");
+}
+
+const Lines = struct { n: usize };
+fn writeLines(c: *const Lines, w: *Io.Writer) anyerror!void {
+    var i: usize = 0;
+    while (i < c.n) : (i += 1) try w.print("line{d}\n", .{i});
+}
+fn streamHandler(a: @import("extract/alloc.zig").Alloc) !Response {
+    const c = try a.value.create(Lines);
+    c.* = .{ .n = 3 };
+    return Response.stream(Lines, c, writeLines, "text/plain");
+}
+
+test "streaming: connection-close streamed body over a real connection" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/stream", streamHandler);
+
+    const port: u16 = 18140;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+    var wb: [128]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+    cw.interface.writeAll("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+
+    // Read to EOF (the server closes after a streamed, connection-close response).
+    var rb: [4096]u8 = undefined;
+    var rdr = cs.reader(io, &rb);
+    while (true) rdr.interface.fillMore() catch break;
+    const resp = rdr.interface.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "connection: close\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "content-length:") == null);
+    try testing.expect(std.mem.endsWith(u8, resp, "line0\nline1\nline2\n"));
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
 }
 
 test "responses: redirect over a real connection" {

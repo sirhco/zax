@@ -13,6 +13,8 @@ pub const Request = request.Request;
 pub const Method = request.Method;
 pub const Header = request.Header;
 pub const Response = response.Response;
+pub const Writer = std.Io.Writer;
+pub const Streamer = response.Streamer;
 pub const Status = response.Status;
 pub const intoResponse = response.intoResponse;
 
