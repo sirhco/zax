@@ -22,6 +22,9 @@ pub const Status = enum(u16) {
     method_not_allowed = 405,
     conflict = 409,
     length_required = 411,
+    request_timeout = 408,
+    payload_too_large = 413,
+    request_header_fields_too_large = 431,
     too_many_requests = 429,
     unprocessable_entity = 422,
     internal_server_error = 500,
@@ -48,6 +51,9 @@ pub const Status = enum(u16) {
             .method_not_allowed => "Method Not Allowed",
             .conflict => "Conflict",
             .length_required => "Length Required",
+            .request_timeout => "Request Timeout",
+            .payload_too_large => "Payload Too Large",
+            .request_header_fields_too_large => "Request Header Fields Too Large",
             .too_many_requests => "Too Many Requests",
             .unprocessable_entity => "Unprocessable Entity",
             .internal_server_error => "Internal Server Error",
@@ -230,4 +236,13 @@ test "IntoResponse: custom type via intoResponse method" {
     };
     try testing.expectEqual(Status.no_content, intoResponse(Custom{ .n = 0 }).status);
     try testing.expectEqualStrings("nonzero", intoResponse(Custom{ .n = 1 }).body);
+}
+
+test "hardening statuses: 408/413/431 codes and reasons" {
+    try testing.expectEqual(@as(u16, 408), Status.request_timeout.code());
+    try testing.expectEqualStrings("Request Timeout", Status.request_timeout.reason());
+    try testing.expectEqual(@as(u16, 413), Status.payload_too_large.code());
+    try testing.expectEqualStrings("Payload Too Large", Status.payload_too_large.reason());
+    try testing.expectEqual(@as(u16, 431), Status.request_header_fields_too_large.code());
+    try testing.expectEqualStrings("Request Header Fields Too Large", Status.request_header_fields_too_large.reason());
 }
