@@ -69,6 +69,14 @@ pub const Status = enum(u16) {
     }
 };
 
+/// A type-erased streamed-body producer: `func` writes the body bytes directly
+/// to the connection writer, using `context` (which must outlive the request —
+/// allocate it in the request arena).
+pub const Streamer = struct {
+    context: *const anyopaque,
+    func: *const fn (context: *const anyopaque, w: *Writer) anyerror!void,
+};
+
 pub const Response = struct {
     status: Status = .ok,
     content_type: []const u8 = "text/plain; charset=utf-8",
@@ -82,6 +90,9 @@ pub const Response = struct {
     /// Whether to advertise a persistent connection. The server sets this from
     /// the request; default `false` keeps `connection: close` behavior.
     keep_alive: bool = false,
+    /// When set, the body is produced by `streamer.func` (connection-close
+    /// framing); `body`/`content-length` are not used.
+    streamer: ?Streamer = null,
 
     pub fn text(body: []const u8) Response {
         return .{ .body = body };
@@ -118,6 +129,27 @@ pub const Response = struct {
     pub fn json(arena: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!Response {
         const body = try std.json.Stringify.valueAlloc(arena, value, .{});
         return .{ .content_type = "application/json", .body = body };
+    }
+
+    /// Build a streamed (connection-close) response. `func` receives the
+    /// arena-allocated `context` and the connection writer, and writes the body
+    /// bytes directly. `context` must outlive the request (use the request arena).
+    pub fn stream(
+        comptime Ctx: type,
+        context: *const Ctx,
+        comptime func: fn (*const Ctx, *Writer) anyerror!void,
+        content_type: []const u8,
+    ) Response {
+        const Erased = struct {
+            fn call(c: *const anyopaque, w: *Writer) anyerror!void {
+                return func(@ptrCast(@alignCast(c)), w);
+            }
+        };
+        return .{
+            .content_type = content_type,
+            .streamer = .{ .context = context, .func = &Erased.call },
+            .keep_alive = false,
+        };
     }
 
     /// Return a copy of `self` with `(name, value)` appended to its headers,
@@ -345,4 +377,23 @@ test "writeHead omits content-length and sets connection close" {
     try testing.expect(std.mem.indexOf(u8, out, "connection: close\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "content-type: text/plain; charset=utf-8\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n")); // head ends at the blank line; no body
+}
+
+test "stream builder round-trips the typed context" {
+    const Ctx = struct { msg: []const u8 };
+    const Impl = struct {
+        fn run(c: *const Ctx, w: *Writer) anyerror!void {
+            try w.writeAll(c.msg);
+        }
+    };
+    var ctx = Ctx{ .msg = "hello" };
+    const r = Response.stream(Ctx, &ctx, Impl.run, "text/plain");
+    try testing.expect(r.streamer != null);
+    try testing.expectEqualStrings("text/plain", r.content_type);
+    try testing.expect(r.keep_alive == false);
+
+    var buf: [64]u8 = undefined;
+    var w = Writer.fixed(&buf);
+    try r.streamer.?.func(r.streamer.?.context, &w);
+    try testing.expectEqualStrings("hello", w.buffered());
 }
