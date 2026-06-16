@@ -901,3 +901,73 @@ test "limits: oversized header block returns 431" {
     app.requestShutdown(io);
     loop_fut.await(io);
 }
+
+test "timeout: slow header (slowloris) returns 408 then closes" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{ .read_timeout_ms = 100 });
+    defer app.deinit();
+    try app.get("/ping", pingHandler);
+
+    const port: u16 = 18112;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+
+    var wb: [128]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+    cw.interface.writeAll("GET /ping HTTP/1.1\r\n") catch unreachable; // partial, no terminator
+    cw.interface.flush() catch unreachable;
+
+    Io.sleep(io, Io.Duration.fromMilliseconds(300), .awake) catch {};
+
+    var rb: [1024]u8 = undefined;
+    var rdr = cs.reader(io, &rb);
+    var out: [1024]u8 = undefined;
+    const resp = readResp(&rdr.interface, &out); // reads the 408 head (content-length 0)
+    try testing.expect(std.mem.indexOf(u8, resp, "408 Request Timeout") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "timeout: idle keep-alive connection is closed after idle_timeout" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{ .idle_timeout_ms = 100 });
+    defer app.deinit();
+    try app.get("/ping", pingHandler);
+
+    const port: u16 = 18113;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+
+    var wb: [128]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+    var rb: [1024]u8 = undefined;
+    var rdr = cs.reader(io, &rb);
+
+    // One full request + response, keeping the connection open.
+    cw.interface.writeAll("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var out: [1024]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, readResp(&rdr.interface, &out), "pong"));
+
+    // Now stall past idle_timeout; the server should close the connection.
+    Io.sleep(io, Io.Duration.fromMilliseconds(300), .awake) catch {};
+    try testing.expectError(error.EndOfStream, rdr.interface.fillMore());
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
