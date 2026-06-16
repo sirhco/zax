@@ -52,12 +52,15 @@ extractor must come last** (enforced at compile time).
 
 | Extractor | Binds |
 |---|---|
-| `Path(T)` | URL path params (`/users/:id`) → struct fields or a scalar |
-| `Query(T)` | query string → struct fields (optional fields = `?T`) |
+| `Path(T)` | path params (`/users/:id`) → struct fields or a scalar (percent-decoded) |
+| `Query(T)` | query string → struct fields (`?T` = optional, percent-decoded) |
 | `Json(T)` | request body parsed as JSON (arena-allocated) — must be last |
 | `State(T)` | the app's read-only shared state (no locks, no refcount) |
 | `Alloc` | the per-request arena allocator, for building response bodies |
 | `Forwarded` | proxied connection info (`scheme`/`host`/`client_ip`) from `X-Forwarded-*` |
+| `Form(T)` | urlencoded request body → struct fields (must be last) |
+| `Cookies` | request cookies via `.get(name)` |
+| `Bytes` | the raw request body (`[]const u8`, must be last) |
 
 Handlers return anything that satisfies `IntoResponse`: a `Response`, a `Status`,
 a byte-string, or a custom type with `pub fn intoResponse(self) Response`. A

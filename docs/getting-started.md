@@ -103,6 +103,9 @@ must be the **last** parameter (enforced at compile time).
 | `State(T)` | read-only app state |
 | `Alloc` | the per-request arena allocator |
 | `Forwarded` | proxied scheme/host/client-ip (see HTTPS) |
+| `Form(T)` | urlencoded body → struct (must be last) |
+| `Cookies` | request cookies via `.get(name)` |
+| `Bytes` | raw request body |
 
 Handlers return anything `IntoResponse`: a `Response`, a `Status`, a byte-string,
 or a type with `pub fn intoResponse(self) Response`. A returned error → `500`.
