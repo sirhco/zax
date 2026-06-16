@@ -142,7 +142,8 @@ error bodies with `app.onError(&renderFn)`.
 
 `Response.text` / `.html` / `.json(arena, value)` / `.redirect(.found, "/path")` /
 `.fromStatus(.created)` cover the common cases; `r.withHeader(arena, n, v)` adds
-headers.
+headers. For large or generated bodies, `Response.stream(Ctx, ctx, fn, "text/plain")`
+writes the body incrementally (connection-close, no Content-Length).
 
 ### Limits & timeouts
 

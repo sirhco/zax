@@ -166,10 +166,28 @@ Build responses with the `Response` constructors:
 | `Response.html(s)` | `text/html` body |
 | `Response.json(arena, value)` | JSON-serialized body (`application/json`) |
 | `Response.jsonRaw(s)` | pre-serialized JSON string |
+| `Response.stream(Ctx, ctx, fn, ct)` | streamed body (connection-close) written by `fn` |
 | `Response.redirect(status, loc)` | redirect with a `Location` header |
 | `Response.seeOther/temporaryRedirect/permanentRedirect(loc)` | 303 / 307 / 308 redirects |
 | `Response.fromStatus(s)` | bare status |
 | `r.withHeader(arena, name, value)` | add a response header |
+
+A streamed response writes its body incrementally to the connection (no
+`Content-Length`, `connection: close`); the `ctx` must be arena-allocated. Useful
+for large or generated bodies:
+
+```zig
+const Lines = struct { n: usize };
+fn writeLines(c: *const Lines, w: *zax.Writer) anyerror!void {
+    var i: usize = 0;
+    while (i < c.n) : (i += 1) try w.print("line {d}\n", .{i});
+}
+fn handler(a: zax.Alloc) !zax.Response {
+    const c = try a.value.create(Lines);
+    c.* = .{ .n = 100 };
+    return zax.Response.stream(Lines, c, writeLines, "text/plain");
+}
+```
 
 ## Limits & timeouts
 
