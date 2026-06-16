@@ -77,6 +77,8 @@ pub const Response = struct {
     /// Extra response headers (beyond content-length/type/connection). Borrowed;
     /// typically arena-allocated via `withHeader`. Empty by default (zero-alloc).
     headers: []const Header = &.{},
+    /// When set, emitted as a `Location:` response header (used by redirects).
+    location: ?[]const u8 = null,
     /// Whether to advertise a persistent connection. The server sets this from
     /// the request; default `false` keeps `connection: close` behavior.
     keep_alive: bool = false,
@@ -91,6 +93,20 @@ pub const Response = struct {
 
     pub fn fromStatus(s: Status) Response {
         return .{ .status = s, .body = "" };
+    }
+
+    /// A redirect to `location` with the given 3xx status.
+    pub fn redirect(status: Status, location: []const u8) Response {
+        return .{ .status = status, .location = location };
+    }
+    pub fn seeOther(location: []const u8) Response {
+        return redirect(.see_other, location);
+    }
+    pub fn temporaryRedirect(location: []const u8) Response {
+        return redirect(.temporary_redirect, location);
+    }
+    pub fn permanentRedirect(location: []const u8) Response {
+        return redirect(.permanent_redirect, location);
     }
 
     /// Return a copy of `self` with `(name, value)` appended to its headers,
@@ -113,6 +129,7 @@ pub const Response = struct {
         for (self.headers) |h| {
             try w.print("{s}: {s}\r\n", .{ h.name, h.value });
         }
+        if (self.location) |loc| try w.print("location: {s}\r\n", .{loc});
         try w.writeAll(if (self.keep_alive) "connection: keep-alive\r\n" else "connection: close\r\n");
         try w.writeAll("\r\n");
         try w.writeAll(self.body);
@@ -260,4 +277,22 @@ test "redirect statuses: 303/307/308 codes and reasons" {
     try testing.expectEqualStrings("Temporary Redirect", Status.temporary_redirect.reason());
     try testing.expectEqual(@as(u16, 308), Status.permanent_redirect.code());
     try testing.expectEqualStrings("Permanent Redirect", Status.permanent_redirect.reason());
+}
+
+test "redirect sets status and Location, omits Location when unset" {
+    var buf: [256]u8 = undefined;
+    const out = serialize(&buf, Response.redirect(.found, "/dashboard"));
+    try testing.expect(std.mem.indexOf(u8, out, "HTTP/1.1 302 Found\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "location: /dashboard\r\n") != null);
+
+    var buf2: [256]u8 = undefined;
+    const plain = serialize(&buf2, Response.text("hi"));
+    try testing.expect(std.mem.indexOf(u8, plain, "location:") == null);
+}
+
+test "redirect convenience wrappers use the right status" {
+    try testing.expectEqual(Status.see_other, Response.seeOther("/a").status);
+    try testing.expectEqual(Status.temporary_redirect, Response.temporaryRedirect("/b").status);
+    try testing.expectEqual(Status.permanent_redirect, Response.permanentRedirect("/c").status);
+    try testing.expectEqualStrings("/a", Response.seeOther("/a").location.?);
 }
