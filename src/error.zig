@@ -45,8 +45,9 @@ pub fn classify(e: anyerror) ErrorInfo {
 
         // Extractor tags (from path.zig/query.zig/json.zig/scalar.zig).
         error.MissingPathParam => .{ .status = .bad_request, .reason = "missing path parameter" },
+        // Retained for back-compat; Query now yields error.MissingField.
         error.MissingQueryParam => .{ .status = .bad_request, .reason = "missing query parameter" },
-        error.MissingField => .{ .status = .bad_request, .reason = "missing form field" },
+        error.MissingField => .{ .status = .bad_request, .reason = "missing field" },
         error.InvalidScalar => .{ .status = .bad_request, .reason = "invalid parameter" },
         error.InvalidEnum => .{ .status = .bad_request, .reason = "invalid parameter" },
         error.InvalidJson => .{ .status = .unprocessable_entity, .reason = "invalid JSON body" },
