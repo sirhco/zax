@@ -109,6 +109,17 @@ pub const Response = struct {
         return redirect(.permanent_redirect, location);
     }
 
+    /// HTML body with a text/html content type.
+    pub fn html(body: []const u8) Response {
+        return .{ .content_type = "text/html; charset=utf-8", .body = body };
+    }
+
+    /// Serialize `value` to a JSON body in `arena` (typed counterpart to jsonRaw).
+    pub fn json(arena: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!Response {
+        const body = try std.json.Stringify.valueAlloc(arena, value, .{});
+        return .{ .content_type = "application/json", .body = body };
+    }
+
     /// Return a copy of `self` with `(name, value)` appended to its headers,
     /// using `arena` for the (re)allocated header slice. Borrowed name/value
     /// must outlive the response (request-scoped).
@@ -295,4 +306,19 @@ test "redirect convenience wrappers use the right status" {
     try testing.expectEqual(Status.temporary_redirect, Response.temporaryRedirect("/b").status);
     try testing.expectEqual(Status.permanent_redirect, Response.permanentRedirect("/c").status);
     try testing.expectEqualStrings("/a", Response.seeOther("/a").location.?);
+}
+
+test "html sets text/html content type" {
+    var buf: [256]u8 = undefined;
+    const out = serialize(&buf, Response.html("<h1>Hi</h1>"));
+    try testing.expect(std.mem.indexOf(u8, out, "content-type: text/html; charset=utf-8\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, out, "<h1>Hi</h1>"));
+}
+
+test "json serializes a value into the arena" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try Response.json(arena.allocator(), .{ .a = @as(u32, 1), .b = "x" });
+    try testing.expectEqualStrings("application/json", r.content_type);
+    try testing.expectEqualStrings("{\"a\":1,\"b\":\"x\"}", r.body);
 }
