@@ -136,6 +136,28 @@ pub fn App(comptime AppState: type) type {
             try self.router.register(method, pattern, &Wrap.call);
         }
 
+        /// Like `route`, but `mws` (a comptime tuple of `Middleware`) run only
+        /// for this route — after the global chain, before the handler, in tuple
+        /// order. The tuple is materialized into static storage (no allocation).
+        pub fn routeWith(
+            self: *Self,
+            method: request.Method,
+            pattern: []const u8,
+            comptime mws: anytype,
+            comptime handler: anytype,
+        ) std.mem.Allocator.Error!void {
+            const Wrap = struct {
+                const list: [mws.len]Chn.Middleware = mws;
+                fn real(ctx: *const Ctx) anyerror!Response {
+                    return extract.callHandler(handler, ctx.*);
+                }
+                fn call(ctx: *const Ctx) anyerror!Response {
+                    return Chn.run(&list, &real, ctx);
+                }
+            };
+            try self.router.register(method, pattern, &Wrap.call);
+        }
+
         pub fn get(self: *Self, pattern: []const u8, comptime h: anytype) !void {
             return self.route(.GET, pattern, h);
         }
@@ -147,6 +169,19 @@ pub fn App(comptime AppState: type) type {
         }
         pub fn delete(self: *Self, pattern: []const u8, comptime h: anytype) !void {
             return self.route(.DELETE, pattern, h);
+        }
+
+        pub fn getWith(self: *Self, pattern: []const u8, comptime mws: anytype, comptime h: anytype) !void {
+            return self.routeWith(.GET, pattern, mws, h);
+        }
+        pub fn postWith(self: *Self, pattern: []const u8, comptime mws: anytype, comptime h: anytype) !void {
+            return self.routeWith(.POST, pattern, mws, h);
+        }
+        pub fn putWith(self: *Self, pattern: []const u8, comptime mws: anytype, comptime h: anytype) !void {
+            return self.routeWith(.PUT, pattern, mws, h);
+        }
+        pub fn deleteWith(self: *Self, pattern: []const u8, comptime mws: anytype, comptime h: anytype) !void {
+            return self.routeWith(.DELETE, pattern, mws, h);
         }
 
         /// Bind and start listening. Separated from `acceptLoop` so callers can
@@ -640,6 +675,74 @@ fn requireAuth(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Respon
 fn requestId(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
     const r = try next.run();
     return r.withHeader(ctx.arena, "x-request-id", "abc123");
+}
+
+fn wrapG(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
+    const r = try next.run();
+    return Response.text(try std.fmt.allocPrint(ctx.arena, "G({s})", .{r.body}));
+}
+fn wrapR(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
+    const r = try next.run();
+    return Response.text(try std.fmt.allocPrint(ctx.arena, "R({s})", .{r.body}));
+}
+fn wrapR2(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
+    const r = try next.run();
+    return Response.text(try std.fmt.allocPrint(ctx.arena, "R2({s})", .{r.body}));
+}
+fn bodyH() Response {
+    return Response.text("H");
+}
+
+test "per-route middleware: scoped to its route + short-circuits" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/open", pingHandler);
+    try app.getWith("/admin", .{&requireAuth}, pingHandler);
+
+    const port: u16 = 18173;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const r = doRequest(io, port, "GET /open HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+
+    var rb2: [2048]u8 = undefined;
+    const r2 = doRequest(io, port, "GET /admin HTTP/1.1\r\nHost: x\r\n\r\n", &rb2);
+    try testing.expect(std.mem.indexOf(u8, r2, "401 Unauthorized") != null);
+
+    var rb3: [2048]u8 = undefined;
+    const r3 = doRequest(io, port, "GET /admin HTTP/1.1\r\nHost: x\r\nAuthorization: t\r\n\r\n", &rb3);
+    try testing.expect(std.mem.indexOf(u8, r3, "200 OK") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "per-route middleware: order is global -> route -> handler" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.use(&wrapG);
+    try app.getWith("/x", .{ &wrapR, &wrapR2 }, bodyH);
+
+    const port: u16 = 18174;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const r = doRequest(io, port, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.endsWith(u8, r, "G(R(R2(H)))"));
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
 }
 
 fn schemeHandler(f: Forwarded) Response {
