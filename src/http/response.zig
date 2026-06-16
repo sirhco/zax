@@ -15,6 +15,9 @@ pub const Status = enum(u16) {
     moved_permanently = 301,
     found = 302,
     not_modified = 304,
+    see_other = 303,
+    temporary_redirect = 307,
+    permanent_redirect = 308,
     bad_request = 400,
     unauthorized = 401,
     forbidden = 403,
@@ -44,6 +47,9 @@ pub const Status = enum(u16) {
             .moved_permanently => "Moved Permanently",
             .found => "Found",
             .not_modified => "Not Modified",
+            .see_other => "See Other",
+            .temporary_redirect => "Temporary Redirect",
+            .permanent_redirect => "Permanent Redirect",
             .bad_request => "Bad Request",
             .unauthorized => "Unauthorized",
             .forbidden => "Forbidden",
@@ -245,4 +251,13 @@ test "hardening statuses: 408/413/431 codes and reasons" {
     try testing.expectEqualStrings("Payload Too Large", Status.payload_too_large.reason());
     try testing.expectEqual(@as(u16, 431), Status.request_header_fields_too_large.code());
     try testing.expectEqualStrings("Request Header Fields Too Large", Status.request_header_fields_too_large.reason());
+}
+
+test "redirect statuses: 303/307/308 codes and reasons" {
+    try testing.expectEqual(@as(u16, 303), Status.see_other.code());
+    try testing.expectEqualStrings("See Other", Status.see_other.reason());
+    try testing.expectEqual(@as(u16, 307), Status.temporary_redirect.code());
+    try testing.expectEqualStrings("Temporary Redirect", Status.temporary_redirect.reason());
+    try testing.expectEqual(@as(u16, 308), Status.permanent_redirect.code());
+    try testing.expectEqualStrings("Permanent Redirect", Status.permanent_redirect.reason());
 }
