@@ -28,9 +28,13 @@ the path. Axum's router has `/*path` for this purpose; Zax has no equivalent.
    `/assets/a/b` but not bare `/assets` or `/assets/`. If a handler for the bare
    prefix is needed, register it as an explicit separate route.
 
-3. **Precedence: static > param > wildcard** — no backtracking. A wildcard child
-   is only consulted when neither a static child nor a param child matches the
-   current segment. This is consistent with the existing matcher philosophy.
+3. **Precedence: static > param > wildcard, with fallback.** At each node the
+   matcher tries a static child first, then a param child, then the wildcard
+   child. If a higher-precedence subtree dead-ends (no slot and no onward match),
+   the matcher backtracks and tries the next kind, so a catch-all still captures
+   a path that a sibling `:param` could not complete (with both `/a/:id` and
+   `/a/*rest`, the path `/a/x/y` falls through to `*rest`). Matching is therefore
+   recursive (depth = number of path segments).
 
 4. **Catch-all is terminal** — `*name` must be the last segment in a pattern.
    Registering `/a/*tail/b` is a logic error; the implementation stops
@@ -143,9 +147,10 @@ Added alongside the existing `param_child` cleanup.
 - **Empty tail (bare prefix):** `/assets/*path` registered; request is
   `/assets`. The walk ends at the `assets` static node; its `slot` is null
   (only the wildcard child has a slot). `match` returns null → 404. Correct.
-- **Precedence:** static child wins first, then param child, then wildcard child.
-  No backtracking: if a param subtree is entered and later dead-ends, the
-  wildcard sibling is not retried.
+- **Precedence with fallback:** static child wins first, then param child, then
+  wildcard child. If a chosen subtree dead-ends, the matcher backtracks and tries
+  the next kind — so a param that grabs a segment but later dead-ends falls
+  through to the sibling wildcard (`/a/:id` + `/a/*rest`, path `/a/x/y` → `*rest`).
 - **`TooManyParams`:** wildcard consumes one param slot, same budget as `:name`.
   With `max_params = 16` in the server, a route with 15 `:name` segments and one
   `*tail` at the end is the limit.
@@ -181,9 +186,10 @@ Added alongside the existing `param_child` cleanup.
   `safeJoin` splits on `/` and rejects empty segments (trailing slash produces
   an empty final segment) — `Files.dir` returns `error.NotFound` → 404.
   Correct; no special handling needed.
-- **No backtracking:** if a `:name` subtree dead-ends (no slot and no onward
-  match), the router returns null without retrying the sibling `wildcard_child`.
-  Route authors should not rely on fallback across sibling node types.
+- **Recursive matching:** the matcher backtracks across sibling node kinds, so
+  recursion depth equals the number of path segments. Path length is bounded by
+  the server's request-line limit, keeping depth bounded; extremely deep paths
+  are the theoretical cost of fallback (vs. the previous iterative walk).
 - **Param budget:** the wildcard capture consumes one slot of the `max_params`
   budget (16 in the server). A pattern with 16 prior `:name` segments and a
   `*tail` would overflow `TooManyParams`. In practice this is not a concern for
