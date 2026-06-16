@@ -314,11 +314,13 @@ fn memoryMetrics(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !
     const total = cfg.conns * cfg.reqs;
 
     // Warmup load(s): client uses the raw gpa (not counted).
-    var w: usize = 0;
-    while (w < cfg.warmup) : (w += 1) {
+    {
         const scratch = try gpa.alloc(i96, total);
         defer gpa.free(scratch);
-        _ = try runLoad(io, gpa, port, cfg.conns, cfg.reqs, scratch);
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            _ = try runLoad(io, gpa, port, cfg.conns, cfg.reqs, scratch);
+        }
     }
 
     const lat = try gpa.alloc(i96, total);
@@ -327,16 +329,21 @@ fn memoryMetrics(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !
     _ = try runLoad(io, gpa, port, cfg.conns, cfg.reqs, lat);
     const after = ca.bytesAllocated();
 
+    // bytes/req includes amortized per-connection accept/buffers (each load opens
+    // fresh connections), so this is steady-state allocator pressure including
+    // amortized connection setup, not pure per-request cost.
     const per_req: f64 = @as(f64, @floatFromInt(after - before)) / @as(f64, @floatFromInt(total));
     try out.print("  bytes/req       {d:.1}\n", .{per_req});
     const rss = peakRssMb();
     if (rss < 0) {
         try out.writeAll("  peak RSS        n/a\n");
     } else {
-        try out.print("  peak RSS        {d:.1} MB (process)\n", .{rss});
+        try out.print("  peak RSS        {d:.1} MB (process lifetime, all sections)\n", .{rss});
     }
 }
 
+// peakRssMb returns the process-lifetime RSS high-water mark via getrusage(SELF).
+// This spans all bench sections (micro + e2e + memory), not memory alone.
 fn peakRssMb() f64 {
     const builtin = @import("builtin");
     const ru = std.posix.getrusage(std.posix.rusage.SELF);
