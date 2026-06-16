@@ -318,6 +318,18 @@ anything else. What is actually validated:
   `iters`, `conns`, `reqs`, and `samples` must be ≥ 1; a bad or zero value
   prints a usage line and exits nonzero.
 
+- **Memory section** — after the throughput/latency output, a `-- memory
+  (loopback, N conns x M reqs) --` section reports two figures:
+  - `bytes/req` — cumulative bytes the server's allocator requested per
+    request over the measured load (includes amortized per-connection buffers;
+    near-zero for static handlers). Measured by wrapping the app allocator in
+    a counting allocator; the loopback client is not counted.
+  - `peak RSS` — process lifetime high-water mark (whole process, across all
+    bench sections) in MB, via `getrusage`.
+
+  These numbers are self-relative — not comparative against other frameworks
+  or servers.
+
 **Read the benchmark caveats.** The e2e numbers are **loopback, in-process,
 single-machine, and not comparative** — the client shares the process and Io
 with the server, so throughput is inflated and sub-microsecond latency is below
