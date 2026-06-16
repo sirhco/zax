@@ -129,6 +129,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| bench_run.addArgs(args);
     const bench_step = b.step("bench", "Run benchmarks (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
 

@@ -18,11 +18,11 @@ const Io = std.Io;
 const net = std.Io.net;
 
 const metrics = @import("bench/metrics.zig");
-comptime {
-    _ = metrics;
-} // ensure metrics tests are discovered by the bench test target
+const Config = metrics.Config;
 
 const clock: Io.Clock = .awake; // monotonic
+
+const usage_line = "usage: bench [--iters N] [--conns N] [--reqs N] [--samples N] [--warmup N]\n";
 
 fn nowNs(io: Io) i96 {
     return Io.Timestamp.now(io, clock).toNanoseconds();
@@ -39,39 +39,77 @@ fn benchHandler() zax.Response {
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
+    const arena = init.arena.allocator();
+
+    // Collect process args (skipping argv[0]) into a plain []const []const u8.
+    var arg_list: std.ArrayList([]const u8) = .empty;
+    var it = init.minimal.args.iterate();
+    _ = it.skip(); // argv[0]
+    while (it.next()) |a| try arg_list.append(arena, a);
+
+    const cfg = metrics.parse(arg_list.items) catch {
+        var stderr_buf: [256]u8 = undefined;
+        var stderr_fw: Io.File.Writer = .init(.stderr(), io, &stderr_buf);
+        stderr_fw.interface.writeAll(usage_line) catch {};
+        stderr_fw.interface.flush() catch {};
+        std.process.exit(2);
+    };
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout_fw: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
     const out = &stdout_fw.interface;
 
     try out.writeAll("=== Zax benchmark (ReleaseFast recommended) ===\n\n");
-    try microBenchmarks(io, out);
-    try endToEnd(io, gpa, out);
+    try microBenchmarks(io, gpa, out, cfg);
+    try endToEnd(io, gpa, out, cfg);
     try out.flush();
 }
 
 // ---------------------------------------------------------------------------
 // Section A: micro-benchmarks
 // ---------------------------------------------------------------------------
-fn microBenchmarks(io: Io, out: *Io.Writer) !void {
-    try out.writeAll("-- micro-benchmarks (in-process) --\n");
+fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void {
+    try out.print("-- micro-benchmarks (in-process, {d} iters x {d} samples) --\n", .{ cfg.iters, cfg.samples });
 
-    const iters: usize = 2_000_000;
+    const iters = cfg.iters;
+
+    // Reused per-micro sample buffer holding ns/op for each sample.
+    const buf = try gpa.alloc(f64, cfg.samples);
+    defer gpa.free(buf);
+
+    const nsPerOp = struct {
+        fn f(total_ns: i96, n: usize) f64 {
+            return @as(f64, @floatFromInt(@as(i64, @intCast(total_ns)))) / @as(f64, @floatFromInt(n));
+        }
+    }.f;
 
     // 1. HTTP/1.1 head parse.
     {
         const raw = "GET /users/42?active=true HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
         var hs: [zax.request.max_headers]zax.Header = undefined;
-        var sink: usize = 0;
-        const t0 = nowNs(io);
-        var i: usize = 0;
-        while (i < iters) : (i += 1) {
-            const p = zax.parser.parseHead(raw, &hs) catch unreachable;
-            sink +%= p.request.path.len;
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            var sink: usize = 0;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const p = zax.parser.parseHead(raw, &hs) catch unreachable;
+                sink +%= p.request.path.len;
+            }
+            std.mem.doNotOptimizeAway(sink);
         }
-        const ns = nowNs(io) - t0;
-        std.mem.doNotOptimizeAway(sink);
-        try report(out, "parseHead", iters, ns);
+        for (buf) |*slot| {
+            var sink: usize = 0;
+            const t0 = nowNs(io);
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const p = zax.parser.parseHead(raw, &hs) catch unreachable;
+                sink +%= p.request.path.len;
+            }
+            const ns = nowNs(io) - t0;
+            std.mem.doNotOptimizeAway(sink);
+            slot.* = nsPerOp(ns, iters);
+        }
+        try report(out, "parseHead", metrics.median(buf), metrics.stddev(buf));
     }
 
     // 2. Radix route match (static + param).
@@ -80,51 +118,100 @@ fn microBenchmarks(io: Io, out: *Io.Writer) !void {
         defer tree.deinit();
         (try tree.getOrPutSlot("/users/:id")).* = 1;
         var pb: [8]zax.radix.Param = undefined;
-        var sink: usize = 0;
-        const t0 = nowNs(io);
-        var i: usize = 0;
-        while (i < iters) : (i += 1) {
-            const m = (tree.match("/users/42", &pb) catch unreachable).?;
-            sink +%= m.value + m.params.len;
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            var sink: usize = 0;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const m = (tree.match("/users/42", &pb) catch unreachable).?;
+                sink +%= m.value + m.params.len;
+            }
+            std.mem.doNotOptimizeAway(sink);
         }
-        const ns = nowNs(io) - t0;
-        std.mem.doNotOptimizeAway(sink);
-        try report(out, "radix match", iters, ns);
+        for (buf) |*slot| {
+            var sink: usize = 0;
+            const t0 = nowNs(io);
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const m = (tree.match("/users/42", &pb) catch unreachable).?;
+                sink +%= m.value + m.params.len;
+            }
+            const ns = nowNs(io) - t0;
+            std.mem.doNotOptimizeAway(sink);
+            slot.* = nsPerOp(ns, iters);
+        }
+        try report(out, "radix match", metrics.median(buf), metrics.stddev(buf));
     }
 
     // 3. Response serialize to a fixed buffer.
     {
         const resp = zax.Response.text("hello world");
-        var buf: [256]u8 = undefined;
-        var sink: usize = 0;
-        const t0 = nowNs(io);
-        var i: usize = 0;
-        while (i < iters) : (i += 1) {
-            var w = Io.Writer.fixed(&buf);
-            resp.write(&w) catch unreachable;
-            sink +%= w.buffered().len;
+        var rbuf: [256]u8 = undefined;
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            var sink: usize = 0;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                var fw = Io.Writer.fixed(&rbuf);
+                resp.write(&fw) catch unreachable;
+                sink +%= fw.buffered().len;
+            }
+            std.mem.doNotOptimizeAway(sink);
         }
-        const ns = nowNs(io) - t0;
-        std.mem.doNotOptimizeAway(sink);
-        try report(out, "response write", iters, ns);
+        for (buf) |*slot| {
+            var sink: usize = 0;
+            const t0 = nowNs(io);
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                var fw = Io.Writer.fixed(&rbuf);
+                resp.write(&fw) catch unreachable;
+                sink +%= fw.buffered().len;
+            }
+            const ns = nowNs(io) - t0;
+            std.mem.doNotOptimizeAway(sink);
+            slot.* = nsPerOp(ns, iters);
+        }
+        try report(out, "response write", metrics.median(buf), metrics.stddev(buf));
     }
     try out.writeAll("\n");
 }
 
-fn report(out: *Io.Writer, name: []const u8, iters: usize, total_ns: i96) !void {
-    const ns_per: f64 = @as(f64, @floatFromInt(@as(i64, @intCast(total_ns)))) / @as(f64, @floatFromInt(iters));
-    const per_sec: f64 = if (ns_per > 0) 1_000_000_000.0 / ns_per else 0;
-    try out.print("  {s:<16} {d:>8.1} ns/op   {d:>12.0} ops/sec\n", .{ name, ns_per, per_sec });
+fn report(out: *Io.Writer, name: []const u8, median_ns: f64, sd_ns: f64) !void {
+    const per_sec: f64 = if (median_ns > 0) 1_000_000_000.0 / median_ns else 0;
+    try out.print("  {s:<16} {d:>8.1} ns/op  +/- {d:>6.1}  {d:>12.0} ops/sec\n", .{ name, median_ns, sd_ns, per_sec });
 }
 
 // ---------------------------------------------------------------------------
 // Section B: end-to-end loopback load
 // ---------------------------------------------------------------------------
-const conns = 8;
-const reqs_per_conn = 5_000;
+/// Run one measured load: `conns` workers each issuing `reqs` requests over a
+/// keep-alive connection. Fills `all` (length conns*reqs) with per-request
+/// latencies (ns) and returns the load's throughput (req/sec).
+fn runLoad(io: Io, gpa: std.mem.Allocator, port: u16, conns: usize, reqs: usize, all: []i96) !f64 {
+    // Per-connection latency buffers (slices into `all`).
+    const lat = try gpa.alloc([]i96, conns);
+    defer gpa.free(lat);
+    for (lat, 0..) |*slot, c| slot.* = all[c * reqs .. (c + 1) * reqs];
 
-fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
-    try out.print("-- end-to-end load (loopback, {d} keep-alive conns x {d} reqs) --\n", .{ conns, reqs_per_conn });
+    const futs = try gpa.alloc(Io.Future(void), conns);
+    defer gpa.free(futs);
+
+    const t0 = nowNs(io);
+    for (0..conns) |c| {
+        futs[c] = io.async(worker, .{ io, port, lat[c] });
+    }
+    for (futs) |*f| f.await(io);
+    const wall_ns = nowNs(io) - t0;
+
+    const total = conns * reqs;
+    const wall_s: f64 = @as(f64, @floatFromInt(@as(i64, @intCast(wall_ns)))) / 1_000_000_000.0;
+    return if (wall_s > 0) @as(f64, @floatFromInt(total)) / wall_s else 0;
+}
+
+fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void {
+    const conns = cfg.conns;
+    const reqs = cfg.reqs;
+    try out.print("-- end-to-end load (loopback, {d} keep-alive conns x {d} reqs, {d} samples) --\n", .{ conns, reqs, cfg.samples });
 
     var db = Db{};
     var app = try Api.init(gpa, &db, .{});
@@ -134,43 +221,62 @@ fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer) !void {
     const port: u16 = 18099;
     try app.bind(io, .{ .ip4 = .loopback(port) });
     var loop_fut = io.async(Api.acceptLoop, .{ &app, io });
-
-    // Per-connection latency buffers.
-    const lat = try gpa.alloc([]i96, conns);
-    defer gpa.free(lat);
-    for (lat) |*slot| slot.* = try gpa.alloc(i96, reqs_per_conn);
-    defer for (lat) |slot| gpa.free(slot);
-
-    const t0 = nowNs(io);
-    var futs: [conns]Io.Future(void) = undefined;
-    for (0..conns) |c| {
-        futs[c] = io.async(worker, .{ io, port, lat[c] });
+    defer {
+        app.requestShutdown(io);
+        loop_fut.await(io);
     }
-    for (&futs) |*f| f.await(io);
-    const wall_ns = nowNs(io) - t0;
 
-    app.requestShutdown(io);
-    loop_fut.await(io);
+    const total = conns * reqs;
 
-    // Aggregate latencies.
-    const total = conns * reqs_per_conn;
-    var all = try gpa.alloc(i96, total);
-    defer gpa.free(all);
-    var n: usize = 0;
-    for (lat) |slot| {
-        @memcpy(all[n .. n + slot.len], slot);
-        n += slot.len;
+    // Warmup loads (discarded).
+    {
+        const scratch = try gpa.alloc(i96, total);
+        defer gpa.free(scratch);
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            _ = try runLoad(io, gpa, port, conns, reqs, scratch);
+        }
     }
+
+    // Measured samples: throughput per sample, plus per-sample latency buffers
+    // so we can report percentiles from the median-throughput sample.
+    const thr = try gpa.alloc(f64, cfg.samples);
+    defer gpa.free(thr);
+    const lat_per_sample = try gpa.alloc([]i96, cfg.samples);
+    defer gpa.free(lat_per_sample);
+    for (lat_per_sample) |*s| s.* = try gpa.alloc(i96, total);
+    defer for (lat_per_sample) |s| gpa.free(s);
+
+    for (0..cfg.samples) |s| {
+        thr[s] = try runLoad(io, gpa, port, conns, reqs, lat_per_sample[s]);
+    }
+
+    // Median throughput; locate the sample whose throughput == median (or
+    // nearest) and report latency percentiles from its latencies.
+    const thr_copy = try gpa.alloc(f64, cfg.samples);
+    defer gpa.free(thr_copy);
+    @memcpy(thr_copy, thr);
+    const med_thr = metrics.median(thr_copy); // sorts thr_copy
+    const sd_thr = metrics.stddev(thr);
+
+    var best: usize = 0;
+    var best_diff: f64 = std.math.floatMax(f64);
+    for (thr, 0..) |t, i| {
+        const d = @abs(t - med_thr);
+        if (d < best_diff) {
+            best_diff = d;
+            best = i;
+        }
+    }
+
+    const all = lat_per_sample[best];
     std.mem.sort(i96, all, {}, std.sort.asc(i96));
 
-    const wall_s: f64 = @as(f64, @floatFromInt(@as(i64, @intCast(wall_ns)))) / 1_000_000_000.0;
-    const rps: f64 = @as(f64, @floatFromInt(total)) / wall_s;
-    try out.print("  requests        {d}\n", .{total});
-    try out.print("  wall            {d:.3} s\n", .{wall_s});
-    try out.print("  throughput      {d:.0} req/sec\n", .{rps});
-    try out.print("  latency p50     {d:.1} us\n", .{us(pct(all, 50))});
-    try out.print("  latency p90     {d:.1} us\n", .{us(pct(all, 90))});
-    try out.print("  latency p99     {d:.1} us\n", .{us(pct(all, 99))});
+    try out.print("  requests        {d} x {d} samples\n", .{ total, cfg.samples });
+    try out.print("  throughput      {d:.0} req/sec  +/- {d:.0}\n", .{ med_thr, sd_thr });
+    try out.print("  latency p50     {d:.1} us\n", .{us(metrics.percentile(all, 50))});
+    try out.print("  latency p90     {d:.1} us\n", .{us(metrics.percentile(all, 90))});
+    try out.print("  latency p99     {d:.1} us\n", .{us(metrics.percentile(all, 99))});
     try out.print("  latency max     {d:.1} us\n", .{us(all[all.len - 1])});
 }
 
@@ -216,12 +322,6 @@ fn parseClen(head: []const u8) usize {
     const i = start + key.len;
     const end = std.mem.indexOfScalarPos(u8, head, i, '\r') orelse return 0;
     return std.fmt.parseInt(usize, head[i..end], 10) catch 0;
-}
-
-fn pct(sorted: []const i96, p: usize) i96 {
-    if (sorted.len == 0) return 0;
-    const idx = @min((sorted.len * p) / 100, sorted.len - 1);
-    return sorted[idx];
 }
 
 fn us(ns: i96) f64 {
