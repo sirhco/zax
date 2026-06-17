@@ -76,6 +76,10 @@ pub const AccessLogger = struct {
                 try std.json.Stringify.encodeJsonString(rec.path, .{}, w);
                 try w.print(",\"status\":{d},\"dur_us\":{d},\"bytes\":{d}", .{ rec.status, rec.duration_ns / 1000, rec.bytes });
                 if (rec.request_id.len > 0) {
+                    // Embedded raw (not encodeJsonString'd): request ids are
+                    // validated to a safe charset [A-Za-z0-9._-] before reaching
+                    // here (see server computeRid/validRid), so they contain no
+                    // JSON-special chars. If that contract changes, escape this.
                     try w.writeAll(",\"request_id\":\"");
                     try w.writeAll(rec.request_id);
                     try w.writeAll("\"");
