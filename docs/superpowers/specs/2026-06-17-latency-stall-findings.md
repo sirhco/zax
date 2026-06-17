@@ -26,12 +26,24 @@ wait; grep latency-trace trace-e1.log
 ```
 | segment | max_ms | over5ms | dominant |
 |---------|-------:|--------:|---------:|
-| head    |        |         |          |
-| body    |        |         |          |
-| disp    |        |         |          |
-| write   |        |         |          |
+| head    |   8.15 |     236 | 4908184  |
+| body    |   0.03 |       0 |        5 |
+| disp    |   0.07 |       0 |       14 |
+| write   |   0.15 |       0 |    45874 |
 
-**Which segment carries the ~35ms:** ______
+oha same run: p50 0.081 / p99 8.13 / **p99.9 35.66 / max 59.59** ms, 165k req/s; histogram
+cluster ~49.5k reqs in 23–47ms.
+
+**Which segment carries the ~35ms: NONE.** Sum of all four segment maxes ≈ 8.4ms, but oha
+p99.9 is 35.7ms. zax's per-request work (parse/route/dispatch/write) is all <8ms — **the
+~35ms is entirely outside the measured server path.** zax application code is exonerated.
+The stall is in the **IO/scheduling handoff** (between `flush` returning in 0.15ms and the
+client receiving / the next read waking), i.e. the `std.Io.Threaded` blocking-IO + kernel
+layer — not zax logic. `head` is the *dominant* segment but only ~8ms, so it isn't the
+keep-alive read-wait either. Combined with the cap result (8 threads / 18 cores → still
+35ms), the tail is insensitive to thread count AND compute and pinned at ~35ms → smells
+like a **fixed timer/quantum in `Io.Threaded` (likely macOS-specific)**. → E5 (Linux) is now
+the decisive experiment.
 
 ## E2 — non-keep-alive (`ZAX_KEEPALIVE=0`)
 Does the tail vanish without keep-alive? (isolates H1, the read-wait.)
