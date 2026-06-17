@@ -1,4 +1,4 @@
-//! Non-blocking per-connection state machine — read & parse phase (Task 2).
+//! Non-blocking per-connection state machine — read, parse, dispatch, write.
 //!
 //! `Conn` wraps two caller-owned buffers (read + write) and drives HTTP/1.1
 //! request ingestion without blocking the calling thread. All IO is mediated
@@ -8,7 +8,7 @@
 //! Task 2 scope: `fillAndParse` — fill the read buffer from the transport,
 //! parse the request head, validate no chunked encoding, read the body by
 //! Content-Length, and return a `ParseOutcome`.  Response serialisation,
-//! dispatch, keep-alive, and the `step` driver are added in Tasks 3–5.
+//! dispatch, keep-alive, and the `step` driver are added in Tasks 3–4.
 
 const std = @import("std");
 const parser = @import("../http/parser.zig");
@@ -20,6 +20,21 @@ const Response = response_mod.Response;
 
 const Transport = transport_mod.Transport;
 const Header = request.Header;
+
+// ---------------------------------------------------------------------------
+// Dispatcher — decouples Conn from App (Task 4)
+// ---------------------------------------------------------------------------
+
+/// Vtable-based dispatch indirection so `Conn` does not import `App`.
+/// The worker (Task 8) builds this from `App.dispatch`.
+pub const Dispatcher = struct {
+    ctx: *anyopaque,
+    dispatchFn: *const fn (ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response,
+
+    pub fn dispatch(self: Dispatcher, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
+        return self.dispatchFn(self.ctx, req, arena);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // State / StepResult — full enums wired across Tasks 2–5
@@ -113,6 +128,24 @@ pub const Conn = struct {
     w_len: usize = 0,
     /// Offset of the next byte to transmit (advanced by `pumpWrite`).
     w_off: usize = 0,
+
+    // -----------------------------------------------------------------------
+    // Task 4: keep-alive / pipeline fields
+    // -----------------------------------------------------------------------
+
+    /// Enable keep-alive on this connection. Mirrors `Options.keep_alive`.
+    keep_alive: bool = true,
+    /// Maximum requests to serve before closing. Mirrors `Options.max_keep_alive_requests`.
+    max_keep_alive_requests: usize = 100,
+    /// Number of requests fully served on this connection so far.
+    served: usize = 0,
+    /// When true, `step` must close after the current write completes
+    /// (used when a response overflowed the write buffer or was a stream).
+    close_after_write: bool = false,
+
+    /// Observer hook: called after each response is serialized, before writing.
+    /// Null = zero-cost no-op. Task 8 will wire this up; the seam is here.
+    on_response: ?*const fn (req: *const request.Request, resp: *const Response) void = null,
 
     /// Construct a `Conn` backed by the given lent buffers and arena.
     pub fn init(read_buf: []u8, write_buf: []u8, arena: *std.heap.ArenaAllocator) Conn {
@@ -270,6 +303,150 @@ pub const Conn = struct {
             },
             .would_block => return .want_write,
             .closed => return .closed,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4: compact + full step() state machine
+    // -----------------------------------------------------------------------
+
+    /// Move pipelined leftover bytes (`read_buf[r_start..r_end]`) to the
+    /// front of the buffer, resetting `r_start = 0`. Mirrors `ConnReader.compact`
+    /// in `src/server.zig`. Call at the start of each new request cycle.
+    pub fn compact(self: *Conn) void {
+        if (self.r_start == 0) return;
+        const len = self.r_end - self.r_start;
+        std.mem.copyForwards(u8, self.read_buf[0..len], self.read_buf[self.r_start..self.r_end]);
+        self.r_start = 0;
+        self.r_end = len;
+    }
+
+    /// Drive the connection state machine one step.
+    ///
+    /// Returns:
+    /// - `.want_read`  — re-arm the readable event; call again when data arrives.
+    /// - `.want_write` — re-arm the writable event; call again when fd is writable.
+    /// - `.done_close` — the connection is finished; caller should close the fd.
+    ///
+    /// The machine loops internally when it can make synchronous progress
+    /// (e.g. pipelined request already buffered after a write completes).
+    pub fn step(self: *Conn, t: Transport, d: Dispatcher) StepResult {
+        while (true) {
+            switch (self.state) {
+                .reading_head, .reading_body => {
+                    switch (self.fillAndParse(t)) {
+                        .need_more => return .want_read,
+                        .closed => {
+                            self.state = .closing;
+                            return .done_close;
+                        },
+                        .failed => {
+                            // Task 5 will refine error→status mapping.
+                            // For now, emit a generic 400 and close.
+                            var err_resp = Response.fromStatus(.bad_request);
+                            err_resp.keep_alive = false;
+                            _ = self.serializeResponse(err_resp);
+                            self.close_after_write = true;
+                            self.state = .writing;
+                            // fall through to writing on the next iteration
+                        },
+                        .parsed => |p| {
+                            // Advance r_start past this request so the next
+                            // compact() sees only pipelined leftovers.
+                            const consumed = p.head_len + p.request.body.len;
+                            self.r_start += consumed;
+
+                            // Keep-alive decision (mirrors server.zig handleConn).
+                            const persistent = self.keep_alive and
+                                p.request.isPersistent() and
+                                (self.served + 1) < self.max_keep_alive_requests;
+
+                            // Dispatch → Response.
+                            var resp = d.dispatch(&p.request, self.arena);
+
+                            // Handle streamed responses: no true streaming in v1,
+                            // render into write_buf up to capacity.
+                            const is_streamed = resp.streamer != null;
+
+                            // Set keep_alive on the response header.
+                            resp.keep_alive = persistent and !is_streamed;
+
+                            // Observer hook (zero-cost when null).
+                            if (self.on_response) |hook| hook(&p.request, &resp);
+
+                            // Serialize into write_buf.
+                            const serialized = self.serializeResponse(resp);
+
+                            // Detect overflow/truncation: if write_buf is exactly full
+                            // the response was truncated (the fixed writer stopped early).
+                            // Also treat a streamed response that didn't fit as overflow.
+                            const overflowed = serialized == self.write_buf.len or
+                                (is_streamed and serialized == self.write_buf.len);
+                            if (overflowed) {
+                                // Synthesize a 500 into write_buf and force close.
+                                var e500 = Response.fromStatus(.internal_server_error);
+                                e500.keep_alive = false;
+                                _ = self.serializeResponse(e500);
+                                self.close_after_write = true;
+                            } else if (is_streamed) {
+                                // Streamed but fit: still close-after-write (v1 rule).
+                                self.close_after_write = true;
+                            } else if (!persistent) {
+                                self.close_after_write = true;
+                            }
+
+                            self.state = .writing;
+                            // fall through to writing
+                        },
+                    }
+                },
+
+                .writing => {
+                    switch (self.pumpWrite(t)) {
+                        .want_write => return .want_write,
+                        .closed => {
+                            self.state = .closing;
+                            return .done_close;
+                        },
+                        .wrote_all => {
+                            // Count this request regardless of keep-alive disposition.
+                            self.served += 1;
+                            if (self.close_after_write) {
+                                self.state = .closing;
+                                return .done_close;
+                            }
+                            // Keep-alive: reset for next request.
+                            self.close_after_write = false;
+                            _ = self.arena.reset(.retain_capacity);
+                            self.compact();
+                            self.state = .reading_head;
+                            // If bytes are already buffered (pipelined), loop
+                            // immediately; otherwise wait for new data.
+                            if (self.r_end > self.r_start) {
+                                // pipelined data present — stay in the loop
+                                continue;
+                            }
+                            self.state = .keep_alive_idle;
+                            return .want_read;
+                        },
+                    }
+                },
+
+                .keep_alive_idle => {
+                    // Waiting for the next pipelined/keep-alive request.
+                    self.state = .reading_head;
+                    // Loop: fillAndParse will call t.read; on would_block it
+                    // returns .need_more → want_read. On data it proceeds.
+                },
+
+                .dispatching => {
+                    // Not used in step(); dispatch is inline in .reading_head handling.
+                    self.state = .closing;
+                    return .done_close;
+                },
+
+                .closing => return .done_close,
+            }
         }
     }
 };
@@ -509,4 +686,155 @@ test "conn: pumpWrite resumes after would_block (backpressure)" {
 
     // Entire serialized response arrived in order.
     try testing.expectEqualStrings(wbuf[0..total_len], ft.written.items);
+}
+
+// ---------------------------------------------------------------------------
+// Task 4 tests — step() + Dispatcher + keep-alive + pipelining
+// ---------------------------------------------------------------------------
+
+/// Minimal fake dispatcher: echoes the request path as the response body.
+fn echoPathDispatch(ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
+    _ = ctx;
+    _ = arena;
+    return Response.text(req.path);
+}
+
+fn makeEchoDispatcher() Dispatcher {
+    return .{
+        .ctx = undefined, // not used
+        .dispatchFn = echoPathDispatch,
+    };
+}
+
+test "conn: step — one request → 200 → done_close (keep_alive off)" {
+    const raw = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false; // force close after first response
+
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    // step drives: reading_head → (parsed) → writing → wrote_all → done_close.
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    // ft.written must contain a valid 200 with "/hello" as body.
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.indexOf(u8, written, "/hello") != null);
+    try testing.expectEqual(@as(usize, 1), c.served);
+}
+
+test "conn: step — two pipelined keep-alive requests → two responses in order" {
+    // Two full HTTP/1.1 requests delivered in a single read chunk.
+    const req1 = "GET /first HTTP/1.1\r\nHost: x\r\n\r\n";
+    const req2 = "GET /second HTTP/1.1\r\nHost: x\r\n\r\n";
+    const both = req1 ++ req2;
+
+    var ft = FakeTransport.init(testing.allocator, &.{both});
+    defer ft.deinit();
+
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = true;
+    c.max_keep_alive_requests = 10;
+
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    // First step: reads both requests from one chunk, handles req1,
+    // then sees req2 buffered → handles req2, then hits want_read (no more data).
+    const r1 = c.step(t, d);
+    // After both requests are processed we hit keep_alive_idle → want_read.
+    try testing.expectEqual(StepResult.want_read, r1);
+    try testing.expectEqual(@as(usize, 2), c.served);
+
+    const written = ft.written.items;
+    // Both responses must appear in order.
+    const pos1 = std.mem.indexOf(u8, written, "/first") orelse return error.TestUnexpectedResult;
+    const pos2 = std.mem.indexOf(u8, written, "/second") orelse return error.TestUnexpectedResult;
+    try testing.expect(pos1 < pos2);
+    // Both are 200s.
+    try testing.expect(std.mem.count(u8, written, "HTTP/1.1 200 ") == 2);
+}
+
+test "conn: step — keep-alive idle then second request on later read" {
+    const raw1 = "GET /one HTTP/1.1\r\nHost: x\r\n\r\n";
+    const raw2 = "GET /two HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    // Deliver requests in two separate chunks (simulates two separate read events).
+    var ft = FakeTransport.init(testing.allocator, &.{ raw1, raw2 });
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = true;
+    c.max_keep_alive_requests = 10;
+
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    // First call: handles /one, then no more data → keep_alive_idle → want_read.
+    const r1 = c.step(t, d);
+    try testing.expectEqual(StepResult.want_read, r1);
+    try testing.expectEqual(@as(usize, 1), c.served);
+    try testing.expect(std.mem.indexOf(u8, ft.written.items, "/one") != null);
+
+    // Second call (simulating the event loop re-arming read): handles /two,
+    // then transport is exhausted (closed) so keep-alive loop ends.
+    const r2 = c.step(t, d);
+    // After /two is served, no more data → transport closes → done_close
+    // OR want_read depending on whether transport signals closed.
+    // With FakeTransport, after all chunks consumed the next read returns .closed.
+    // The keep_alive_idle→reading_head→fillAndParse path hits .closed → done_close.
+    try testing.expect(r2 == .done_close or r2 == .want_read);
+    try testing.expect(c.served >= 2);
+    try testing.expect(std.mem.indexOf(u8, ft.written.items, "/two") != null);
+}
+
+test "conn: step — oversize response → 500 + done_close" {
+    // A tiny write buffer forces overflow detection.
+    const raw = "GET /path HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    // Write buf deliberately tiny so the echo response overflows.
+    var wbuf: [32]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    // The written bytes should contain a 500 (not a 200), since the response overflowed.
+    // The 500 itself may also be truncated to fit in 32 bytes, but it should start with
+    // HTTP/1.1 5 at minimum.
+    const written = ft.written.items;
+    try testing.expect(written.len > 0);
+    // Check that a 500 status appears (overflow path emits 500).
+    try testing.expect(std.mem.indexOf(u8, written, "500") != null or
+        std.mem.indexOf(u8, written, "HTTP/1.1 5") != null);
 }
