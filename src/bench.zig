@@ -23,7 +23,12 @@ const Config = metrics.Config;
 
 const clock: Io.Clock = .awake; // monotonic
 
-const usage_line = "usage: bench [--iters N] [--conns N] [--reqs N] [--samples N] [--warmup N]\n";
+const usage_line = "usage: bench [--iters N] [--conns N] [--reqs N] [--samples N] [--warmup N] [--json] [--check] [--tolerance F]\n";
+
+// One collected result. `gated` metrics are compared in --check mode; ungated
+// ones (throughput) are still emitted in --json but never gate the build.
+const Metric = struct { key: []const u8, value: f64, gated: bool };
+const baseline_json = @embedFile("bench/baseline.json");
 
 fn nowNs(io: Io) i96 {
     return Io.Timestamp.now(io, clock).toNanoseconds();
@@ -91,19 +96,111 @@ pub fn main(init: std.process.Init) !void {
     var stdout_fw: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
     const out = &stdout_fw.interface;
 
-    try out.writeAll("=== Zax benchmark (ReleaseFast recommended) ===\n\n");
-    try microBenchmarks(io, gpa, out, cfg);
-    try endToEnd(io, gpa, out, cfg);
-    try out.writeAll("\n");
-    try memoryMetrics(io, gpa, out, cfg);
+    // In --json/--check mode the sections produce NO stdout; only the JSON
+    // object (or the check report) is written, so it redirects cleanly.
+    const human = !(cfg.json or cfg.check);
+
+    var coll: std.ArrayList(Metric) = .empty;
+
+    if (human) try out.writeAll("=== Zax benchmark (ReleaseFast recommended) ===\n\n");
+    try microBenchmarks(io, gpa, out, cfg, &coll, arena, human);
+    try endToEnd(io, gpa, out, cfg, &coll, arena, human);
+    if (human) try out.writeAll("\n");
+    try memoryMetrics(io, gpa, out, cfg, &coll, arena, human);
+
+    if (cfg.json) {
+        try emitJson(out, coll.items);
+    } else if (cfg.check) {
+        try runCheck(gpa, out, cfg, coll.items);
+    }
     try out.flush();
+}
+
+/// Emit a single flat JSON object of all collected metrics and nothing else.
+fn emitJson(out: *Io.Writer, items: []const Metric) !void {
+    try out.writeByte('{');
+    for (items, 0..) |m, i| {
+        if (i != 0) try out.writeByte(',');
+        // Keys are simple ASCII (scenario names may contain spaces, valid in a
+        // JSON string). std.json.Stringify escapes them safely.
+        try std.json.Stringify.encodeJsonString(m.key, .{}, out);
+        try out.print(":{d}", .{m.value});
+    }
+    try out.writeAll("}\n");
+}
+
+/// Compare the gated metrics against the embedded baseline within tolerance,
+/// print OK/FAIL per metric and a summary, and exit nonzero on any regression.
+fn runCheck(gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config, items: []const Metric) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, baseline_json, .{}) catch |e| {
+        try out.print("error: failed to parse embedded baseline.json: {s}\n", .{@errorName(e)});
+        try out.flush();
+        std.process.exit(2);
+    };
+    defer parsed.deinit();
+    const base_obj = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            try out.writeAll("error: baseline.json is not a JSON object\n");
+            try out.flush();
+            std.process.exit(2);
+        },
+    };
+
+    var checked: usize = 0;
+    var regressed_n: usize = 0;
+    var any_fail = false;
+
+    for (items) |m| {
+        if (!m.gated) continue;
+        checked += 1;
+        const bv = base_obj.get(m.key) orelse {
+            try out.print("  (no baseline)  {s}\n", .{m.key});
+            continue;
+        };
+        const base = jsonNumber(bv) orelse {
+            try out.print("  (bad baseline) {s}\n", .{m.key});
+            continue;
+        };
+        const reg = metrics.regressed(base, m.value, cfg.tolerance);
+        const d = metrics.pctDelta(base, m.value);
+        // Zig 0.16 fmt has no `+` sign flag, so render the sign manually.
+        const sign: []const u8 = if (d >= 0) "+" else "-";
+        if (reg) {
+            regressed_n += 1;
+            any_fail = true;
+            try out.print("  FAIL {s}: {d:.1} vs {d:.1}  ({s}{d:.1}%)\n", .{ m.key, m.value, base, sign, @abs(d) });
+        } else {
+            try out.print("  OK   {s}: {d:.1} vs {d:.1}  ({s}{d:.1}%)\n", .{ m.key, m.value, base, sign, @abs(d) });
+        }
+    }
+
+    try out.print(
+        "checked {d} gated metrics, {d} regressed (tolerance {d:.0}%)\n",
+        .{ checked, regressed_n, cfg.tolerance * 100.0 },
+    );
+
+    if (any_fail) {
+        try out.flush();
+        std.process.exit(1);
+    }
+}
+
+/// Coerce a JSON number Value to f64, handling integer/float/number_string.
+fn jsonNumber(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .integer => |n| @floatFromInt(n),
+        .float => |f| f,
+        .number_string => |s| std.fmt.parseFloat(f64, s) catch null,
+        else => null,
+    };
 }
 
 // ---------------------------------------------------------------------------
 // Section A: micro-benchmarks
 // ---------------------------------------------------------------------------
-fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void {
-    try out.print("-- micro-benchmarks (in-process, {d} iters x {d} samples) --\n", .{ cfg.iters, cfg.samples });
+fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config, coll: *std.ArrayList(Metric), arena: std.mem.Allocator, human: bool) !void {
+    if (human) try out.print("-- micro-benchmarks (in-process, {d} iters x {d} samples) --\n", .{ cfg.iters, cfg.samples });
 
     const iters = cfg.iters;
 
@@ -143,7 +240,7 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             std.mem.doNotOptimizeAway(sink);
             slot.* = nsPerOp(ns, iters);
         }
-        try report(out, "parseHead", metrics.median(buf), metrics.stddev(buf));
+        try report(out, coll, arena, human, "parseHead", metrics.median(buf), metrics.stddev(buf));
     }
 
     // 2. Radix route match (static + param).
@@ -174,7 +271,7 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             std.mem.doNotOptimizeAway(sink);
             slot.* = nsPerOp(ns, iters);
         }
-        try report(out, "radix match", metrics.median(buf), metrics.stddev(buf));
+        try report(out, coll, arena, human, "radix match", metrics.median(buf), metrics.stddev(buf));
     }
 
     // 3. Response serialize to a fixed buffer.
@@ -205,7 +302,7 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             std.mem.doNotOptimizeAway(sink);
             slot.* = nsPerOp(ns, iters);
         }
-        try report(out, "response write", metrics.median(buf), metrics.stddev(buf));
+        try report(out, coll, arena, human, "response write", metrics.median(buf), metrics.stddev(buf));
     }
 
     // 4. Middleware chain (3 pass-through middlewares wrapping a handler).
@@ -240,7 +337,7 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             std.mem.doNotOptimizeAway(sink);
             slot.* = nsPerOp(ns, iters);
         }
-        try report(out, "middleware x3", metrics.median(buf), metrics.stddev(buf));
+        try report(out, coll, arena, human, "middleware x3", metrics.median(buf), metrics.stddev(buf));
     }
 
     // 5. Radix wildcard match.
@@ -271,7 +368,7 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             std.mem.doNotOptimizeAway(sink);
             slot.* = nsPerOp(ns, iters);
         }
-        try report(out, "radix wildcard", metrics.median(buf), metrics.stddev(buf));
+        try report(out, coll, arena, human, "radix wildcard", metrics.median(buf), metrics.stddev(buf));
     }
 
     // 6. Radix nested-static + param match.
@@ -302,7 +399,7 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             std.mem.doNotOptimizeAway(sink);
             slot.* = nsPerOp(ns, iters);
         }
-        try report(out, "radix nested", metrics.median(buf), metrics.stddev(buf));
+        try report(out, coll, arena, human, "radix nested", metrics.median(buf), metrics.stddev(buf));
     }
 
     // 7. Path extractor (struct field from a captured param).
@@ -339,7 +436,7 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             std.mem.doNotOptimizeAway(sink);
             slot.* = nsPerOp(ns, iters);
         }
-        try report(out, "Path extract", metrics.median(buf), metrics.stddev(buf));
+        try report(out, coll, arena, human, "Path extract", metrics.median(buf), metrics.stddev(buf));
     }
 
     // 8. Query extractor (bool + int from a query string).
@@ -370,7 +467,7 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             std.mem.doNotOptimizeAway(sink);
             slot.* = nsPerOp(ns, iters);
         }
-        try report(out, "Query extract", metrics.median(buf), metrics.stddev(buf));
+        try report(out, coll, arena, human, "Query extract", metrics.median(buf), metrics.stddev(buf));
     }
 
     // 9. Json extractor (small object from the request body).
@@ -401,12 +498,15 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             std.mem.doNotOptimizeAway(sink);
             slot.* = nsPerOp(ns, iters);
         }
-        try report(out, "Json extract", metrics.median(buf), metrics.stddev(buf));
+        try report(out, coll, arena, human, "Json extract", metrics.median(buf), metrics.stddev(buf));
     }
-    try out.writeAll("\n");
+    if (human) try out.writeAll("\n");
 }
 
-fn report(out: *Io.Writer, name: []const u8, median_ns: f64, sd_ns: f64) !void {
+fn report(out: *Io.Writer, coll: *std.ArrayList(Metric), arena: std.mem.Allocator, human: bool, name: []const u8, median_ns: f64, sd_ns: f64) !void {
+    // Always collect (micro medians are gated); print only in human mode.
+    try coll.append(arena, .{ .key = name, .value = median_ns, .gated = true });
+    if (!human) return;
     const per_sec: f64 = if (median_ns > 0) 1_000_000_000.0 / median_ns else 0;
     try out.print("  {s:<16} {d:>8.1} ns/op  +/- {d:>6.1}  {d:>12.0} ops/sec\n", .{ name, median_ns, sd_ns, per_sec });
 }
@@ -438,8 +538,8 @@ fn runLoad(io: Io, gpa: std.mem.Allocator, port: u16, req: []const u8, conns: us
     return if (wall_s > 0) @as(f64, @floatFromInt(total)) / wall_s else 0;
 }
 
-fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void {
-    try out.print("-- end-to-end load (loopback, {d} keep-alive conns x {d} reqs, {d} samples) --\n", .{ cfg.conns, cfg.reqs, cfg.samples });
+fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config, coll: *std.ArrayList(Metric), arena: std.mem.Allocator, human: bool) !void {
+    if (human) try out.print("-- end-to-end load (loopback, {d} keep-alive conns x {d} reqs, {d} samples) --\n", .{ cfg.conns, cfg.reqs, cfg.samples });
 
     var db = Db{};
     var app = try Api.init(gpa, &db, .{});
@@ -454,13 +554,13 @@ fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void 
         loop_fut.await(io);
     }
 
-    for (scenarios) |sc| try benchScenario(io, gpa, out, port, cfg, sc);
+    for (scenarios) |sc| try benchScenario(io, gpa, out, port, cfg, sc, coll, arena, human);
 }
 
 /// Run one scenario's measured load (warmup + samples) and print a per-scenario
 /// block. The math (median throughput, stddev, median-sample percentiles) is
 /// identical to the original single-scenario path; only the request varies.
-fn benchScenario(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, port: u16, cfg: Config, sc: Scenario) !void {
+fn benchScenario(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, port: u16, cfg: Config, sc: Scenario, coll: *std.ArrayList(Metric), arena: std.mem.Allocator, human: bool) !void {
     const conns = cfg.conns;
     const reqs = cfg.reqs;
     const total = conns * reqs;
@@ -511,6 +611,11 @@ fn benchScenario(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, port: u16, cfg
     const all = lat_per_sample[best];
     std.mem.sort(i96, all, {}, std.sort.asc(i96));
 
+    // Collect median throughput (ungated: not compared in --check).
+    const thr_key = try std.fmt.allocPrint(arena, "thr.{s}", .{sc.name});
+    try coll.append(arena, .{ .key = thr_key, .value = med_thr, .gated = false });
+
+    if (!human) return;
     try out.print("  [{s}]\n", .{sc.name});
     try out.print("    requests      {d} x {d} samples\n", .{ total, cfg.samples });
     try out.print("    throughput    {d:.0} req/sec  +/- {d:.0}\n", .{ med_thr, sd_thr });
@@ -527,8 +632,8 @@ fn benchScenario(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, port: u16, cfg
 // the CountingAllocator's atomic-counter overhead. Only the SERVER's allocator
 // is wrapped; the client side (runLoad) uses the raw gpa, so client
 // allocations are not counted.
-fn memoryMetrics(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void {
-    try out.print("-- memory (loopback, {d} conns x {d} reqs) --\n", .{ cfg.conns, cfg.reqs });
+fn memoryMetrics(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config, coll: *std.ArrayList(Metric), arena: std.mem.Allocator, human: bool) !void {
+    if (human) try out.print("-- memory (loopback, {d} conns x {d} reqs) --\n", .{ cfg.conns, cfg.reqs });
 
     var ca = counting.CountingAllocator{ .child = gpa };
     const cgpa = ca.allocator(); // server allocations counted
@@ -570,8 +675,14 @@ fn memoryMetrics(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !
         // amortized connection setup, not pure per-request cost.
         // Cross-scenario differences are dominated by those per-connection buffers at small loads; they only diverge meaningfully at high request counts.
         const per_req: f64 = @as(f64, @floatFromInt(after - before)) / @as(f64, @floatFromInt(total));
-        try out.print("  [{s}] bytes/req {d:.1}\n", .{ sc.name, per_req });
+
+        // Collect bytes/req (gated: compared in --check).
+        const mem_key = try std.fmt.allocPrint(arena, "mem.{s}", .{sc.name});
+        try coll.append(arena, .{ .key = mem_key, .value = per_req, .gated = true });
+
+        if (human) try out.print("  [{s}] bytes/req {d:.1}\n", .{ sc.name, per_req });
     }
+    if (!human) return;
     const rss = peakRssMb();
     if (rss < 0) {
         try out.writeAll("  peak RSS        n/a\n");
