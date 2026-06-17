@@ -37,6 +37,27 @@ fn benchHandler() zax.Response {
     return zax.Response.text("ok");
 }
 
+fn userHandler(p: zax.Path(struct { id: u64 })) zax.Response {
+    _ = p;
+    return zax.Response.text("ok");
+}
+fn echoHandler(b: zax.Json(struct { msg: []const u8 })) !zax.Response {
+    return zax.Response.text(b.value.msg);
+}
+
+const Scenario = struct { name: []const u8, req: []const u8 };
+const scenarios = [_]Scenario{
+    .{ .name = "static GET", .req = "GET /bench HTTP/1.1\r\nHost: x\r\n\r\n" },
+    .{ .name = "param GET", .req = "GET /users/123 HTTP/1.1\r\nHost: x\r\n\r\n" },
+    .{ .name = "json POST", .req = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 15\r\n\r\n{\"msg\":\"hello\"}" },
+};
+
+fn registerBenchRoutes(app: *Api) !void {
+    try app.get("/bench", benchHandler);
+    try app.get("/users/:id", userHandler);
+    try app.post("/echo", echoHandler);
+}
+
 // --- Fixtures used by the micro-benchmark chain section ---
 const FakeCtx = struct {};
 const FChn = zax.Chain(FakeCtx);
@@ -396,7 +417,7 @@ fn report(out: *Io.Writer, name: []const u8, median_ns: f64, sd_ns: f64) !void {
 /// Run one measured load: `conns` workers each issuing `reqs` requests over a
 /// keep-alive connection. Fills `all` (length conns*reqs) with per-request
 /// latencies (ns) and returns the load's throughput (req/sec).
-fn runLoad(io: Io, gpa: std.mem.Allocator, port: u16, conns: usize, reqs: usize, all: []i96) !f64 {
+fn runLoad(io: Io, gpa: std.mem.Allocator, port: u16, req: []const u8, conns: usize, reqs: usize, all: []i96) !f64 {
     // Per-connection latency buffers (slices into `all`).
     const lat = try gpa.alloc([]i96, conns);
     defer gpa.free(lat);
@@ -407,7 +428,7 @@ fn runLoad(io: Io, gpa: std.mem.Allocator, port: u16, conns: usize, reqs: usize,
 
     const t0 = nowNs(io);
     for (0..conns) |c| {
-        futs[c] = io.async(worker, .{ io, port, lat[c] });
+        futs[c] = io.async(worker, .{ io, port, req, lat[c] });
     }
     for (futs) |*f| f.await(io);
     const wall_ns = nowNs(io) - t0;
@@ -418,14 +439,12 @@ fn runLoad(io: Io, gpa: std.mem.Allocator, port: u16, conns: usize, reqs: usize,
 }
 
 fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void {
-    const conns = cfg.conns;
-    const reqs = cfg.reqs;
-    try out.print("-- end-to-end load (loopback, {d} keep-alive conns x {d} reqs, {d} samples) --\n", .{ conns, reqs, cfg.samples });
+    try out.print("-- end-to-end load (loopback, {d} keep-alive conns x {d} reqs, {d} samples) --\n", .{ cfg.conns, cfg.reqs, cfg.samples });
 
     var db = Db{};
     var app = try Api.init(gpa, &db, .{});
     defer app.deinit();
-    try app.get("/bench", benchHandler);
+    try registerBenchRoutes(&app);
 
     const port: u16 = 18099;
     try app.bind(io, .{ .ip4 = .loopback(port) });
@@ -435,6 +454,15 @@ fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void 
         loop_fut.await(io);
     }
 
+    for (scenarios) |sc| try benchScenario(io, gpa, out, port, cfg, sc);
+}
+
+/// Run one scenario's measured load (warmup + samples) and print a per-scenario
+/// block. The math (median throughput, stddev, median-sample percentiles) is
+/// identical to the original single-scenario path; only the request varies.
+fn benchScenario(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, port: u16, cfg: Config, sc: Scenario) !void {
+    const conns = cfg.conns;
+    const reqs = cfg.reqs;
     const total = conns * reqs;
 
     // Warmup loads (discarded).
@@ -443,7 +471,7 @@ fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void 
         defer gpa.free(scratch);
         var w: usize = 0;
         while (w < cfg.warmup) : (w += 1) {
-            _ = try runLoad(io, gpa, port, conns, reqs, scratch);
+            _ = try runLoad(io, gpa, port, sc.req, conns, reqs, scratch);
         }
     }
 
@@ -459,7 +487,7 @@ fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void 
     defer for (lat_per_sample) |s| gpa.free(s);
 
     for (0..cfg.samples) |s| {
-        thr[s] = try runLoad(io, gpa, port, conns, reqs, lat_per_sample[s]);
+        thr[s] = try runLoad(io, gpa, port, sc.req, conns, reqs, lat_per_sample[s]);
     }
 
     // Median throughput; locate the sample whose throughput == median (or
@@ -483,12 +511,13 @@ fn endToEnd(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !void 
     const all = lat_per_sample[best];
     std.mem.sort(i96, all, {}, std.sort.asc(i96));
 
-    try out.print("  requests        {d} x {d} samples\n", .{ total, cfg.samples });
-    try out.print("  throughput      {d:.0} req/sec  +/- {d:.0}\n", .{ med_thr, sd_thr });
-    try out.print("  latency p50     {d:.1} us\n", .{us(metrics.percentile(all, 50))});
-    try out.print("  latency p90     {d:.1} us\n", .{us(metrics.percentile(all, 90))});
-    try out.print("  latency p99     {d:.1} us\n", .{us(metrics.percentile(all, 99))});
-    try out.print("  latency max     {d:.1} us\n", .{us(all[all.len - 1])});
+    try out.print("  [{s}]\n", .{sc.name});
+    try out.print("    requests      {d} x {d} samples\n", .{ total, cfg.samples });
+    try out.print("    throughput    {d:.0} req/sec  +/- {d:.0}\n", .{ med_thr, sd_thr });
+    try out.print("    latency p50   {d:.1} us\n", .{us(metrics.percentile(all, 50))});
+    try out.print("    latency p90   {d:.1} us\n", .{us(metrics.percentile(all, 90))});
+    try out.print("    latency p99   {d:.1} us\n", .{us(metrics.percentile(all, 99))});
+    try out.print("    latency max   {d:.1} us\n", .{us(all[all.len - 1])});
 }
 
 // ---------------------------------------------------------------------------
@@ -507,7 +536,7 @@ fn memoryMetrics(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !
     var db = Db{};
     var app = try Api.init(cgpa, &db, .{});
     defer app.deinit();
-    try app.get("/bench", benchHandler);
+    try registerBenchRoutes(&app);
 
     const port: u16 = 18098;
     try app.bind(io, .{ .ip4 = .loopback(port) });
@@ -519,27 +548,29 @@ fn memoryMetrics(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !
 
     const total = cfg.conns * cfg.reqs;
 
-    // Warmup load(s): client uses the raw gpa (not counted).
-    {
-        const scratch = try gpa.alloc(i96, total);
-        defer gpa.free(scratch);
-        var w: usize = 0;
-        while (w < cfg.warmup) : (w += 1) {
-            _ = try runLoad(io, gpa, port, cfg.conns, cfg.reqs, scratch);
+    for (scenarios) |sc| {
+        // Warmup load(s): client uses the raw gpa (not counted).
+        {
+            const scratch = try gpa.alloc(i96, total);
+            defer gpa.free(scratch);
+            var w: usize = 0;
+            while (w < cfg.warmup) : (w += 1) {
+                _ = try runLoad(io, gpa, port, sc.req, cfg.conns, cfg.reqs, scratch);
+            }
         }
+
+        const lat = try gpa.alloc(i96, total);
+        defer gpa.free(lat);
+        const before = ca.bytesAllocated();
+        _ = try runLoad(io, gpa, port, sc.req, cfg.conns, cfg.reqs, lat);
+        const after = ca.bytesAllocated();
+
+        // bytes/req includes amortized per-connection accept/buffers (each load opens
+        // fresh connections), so this is steady-state allocator pressure including
+        // amortized connection setup, not pure per-request cost.
+        const per_req: f64 = @as(f64, @floatFromInt(after - before)) / @as(f64, @floatFromInt(total));
+        try out.print("  [{s}] bytes/req {d:.1}\n", .{ sc.name, per_req });
     }
-
-    const lat = try gpa.alloc(i96, total);
-    defer gpa.free(lat);
-    const before = ca.bytesAllocated();
-    _ = try runLoad(io, gpa, port, cfg.conns, cfg.reqs, lat);
-    const after = ca.bytesAllocated();
-
-    // bytes/req includes amortized per-connection accept/buffers (each load opens
-    // fresh connections), so this is steady-state allocator pressure including
-    // amortized connection setup, not pure per-request cost.
-    const per_req: f64 = @as(f64, @floatFromInt(after - before)) / @as(f64, @floatFromInt(total));
-    try out.print("  bytes/req       {d:.1}\n", .{per_req});
     const rss = peakRssMb();
     if (rss < 0) {
         try out.writeAll("  peak RSS        n/a\n");
@@ -559,11 +590,11 @@ fn peakRssMb() f64 {
     return bytes / (1024.0 * 1024.0);
 }
 
-fn worker(io: Io, port: u16, out_lat: []i96) void {
-    workerFallible(io, port, out_lat) catch {};
+fn worker(io: Io, port: u16, req: []const u8, out_lat: []i96) void {
+    workerFallible(io, port, req, out_lat) catch {};
 }
 
-fn workerFallible(io: Io, port: u16, out_lat: []i96) !void {
+fn workerFallible(io: Io, port: u16, req: []const u8, out_lat: []i96) !void {
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = try caddr.connect(io, .{ .mode = .stream });
     defer cs.close(io);
@@ -575,7 +606,7 @@ fn workerFallible(io: Io, port: u16, out_lat: []i96) !void {
 
     for (out_lat) |*slot| {
         const t0 = nowNs(io);
-        try cw.interface.writeAll("GET /bench HTTP/1.1\r\nHost: x\r\n\r\n");
+        try cw.interface.writeAll(req);
         try cw.interface.flush();
         skipResponse(r);
         slot.* = nowNs(io) - t0;
