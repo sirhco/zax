@@ -87,15 +87,17 @@ if ! command -v "$LOAD" >/dev/null 2>&1; then
 fi
 
 echo "== building (release) =="
-( cd zax  && zig build -Doptimize=ReleaseFast )
-( cd axum && cargo build --release )
-( cd go   && go build -o go-bench . )
+( cd zax   && zig build -Doptimize=ReleaseFast )
+( cd axum  && cargo build --release )
+( cd go    && go build -o go-bench . )
+[ -d httpz ] && ( cd httpz && zig build -Doptimize=ReleaseFast )
 
 # name  port  start-command
 FRAMEWORKS=(
-  "zax  8081 ./zax/zig-out/bin/zax-bench"
-  "axum 8082 ./axum/target/release/axum-bench"
-  "go   8083 ./go/go-bench"
+  "zax   8081 ./zax/zig-out/bin/zax-bench"
+  "axum  8082 ./axum/target/release/axum-bench"
+  "go    8083 ./go/go-bench"
+  "httpz 8084 ./httpz/zig-out/bin/httpz-bench"
 )
 
 # drive <name> <scenario> <url> [method] [data]

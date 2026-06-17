@@ -34,8 +34,9 @@ RUN cargo install oha --locked && oha --version
 WORKDIR /zax
 COPY . /zax
 RUN cd /zax/benchmarks/cross \
-    && ( cd zax  && zig build -Doptimize=ReleaseFast ) \
-    && ( cd axum && cargo build --release ) \
-    && ( cd go   && go build -o go-bench . )
+    && ( cd zax   && zig build -Doptimize=ReleaseFast ) \
+    && ( cd axum  && cargo build --release ) \
+    && ( cd go    && go build -o go-bench . ) \
+    && ( cd httpz && zig build -Doptimize=ReleaseFast )
 
 CMD ["bash", "/zax/benchmarks/cross/docker/run-linux-bench.sh"]

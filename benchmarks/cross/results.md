@@ -211,3 +211,25 @@ req/s carries Docker-VM overhead; the **relative** gap (same VM) is sound.
 go 2.9ms). zax p50 is still best (0.054ms — hot path excellent). Root cause = `std.Io.Threaded`
 thread-per-conn (64 blocking threads on 9 pinned cores). The unpinned macOS "competitive
 throughput" was an artifact. See `docs/superpowers/specs/2026-06-17-latency-stall-findings.md`.
+
+### httpz de-risk — evented Zig server closes the gap (Linux Docker, PIN=1)
+
+Added httpz (karlseguin/http.zig, evented epoll, Zig 0.16) as a 4th framework to confirm an
+*evented Zig* server reaches axum-class numbers on this exact box (before investing in an
+evented backend for zax). 15s, 64 conns, pinned.
+
+| framework | req/s | p50 | p99 | p99.9 | max | model |
+|-----------|------:|----:|----:|------:|----:|-------|
+| zax   | ~115k | **0.054** | ~2.1 | 53–56 | 79–98 | std.Io.Threaded (thread/conn) |
+| httpz | **~400k** | 0.150 | 0.31 | **0.40** | ~2 | own epoll loop (evented) |
+| axum  | ~435k | 0.140 | 0.30 | 0.39 | ~3 | tokio (evented) |
+| go    | ~410k | 0.083 | 1.9 | 2.8 | ~8 | goroutines (M:N) |
+
+**Verdict: evented IO is the fix.** httpz (Zig, epoll) matches axum — **~3.5× zax throughput,
+~130× better tail** — on identical hardware/kernel/VM. The ceiling is not Zig, the kernel, or
+the VM; it is zax's thread-per-connection `std.Io.Threaded` backend. **zax's p50 (0.054ms) is
+the BEST of all four** (leaner than httpz's 0.15ms) — so zax with an evented backend could be
+the fastest overall: best median + evented throughput/tail. Two viable evented paths:
+(A) patch `std.Io.Evented` (io_uring/Uring) — keeps zax's clean `Io` pluggability; or
+(C) give zax its own epoll/kqueue loop like httpz — proven viable here, full control, but drops
+`Io` pluggability. See `docs/superpowers/specs/2026-06-17-evented-io-decision.md`.

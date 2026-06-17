@@ -1,0 +1,17 @@
+.{
+    .name = .httpz_bench_cross,
+    .version = "0.0.0",
+    .fingerprint = 0xde4583c1a10e410b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .httpz = .{
+            .url = "https://github.com/karlseguin/http.zig/archive/80a76ddee50e348f0c6ce5ccb6ac860dbb510f20.tar.gz",
+            .hash = "httpz-0.0.0-PNVzrIDeCAAPK5gkCAuTcCmqRfn0u65AYxxojzjsy-Pn",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
