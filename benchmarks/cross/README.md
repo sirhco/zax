@@ -37,7 +37,14 @@ cd benchmarks/cross
 ./run.sh                              # 30s, 64 connections, oha
 DURATION=10s CONNS=128 ./run.sh
 LOAD=wrk ./run.sh                     # oha | wrk | bombardier
+PIN=1 ./run.sh                        # pin server vs client to disjoint cores
+                                      # (Linux/taskset) so they don't fight for CPU
 ```
+
+`PIN=1` runs the server on the first half of the cores and the load generator on
+the second half (via `taskset`), so client CPU never steals from the server —
+this isolates the server's true tail latency from same-host oversubscription.
+Linux only; on macOS run the load generator on a separate machine instead.
 
 `run.sh` builds each server in release mode, boots it, warms up, runs the measured
 load for each scenario, then moves on. Copy req/s + p50/p99 into `results.md`.
@@ -55,7 +62,7 @@ These wreck cross-framework comparisons if ignored:
 - **Loopback ≠ network.** Same-host runs measure the kernel + scheduler as much
   as the framework. For real numbers, run the load generator on a **separate
   machine** over the network, or at minimum pin server vs client to disjoint
-  cores (`taskset`/cpuset on Linux; macOS has no easy core pinning).
+  cores — use **`PIN=1`** (Linux/`taskset`; macOS has no easy core pinning).
 - **Client starves server on one box.** The load tool competes for the same
   cores. Isolate them or expect noise.
 - **Runtime models differ.** Go has a GC (pause jitter); Rust/axum (tokio) and

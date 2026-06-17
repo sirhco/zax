@@ -8,6 +8,10 @@
 #   ./run.sh                         # 30s, 64 conns, oha
 #   DURATION=10s CONNS=128 ./run.sh
 #   LOAD=wrk ./run.sh                # oha | wrk | bombardier
+#   PIN=1 ./run.sh                   # pin server vs load generator to disjoint
+#                                    # cores (Linux/taskset) so they don't fight
+#                                    # for CPU — isolates the server's real tail
+#                                    # latency from same-host oversubscription
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -15,6 +19,27 @@ DURATION="${DURATION:-30s}"
 CONNS="${CONNS:-64}"
 LOAD="${LOAD:-oha}"
 WARMUP="${WARMUP:-3s}"
+PIN="${PIN:-0}"
+
+# When PIN=1, run the server on the first half of the cores and the load
+# generator on the second half (disjoint) via taskset, so client CPU never
+# steals from the server. taskset is Linux-only; macOS has no shell core
+# pinning — run the load generator on a SEPARATE machine for a fair test.
+SRV_PIN=""
+CLT_PIN=""
+if [ "$PIN" = 1 ]; then
+  if command -v taskset >/dev/null 2>&1; then
+    NCORES="$(nproc)"
+    HALF=$(( NCORES / 2 )); [ "$HALF" -lt 1 ] && HALF=1
+    SRV_PIN="taskset -c 0-$((HALF - 1))"
+    CLT_PIN="taskset -c ${HALF}-$((NCORES - 1))"
+    echo "== core pinning: server [$SRV_PIN]  client [$CLT_PIN] =="
+  else
+    echo "PIN=1 but 'taskset' not found (Linux only)."
+    echo "  macOS has no shell core pinning — run the load generator on a"
+    echo "  SEPARATE machine for a fair test. Proceeding UNPINNED."
+  fi
+fi
 
 if ! command -v "$LOAD" >/dev/null 2>&1; then
   echo "load generator '$LOAD' not found."
@@ -42,16 +67,16 @@ drive() {
   case "$LOAD" in
     oha)
       if [ "$method" = POST ]; then
-        oha -z "$WARMUP" -c "$CONNS" --no-tui -m POST -d "$data" -T application/json "$url" >/dev/null
-        oha -z "$DURATION" -c "$CONNS" --no-tui -m POST -d "$data" -T application/json "$url"
+        $CLT_PIN oha -z "$WARMUP" -c "$CONNS" --no-tui -m POST -d "$data" -T application/json "$url" >/dev/null
+        $CLT_PIN oha -z "$DURATION" -c "$CONNS" --no-tui -m POST -d "$data" -T application/json "$url"
       else
-        oha -z "$WARMUP" -c "$CONNS" --no-tui "$url" >/dev/null
-        oha -z "$DURATION" -c "$CONNS" --no-tui "$url"
+        $CLT_PIN oha -z "$WARMUP" -c "$CONNS" --no-tui "$url" >/dev/null
+        $CLT_PIN oha -z "$DURATION" -c "$CONNS" --no-tui "$url"
       fi ;;
     wrk)
-      wrk -d "$DURATION" -c "$CONNS" "$url" ;;
+      $CLT_PIN wrk -d "$DURATION" -c "$CONNS" "$url" ;;
     bombardier)
-      bombardier -d "$DURATION" -c "$CONNS" "$url" ;;
+      $CLT_PIN bombardier -d "$DURATION" -c "$CONNS" "$url" ;;
   esac
 }
 
@@ -59,7 +84,7 @@ for entry in "${FRAMEWORKS[@]}"; do
   read -r name port cmd <<<"$entry"
   echo
   echo "######################## $name (:$port) ########################"
-  $cmd >/dev/null 2>&1 &
+  $SRV_PIN $cmd >/dev/null 2>&1 &
   pid=$!
   trap 'kill "$pid" 2>/dev/null || true' EXIT
   # wait for readiness
