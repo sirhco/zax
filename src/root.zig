@@ -45,6 +45,12 @@ pub const Bytes = @import("extract/bytes.zig").Bytes;
 pub const files = @import("extract/files.zig");
 pub const Files = files.Files;
 
+// --- Observability ---
+pub const observe = @import("observe.zig");
+pub const Observer = observe.Observer;
+pub const AccessRecord = observe.AccessRecord;
+pub const AccessLogger = observe.AccessLogger;
+
 // --- Error model ---
 pub const err = @import("error.zig");
 pub const ErrorInfo = err.ErrorInfo;
