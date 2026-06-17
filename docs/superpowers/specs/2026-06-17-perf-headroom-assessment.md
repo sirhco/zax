@@ -39,9 +39,23 @@ Hot path: `src/server.zig` `acceptLoop` → `handleConn` → `readHead`/`readBod
 - **`smp_allocator`** backing in ReleaseFast.
 - Zero-overhead-when-off **request_id** and **observer/metrics** hooks.
 
+## UPDATE 2026-06-17 — spike result reranks the levers
+
+A spike + research round (`2026-06-17-evented-io-decision.md`) found that **evented IO
+via `std.Io.Evented` is a dead end on macOS + Linux in Zig 0.16** — the Dispatch and
+Uring backends stub their TCP socket ops (`*Unavailable`); only BSD Kqueue implements
+them. So lever #1 below as originally written is **blocked upstream**, not actionable now.
+
+**Revised priority:** the real, available tail fix is **bounding the worker pool** within
+the existing thread-per-conn model (httpz's pattern: workers ~cores + backpressure) —
+formerly lever #2, now the **top lever**. zax spawns an unbounded thread per accept; that
+is the oversubscription producing the ~50× p99.9/max tail. Cheap, additive, testable on
+mac today. See the decision doc for the full plan. The ranking below is kept for record;
+read it through the decision doc's reversal.
+
 ## Remaining levers, ranked
 
-### 1. Evented IO reactor — BIG, architectural — NOW EVIDENCE-BACKED
+### 1. Evented IO reactor — BIG, architectural — BLOCKED on Zig 0.16 std (see update above)
 
 Today each connection is a thread via `std.Io.Threaded` (`conn_group.async`). The
 code comment already names the goal as a future single-thread `Io.Evented`. Moving to

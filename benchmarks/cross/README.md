@@ -70,6 +70,38 @@ roughly equal, the same-box tail is oversubscription (not Nagle), and `TCP_NODEL
 is still correct best-practice (axum/hyper and Go set it) but won't move same-box
 numbers. For absolute numbers, run `oha` from a separate machine.
 
+### Off-box / true tail (confirm model vs oversubscription)
+
+Same-host (loopback) runs make the load generator fight the server for cores, so the
+p99.9/max tail is inflated by oversubscription. zax's tail is ~50× axum/go on loopback
+(`results.md`); to confirm that's the **thread-per-connection model** and not just
+same-host contention, measure off the loopback. Two options:
+
+**A. Second machine over the LAN (truest).** On this box, start a server bound to all
+interfaces (edit the bench server's `loopback(port)` → an all-interfaces bind, or front
+it). From machine B on the same LAN:
+```sh
+# machine B -> machine A (this box) at <A-IP>
+oha -z 30s -c 64 --no-tui http://<A-IP>:8081/
+oha -z 30s -c 64 --no-tui http://<A-IP>:8082/        # axum
+oha -z 30s -c 64 --no-tui http://<A-IP>:8083/        # go
+```
+No shared cores → the tail you see is the server's, not the scheduler fighting the client.
+
+**B. Linux box with `PIN=1` (good proxy).** On Linux, `taskset` pins server and client to
+disjoint cores, and `std.Io.Evented` would resolve to io_uring (note: std's io_uring TCP
+is not yet usable — see the decision doc):
+```sh
+PIN=1 DURATION=30s ./run.sh                 # server cores 0..N/2-1, client N/2..N-1
+```
+
+**Record:** drop the numbers into `results.md` under a new "Off-box" heading with the
+client location noted. **Interpret:** if zax's p99.9/max stays ~tens-of-ms while axum/go
+stay sub-ms **off-box**, the tail is the concurrency model (thread-per-conn
+oversubscription) → pursue the bounded-worker-pool theme
+(`docs/superpowers/specs/2026-06-17-evented-io-decision.md`). If zax's tail collapses
+toward axum/go off-box, it was mostly same-host contention.
+
 ## Toolchains
 
 - zax: Zig 0.16.0 (`zig build -Doptimize=ReleaseFast`)
