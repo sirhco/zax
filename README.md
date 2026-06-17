@@ -160,6 +160,58 @@ pub fn main(init: std.process.Init) !void {
 > `0` for streamed responses (`Response.stream` / `Response.sse`) because the
 > streamed body bytes are not counted.
 
+### Metrics
+
+`zax.Metrics` is a built-in observer that aggregates request outcomes into
+lock-free atomic counters. Wire it the same way as `AccessLogger`:
+
+```zig
+var metrics = zax.Metrics{};
+try app.observe(metrics.observer());
+```
+
+It tracks (thread-safely, from the post-response hook):
+
+- **Total requests** and **per-status-class counters** (`1xx`–`5xx`)
+- **Total response bytes** (buffered; `0` for streamed responses)
+- **Request-latency histogram** using the Prometheus default buckets
+  (0.005 s, 0.01 s, 0.025 s … 10 s)
+
+> In-flight request count is **not** tracked — the hook fires after the
+> response is written.
+
+**Point-in-time snapshot** (plain `u64`s, no atomics):
+
+```zig
+const snap: zax.MetricsSnapshot = metrics.snapshot();
+// snap.total, snap.class[2], snap.bytes_total, snap.duration_sum_ns, snap.buckets[…]
+```
+
+**Prometheus text exposition** — call `metrics.writePrometheus(writer)` where
+`writer` is a `*std.Io.Writer`. It emits:
+
+- `zax_requests_total{class="Nxx"} N` (one line per class)
+- `zax_response_bytes_total N`
+- `zax_request_duration_seconds` histogram (`_bucket{le="…"}` cumulative,
+  `_sum`, `_count`)
+
+There is **no built-in `/metrics` route** — serve it yourself with a small
+handler. Access `metrics` via app state or a module-level variable:
+
+```zig
+var METRICS = zax.Metrics{};
+
+fn metricsHandler(a: zax.Alloc) !zax.Response {
+    var w = std.Io.Writer.Allocating.init(a.value);
+    try METRICS.writePrometheus(&w.writer);
+    return .{ .status = .ok, .content_type = "text/plain; version=0.0.4", .body = w.written() };
+}
+
+// in main, after creating app:
+try app.observe(METRICS.observer());
+try app.get("/metrics", metricsHandler);
+```
+
 ## Fallback
 
 Register a handler for requests that match no route — a custom 404 or an SPA

@@ -174,6 +174,25 @@ try app.observe(logger.observer());
 
 `bytes` is 0 for streamed responses.
 
+`zax.Metrics` is a second built-in observer — wire it with
+`try app.observe(metrics.observer())`. It tracks total requests,
+per-status-class counters (1xx–5xx), total response bytes, and a
+request-latency histogram. Expose the data with
+`metrics.writePrometheus(&writer)` (Prometheus text format) or read a
+plain-value copy via `metrics.snapshot()`. Serve the endpoint yourself:
+
+```zig
+var METRICS = zax.Metrics{};
+fn metricsHandler(a: zax.Alloc) !zax.Response {
+    var w = std.Io.Writer.Allocating.init(a.value);
+    try METRICS.writePrometheus(&w.writer);
+    return .{ .status = .ok, .content_type = "text/plain; version=0.0.4", .body = w.written() };
+}
+// in main:
+try app.observe(METRICS.observer());
+try app.get("/metrics", metricsHandler);
+```
+
 ### Wildcard / catch-all routes
 
 `*name` captures the rest of the path (with slashes) into one param — useful for
