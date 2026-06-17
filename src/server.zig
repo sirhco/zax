@@ -67,6 +67,13 @@ pub const Options = struct {
     /// coalesce. On by default (matches axum/hyper and Go net/http). Set false
     /// only to deliberately measure the Nagle/delayed-ACK effect.
     tcp_nodelay: bool = true,
+    /// Cap concurrent in-flight connections (backpressure). When this many
+    /// connections are being served, the accept loop stops accepting until one
+    /// finishes — new connections wait in the kernel accept backlog. Bounds the
+    /// live-thread count under `Io.Threaded` to tame CPU oversubscription and the
+    /// latency tail. 0 = unbounded (default; unchanged behavior). A good starting
+    /// value is roughly the core count.
+    max_in_flight: usize = 0,
 };
 
 /// `App(AppState)` — a server bound to one concrete, read-only app-state type.
@@ -276,10 +283,21 @@ pub fn App(comptime AppState: type) type {
         /// drain in-flight connections. Returns when fully drained.
         pub fn acceptLoop(self: *Self, io: Io) void {
             var conn_group: Io.Group = .init;
+            var sem: Io.Semaphore = .{ .permits = self.opts.max_in_flight };
+            const cap = self.opts.max_in_flight != 0;
             while (!self.shutting_down.load(.acquire)) {
                 const srv = if (self.server) |*s| s else break;
-                const stream = srv.accept(io) catch break;
-                conn_group.async(io, handleConn, .{ self, io, stream });
+                if (cap) sem.waitUncancelable(io); // backpressure: block at cap
+                // Re-check after unblocking: shutdown may have fired while we waited.
+                if (cap and self.shutting_down.load(.acquire)) {
+                    sem.post(io);
+                    break;
+                }
+                const stream = srv.accept(io) catch {
+                    if (cap) sem.post(io); // release on accept error
+                    break;
+                };
+                conn_group.async(io, handleConn, .{ self, io, stream, if (cap) &sem else null });
             }
             conn_group.await(io) catch {};
         }
@@ -302,7 +320,8 @@ pub fn App(comptime AppState: type) type {
         /// Serve a connection: a keep-alive loop of request/response cycles over
         /// one stream. Read/write buffers and the request arena persist for the
         /// whole connection; the arena is reset (capacity retained) each request.
-        fn handleConn(self: *Self, io: Io, stream_in: net.Stream) void {
+        fn handleConn(self: *Self, io: Io, stream_in: net.Stream, sem: ?*Io.Semaphore) void {
+            defer if (sem) |s| s.post(io);
             var stream = stream_in;
             defer stream.close(io);
             // disable Nagle (opt-out): small responses go out immediately
@@ -1876,6 +1895,128 @@ test "request id: disabled by default -> no header, empty value" {
     var rb: [2048]u8 = undefined;
     const r = doRequest(io, port, "GET /rid HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
     try testing.expect(std.mem.indexOf(u8, r, "x-request-id:") == null);
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+// ---------------------------------------------------------------------------
+// Counters shared between the capped / uncapped in-flight tests.
+// ---------------------------------------------------------------------------
+const InFlightState = struct {
+    in_flight: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    max_seen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Io handle so the handler can sleep without requiring OS-level sleep API.
+    io: Io,
+};
+
+fn inFlightHandler(s: State(*InFlightState)) !Response {
+    const c = s.value;
+    const prev = c.in_flight.fetchAdd(1, .acq_rel);
+    const cur = prev + 1;
+    // CAS-max: update max_seen if cur is larger.
+    var old = c.max_seen.load(.acquire);
+    while (old < cur) {
+        old = c.max_seen.cmpxchgWeak(old, cur, .acq_rel, .acquire) orelse break;
+    }
+    // Park briefly so multiple requests overlap in the server.
+    Io.sleep(c.io, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake) catch {};
+    _ = c.in_flight.fetchSub(1, .acq_rel);
+    return Response.text("ok");
+}
+
+test "max_in_flight: cap holds under concurrent load" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var state = InFlightState{ .io = io };
+    const InFlightApp = App(*InFlightState);
+    var app = try InFlightApp.init(testing.allocator, &state, .{ .max_in_flight = 2 });
+    defer app.deinit();
+    try app.get("/work", inFlightHandler);
+
+    const port: u16 = 18194;
+    app.bind(io, .{ .ip4 = .loopback(port) }) catch unreachable;
+    var loop_fut = io.async(InFlightApp.acceptLoop, .{ &app, io });
+
+    // Spawn 8 concurrent client tasks, all fire simultaneously.
+    var group: Io.Group = .init;
+    const N = 8;
+    var bufs: [N][2048]u8 = undefined;
+    var results: [N][]const u8 = undefined;
+    const Ctx = struct {
+        io: Io,
+        port: u16,
+        buf: *[2048]u8,
+        result: *[]const u8,
+        fn run(self: *@This()) void {
+            self.result.* = doRequest(self.io, self.port, "GET /work HTTP/1.1\r\nHost: x\r\n\r\n", self.buf);
+        }
+    };
+    var ctxs: [N]Ctx = undefined;
+    for (0..N) |i| {
+        ctxs[i] = .{ .io = io, .port = port, .buf = &bufs[i], .result = &results[i] };
+        group.async(io, Ctx.run, .{&ctxs[i]});
+    }
+    group.await(io) catch unreachable;
+
+    // All 8 must have succeeded.
+    for (0..N) |i| {
+        try testing.expect(std.mem.indexOf(u8, results[i], "200 OK") != null);
+        try testing.expect(std.mem.endsWith(u8, results[i], "ok"));
+    }
+    // The cap must have held: never more than 2 simultaneous in-flight.
+    const observed_max = state.max_seen.load(.acquire);
+    try testing.expect(observed_max <= 2);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "max_in_flight: default (0) is unbounded — all requests succeed" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var state = InFlightState{ .io = io };
+    const InFlightApp = App(*InFlightState);
+    var app = try InFlightApp.init(testing.allocator, &state, .{}); // max_in_flight = 0
+    defer app.deinit();
+    try app.get("/work", inFlightHandler);
+
+    const port: u16 = 18195;
+    app.bind(io, .{ .ip4 = .loopback(port) }) catch unreachable;
+    var loop_fut = io.async(InFlightApp.acceptLoop, .{ &app, io });
+
+    var group: Io.Group = .init;
+    const N = 8;
+    var bufs: [N][2048]u8 = undefined;
+    var results: [N][]const u8 = undefined;
+    const Ctx = struct {
+        io: Io,
+        port: u16,
+        buf: *[2048]u8,
+        result: *[]const u8,
+        fn run(self: *@This()) void {
+            self.result.* = doRequest(self.io, self.port, "GET /work HTTP/1.1\r\nHost: x\r\n\r\n", self.buf);
+        }
+    };
+    var ctxs: [N]Ctx = undefined;
+    for (0..N) |i| {
+        ctxs[i] = .{ .io = io, .port = port, .buf = &bufs[i], .result = &results[i] };
+        group.async(io, Ctx.run, .{&ctxs[i]});
+    }
+    group.await(io) catch unreachable;
+
+    // All 8 must succeed (unbounded — no drops, no hangs).
+    for (0..N) |i| {
+        try testing.expect(std.mem.indexOf(u8, results[i], "200 OK") != null);
+        try testing.expect(std.mem.endsWith(u8, results[i], "ok"));
+    }
+    // Don't assert exact max_seen — it may be 1..8 depending on scheduling.
+    // Just verify it's nonzero (at least one request ran).
+    try testing.expect(state.max_seen.load(.acquire) >= 1);
+
     app.requestShutdown(io);
     loop_fut.await(io);
 }
