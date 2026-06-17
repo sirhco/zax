@@ -1552,6 +1552,42 @@ test "observe: hook fires for matched and 404 with method/path/status" {
     loop_fut.await(io);
 }
 
+var test_metrics: observe_mod.Metrics = .{};
+fn metricsTestHandler(a: @import("extract/alloc.zig").Alloc) !Response {
+    var w = std.Io.Writer.Allocating.init(a.value);
+    try test_metrics.writePrometheus(&w.writer);
+    return .{ .status = .ok, .content_type = "text/plain; version=0.0.4", .body = w.written() };
+}
+
+test "metrics: end-to-end via observer + /metrics handler" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    test_metrics = .{}; // reset (process may be shared across tests)
+    try app.get("/ping", pingHandler);
+    try app.get("/metrics", metricsTestHandler);
+    try app.observe(test_metrics.observer());
+
+    const port: u16 = 18191;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    _ = doRequest(io, port, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    _ = doRequest(io, port, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+
+    var rb2: [4096]u8 = undefined;
+    const r = doRequest(io, port, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n", &rb2);
+    try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "zax_requests_total{class=\"2xx\"} 2") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
 fn echoTail(p: Path(struct { path: []const u8 })) Response {
     return Response.text(p.value.path);
 }
