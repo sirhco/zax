@@ -285,6 +285,9 @@ try app.get("/assets/*path", serveAsset);
 - **Per-connection keep-alive.** Persistent HTTP/1.1 connections (Content-Length
   framing); the arena is reset between requests and the read buffer reused via
   `toss`/`rebase`. Honors `Connection`; rejects chunked request bodies with 411.
+- **`TCP_NODELAY` on every connection.** Nagle's algorithm is disabled so small
+  responses are sent immediately instead of being held for the peer's delayed
+  ACK (~40 ms) — standard for low-latency HTTP servers.
 - **Graceful drain.** `app.requestShutdown(io)` stops accepting (it closes the
   listening socket, which unblocks `accept`) and the accept loop then awaits an
   `Io.Group` of in-flight connections before returning.
