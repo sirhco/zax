@@ -37,6 +37,16 @@ fn benchHandler() zax.Response {
     return zax.Response.text("ok");
 }
 
+// --- Fixtures used by the micro-benchmark chain section ---
+const FakeCtx = struct {};
+const FChn = zax.Chain(FakeCtx);
+fn passThru(_: *const FakeCtx, next: *FChn.Next) anyerror!zax.Response {
+    return next.run();
+}
+fn chainHandler(_: *const FakeCtx) anyerror!zax.Response {
+    return zax.Response.text("ok");
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -175,6 +185,190 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             slot.* = nsPerOp(ns, iters);
         }
         try report(out, "response write", metrics.median(buf), metrics.stddev(buf));
+    }
+
+    // 4. Middleware chain (3 pass-through middlewares wrapping a handler).
+    {
+        const mws = [_]FChn.Middleware{ &passThru, &passThru, &passThru };
+        var fctx = FakeCtx{};
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            var sink: usize = 0;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const r = FChn.run(&mws, &chainHandler, &fctx) catch unreachable;
+                sink +%= r.body.len;
+            }
+            std.mem.doNotOptimizeAway(sink);
+        }
+        for (buf) |*slot| {
+            var sink: usize = 0;
+            const t0 = nowNs(io);
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const r = FChn.run(&mws, &chainHandler, &fctx) catch unreachable;
+                sink +%= r.body.len;
+            }
+            const ns = nowNs(io) - t0;
+            std.mem.doNotOptimizeAway(sink);
+            slot.* = nsPerOp(ns, iters);
+        }
+        try report(out, "middleware x3", metrics.median(buf), metrics.stddev(buf));
+    }
+
+    // 5. Radix wildcard match.
+    {
+        var tree = try zax.radix.Tree(usize).init(std.heap.page_allocator);
+        defer tree.deinit();
+        (try tree.getOrPutSlot("/assets/*path")).* = 1;
+        var pb: [8]zax.radix.Param = undefined;
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            var sink: usize = 0;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const m = (tree.match("/assets/a/b/c", &pb) catch unreachable).?;
+                sink +%= m.value + m.params.len;
+            }
+            std.mem.doNotOptimizeAway(sink);
+        }
+        for (buf) |*slot| {
+            var sink: usize = 0;
+            const t0 = nowNs(io);
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const m = (tree.match("/assets/a/b/c", &pb) catch unreachable).?;
+                sink +%= m.value + m.params.len;
+            }
+            const ns = nowNs(io) - t0;
+            std.mem.doNotOptimizeAway(sink);
+            slot.* = nsPerOp(ns, iters);
+        }
+        try report(out, "radix wildcard", metrics.median(buf), metrics.stddev(buf));
+    }
+
+    // 6. Radix nested-static + param match.
+    {
+        var tree = try zax.radix.Tree(usize).init(std.heap.page_allocator);
+        defer tree.deinit();
+        (try tree.getOrPutSlot("/api/v1/users/:id")).* = 1;
+        var pb: [8]zax.radix.Param = undefined;
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            var sink: usize = 0;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const m = (tree.match("/api/v1/users/42", &pb) catch unreachable).?;
+                sink +%= m.value + m.params.len;
+            }
+            std.mem.doNotOptimizeAway(sink);
+        }
+        for (buf) |*slot| {
+            var sink: usize = 0;
+            const t0 = nowNs(io);
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                const m = (tree.match("/api/v1/users/42", &pb) catch unreachable).?;
+                sink +%= m.value + m.params.len;
+            }
+            const ns = nowNs(io) - t0;
+            std.mem.doNotOptimizeAway(sink);
+            slot.* = nsPerOp(ns, iters);
+        }
+        try report(out, "radix nested", metrics.median(buf), metrics.stddev(buf));
+    }
+
+    // 7. Path extractor (struct field from a captured param).
+    {
+        const params = [_]zax.Param{.{ .name = "id", .value = "42" }};
+        var fbuf: [512]u8 = undefined;
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            var sink: usize = 0;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                var fba = std.heap.FixedBufferAllocator.init(&fbuf);
+                const p = zax.Path(struct { id: u64 }).fromContext(.{ .params = &params, .arena = fba.allocator() }) catch unreachable;
+                sink +%= p.value.id;
+            }
+            std.mem.doNotOptimizeAway(sink);
+        }
+        for (buf) |*slot| {
+            var sink: usize = 0;
+            const t0 = nowNs(io);
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                var fba = std.heap.FixedBufferAllocator.init(&fbuf);
+                const p = zax.Path(struct { id: u64 }).fromContext(.{ .params = &params, .arena = fba.allocator() }) catch unreachable;
+                sink +%= p.value.id;
+            }
+            const ns = nowNs(io) - t0;
+            std.mem.doNotOptimizeAway(sink);
+            slot.* = nsPerOp(ns, iters);
+        }
+        try report(out, "Path extract", metrics.median(buf), metrics.stddev(buf));
+    }
+
+    // 8. Query extractor (bool + int from a query string).
+    {
+        const qreq = zax.Request{ .method = .GET, .target = "", .path = "", .query = "active=true&page=2", .version_minor = 1, .headers = &.{}, .body = "" };
+        var fbuf: [512]u8 = undefined;
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            var sink: usize = 0;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                var fba = std.heap.FixedBufferAllocator.init(&fbuf);
+                const q = zax.Query(struct { active: bool, page: u32 }).fromContext(.{ .req = &qreq, .arena = fba.allocator() }) catch unreachable;
+                sink +%= @as(usize, @intFromBool(q.value.active)) + q.value.page;
+            }
+            std.mem.doNotOptimizeAway(sink);
+        }
+        for (buf) |*slot| {
+            var sink: usize = 0;
+            const t0 = nowNs(io);
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                var fba = std.heap.FixedBufferAllocator.init(&fbuf);
+                const q = zax.Query(struct { active: bool, page: u32 }).fromContext(.{ .req = &qreq, .arena = fba.allocator() }) catch unreachable;
+                sink +%= @as(usize, @intFromBool(q.value.active)) + q.value.page;
+            }
+            const ns = nowNs(io) - t0;
+            std.mem.doNotOptimizeAway(sink);
+            slot.* = nsPerOp(ns, iters);
+        }
+        try report(out, "Query extract", metrics.median(buf), metrics.stddev(buf));
+    }
+
+    // 9. Json extractor (small object from the request body).
+    {
+        const jreq = zax.Request{ .method = .POST, .target = "", .path = "", .query = "", .version_minor = 1, .headers = &.{}, .body = "{\"id\":42,\"msg\":\"hello\"}" };
+        var fbuf: [4096]u8 = undefined;
+        var w: usize = 0;
+        while (w < cfg.warmup) : (w += 1) {
+            var sink: usize = 0;
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                var fba = std.heap.FixedBufferAllocator.init(&fbuf);
+                const j = zax.Json(struct { id: u64, msg: []const u8 }).fromContext(.{ .arena = fba.allocator(), .req = &jreq }) catch unreachable;
+                sink +%= j.value.id + j.value.msg.len;
+            }
+            std.mem.doNotOptimizeAway(sink);
+        }
+        for (buf) |*slot| {
+            var sink: usize = 0;
+            const t0 = nowNs(io);
+            var i: usize = 0;
+            while (i < iters) : (i += 1) {
+                var fba = std.heap.FixedBufferAllocator.init(&fbuf);
+                const j = zax.Json(struct { id: u64, msg: []const u8 }).fromContext(.{ .arena = fba.allocator(), .req = &jreq }) catch unreachable;
+                sink +%= j.value.id + j.value.msg.len;
+            }
+            const ns = nowNs(io) - t0;
+            std.mem.doNotOptimizeAway(sink);
+            slot.* = nsPerOp(ns, iters);
+        }
+        try report(out, "Json extract", metrics.median(buf), metrics.stddev(buf));
     }
     try out.writeAll("\n");
 }
