@@ -91,7 +91,8 @@ micro follows the existing warmup-then-`cfg.samples` loop and calls
 - **Manual (`zig build bench`):** the micro section shows the 6 new lines with
   `median ns/op ± sd`; the e2e section shows three named scenarios with
   throughput + latency; the memory section shows per-scenario bytes/req (json
-  POST visibly higher than static/param) + peak RSS. Honored by `--conns`/
+  POST marginally higher than static/param — per-connection buffer amortization
+  dominates at small loads, see Risks) + peak RSS. Honored by `--conns`/
   `--reqs`/`--samples`/`--warmup`. Self-relative only.
 - **Regression:** `zig build test` stays green (136).
 
