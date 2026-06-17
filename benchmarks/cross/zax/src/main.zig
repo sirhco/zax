@@ -4,6 +4,10 @@
 //!   GET  /users/{id}  -> the captured id (echoes the path param)
 //!   POST /echo        -> JSON echo of {"msg": "..."}
 //! Run: `zig build -Doptimize=ReleaseFast run` (listens on :8081).
+//!
+//! Self-shutdown timer: set ZAX_RUN_SECS=N to have the server stop itself after
+//! N seconds (calls app.requestShutdown, which dumps the trace summary if
+//! -Dtrace-latency=true was used at build time). Unset / 0 = run forever.
 
 const std = @import("std");
 const zax = @import("zax");
@@ -23,6 +27,25 @@ fn user(p: zax.Path(struct { id: []const u8 })) zax.Response {
 fn echo(a: zax.Alloc, body: zax.Json(struct { msg: []const u8 })) !zax.Response {
     return zax.Response.json(a.value, .{ .msg = body.value.msg });
 }
+
+/// Timer task: sleep run_secs seconds then call requestShutdown so acceptLoop
+/// exits and the trace summary is dumped. Runs concurrently with acceptLoop on
+/// the same io. app must remain valid until this task completes (it lives in
+/// main's stack for the entire serve lifetime).
+const ShutdownCtx = struct {
+    app: *Api,
+    io: std.Io,
+    run_secs: u64,
+
+    fn run(ctx: *ShutdownCtx) void {
+        std.Io.sleep(
+            ctx.io,
+            .{ .nanoseconds = ctx.run_secs * std.time.ns_per_s },
+            .awake,
+        ) catch {};
+        ctx.app.requestShutdown(ctx.io);
+    }
+};
 
 pub fn main(init: std.process.Init) !void {
     // A/B knob for the bench harness: ZAX_NODELAY=0 leaves Nagle on so the
@@ -51,6 +74,13 @@ pub fn main(init: std.process.Init) !void {
     // IO backend selector: ZAX_IO=evented -> std.Io.Evented (GCD on macOS, io_uring on Linux)
     // Anything else (incl. unset) -> init.io (std.Io.Threaded, one thread per connection).
     const use_evented = if (init.environ_map.get("ZAX_IO")) |v| std.mem.eql(u8, v, "evented") else false;
+
+    // Self-shutdown timer: ZAX_RUN_SECS=N → stop after N seconds (dumps trace).
+    // 0 or unset → run forever (unchanged behavior).
+    const run_secs: u64 = if (init.environ_map.get("ZAX_RUN_SECS")) |v|
+        std.fmt.parseUnsigned(u64, v, 10) catch 0
+    else
+        0;
 
     var db = Db{};
     var app = try Api.init(init.gpa, &db, .{
@@ -95,16 +125,52 @@ pub fn main(init: std.process.Init) !void {
             .async_limit = std.Io.Limit.limited(threads_n),
         });
         defer threaded.deinit();
-        std.debug.print(
-            "zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, max_in_flight={d}, keep_alive={}, threads={d}, trace={})\n",
-            .{ port, nodelay, max_in_flight, keep_alive, threads_n, zax.trace_latency },
-        );
-        try app.serve(threaded.io(), .{ .ip4 = .loopback(port) });
+        const io = threaded.io();
+        if (run_secs > 0) {
+            std.debug.print(
+                "zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, max_in_flight={d}, keep_alive={}, threads={d}, trace={}, run_secs={d})\n",
+                .{ port, nodelay, max_in_flight, keep_alive, threads_n, zax.trace_latency, run_secs },
+            );
+            try serveWithTimer(&app, io, port, run_secs);
+        } else {
+            std.debug.print(
+                "zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, max_in_flight={d}, keep_alive={}, threads={d}, trace={}, run_secs=∞)\n",
+                .{ port, nodelay, max_in_flight, keep_alive, threads_n, zax.trace_latency },
+            );
+            try app.serve(io, .{ .ip4 = .loopback(port) });
+        }
     } else {
-        std.debug.print(
-            "zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, max_in_flight={d}, keep_alive={}, threads=init.io, trace={})\n",
-            .{ port, nodelay, max_in_flight, keep_alive, zax.trace_latency },
-        );
-        try app.serve(init.io, .{ .ip4 = .loopback(port) });
+        const io = init.io;
+        if (run_secs > 0) {
+            std.debug.print(
+                "zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, max_in_flight={d}, keep_alive={}, threads=init.io, trace={}, run_secs={d})\n",
+                .{ port, nodelay, max_in_flight, keep_alive, zax.trace_latency, run_secs },
+            );
+            try serveWithTimer(&app, io, port, run_secs);
+        } else {
+            std.debug.print(
+                "zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, max_in_flight={d}, keep_alive={}, threads=init.io, trace={}, run_secs=∞)\n",
+                .{ port, nodelay, max_in_flight, keep_alive, zax.trace_latency },
+            );
+            try app.serve(io, .{ .ip4 = .loopback(port) });
+        }
     }
+}
+
+/// Bind, spawn a concurrent shutdown timer, run acceptLoop, then await the timer.
+/// The timer calls app.requestShutdown(io) after run_secs seconds, which closes
+/// the listening socket so acceptLoop exits and (if trace_latency) dumps the
+/// phase summary before we return.
+fn serveWithTimer(app: *Api, io: std.Io, port: u16, run_secs: u64) !void {
+    try app.bind(io, .{ .ip4 = .loopback(port) });
+
+    // Timer task: lives entirely within this function's frame.
+    var ctx = ShutdownCtx{ .app = app, .io = io, .run_secs = run_secs };
+    var timer_fut = io.async(ShutdownCtx.run, .{&ctx});
+
+    // acceptLoop blocks until requestShutdown closes the socket.
+    app.acceptLoop(io);
+
+    // Reap the timer task (it has either already fired or will momentarily).
+    timer_fut.await(io);
 }

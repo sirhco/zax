@@ -18,15 +18,16 @@
 # Build the zax bench server with phase timers enabled (E1/E2/E4/E5):
 #   ( cd zax && zig build -Dtrace-latency=true -Doptimize=ReleaseFast )
 #
-# Run it manually and kill with Ctrl-C / SIGTERM; the phase summary is printed
-# by requestShutdown when the server is stopped via zax.App.requestShutdown().
-# NOTE: run.sh itself calls kill on the PID (SIGTERM); the bench server does not
-# install a signal handler that calls requestShutdown, so the phase dump requires
-# the server be stopped through the API (or a SIGINT handler added to main.zig).
-# Until then, run the traced server manually to capture the dump:
-#   ./zax/zig-out/bin/zax-bench   # Ctrl-C to stop and see the phase summary
+# The bench server self-stops via ZAX_RUN_SECS=N (calls requestShutdown after N
+# seconds, which dumps the phase summary to stderr). No signal handler needed.
+#
+# Trace the ~35ms stall (localize):
+#   ZAX_RUN_SECS=35 ./zax/zig-out/bin/zax-bench 2>trace.log &   # self-stops at 35s, dumps summary
+#   oha -z 30s -c 64 --no-tui http://127.0.0.1:8081/            # (or /users/42, POST /echo)
+#   wait; grep -A8 'trace' trace.log                             # read the phase summary
 #
 # Experiment knobs (set before starting the server):
+#   ZAX_RUN_SECS=N           self-stop after N seconds and dump trace summary
 #   ZAX_KEEPALIVE=0          E2 — disable HTTP keep-alive (each request uses a
 #                                 fresh connection); does the 35ms tail vanish?
 #   ZAX_THREADS=N            E4 — override async_limit to N worker threads
@@ -34,9 +35,9 @@
 #                                 the tail move with fewer/more threads?
 #
 # Examples:
-#   ZAX_KEEPALIVE=0 ./zax/zig-out/bin/zax-bench   # E2: no keep-alive
-#   ZAX_THREADS=1   ./zax/zig-out/bin/zax-bench   # E4: single worker thread
-#   ZAX_THREADS=8   ./zax/zig-out/bin/zax-bench   # E4: 8 worker threads
+#   ZAX_RUN_SECS=35 ZAX_KEEPALIVE=0 ./zax/zig-out/bin/zax-bench 2>trace.log &  # E2: no keep-alive
+#   ZAX_RUN_SECS=35 ZAX_THREADS=1   ./zax/zig-out/bin/zax-bench 2>trace.log &  # E4: single thread
+#   ZAX_RUN_SECS=35 ZAX_THREADS=8   ./zax/zig-out/bin/zax-bench 2>trace.log &  # E4: 8 threads
 #
 # The existing ZAX_NODELAY and ZAX_MAX_INFLIGHT knobs remain unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
