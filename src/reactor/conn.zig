@@ -133,6 +133,8 @@ pub const Conn = struct {
     /// Zero-copy: `Parsed.request` fields are slices into `read_buf`; the
     /// buffer must remain live for the lifetime of the returned `Parsed`.
     pub fn fillAndParse(self: *Conn, t: Transport) ParseOutcome {
+        self.state = .reading_head;
+
         // ----------------------------------------------------------------
         // Phase 1: if head already buffered, skip straight to body phase.
         // ----------------------------------------------------------------
@@ -198,6 +200,8 @@ pub const Conn = struct {
             @min(self.max_body_size, buf_bound);
 
         if (clen > limit) return .{ .failed = error.BodyTooLarge };
+
+        self.state = .reading_body;
 
         // The absolute offset into read_buf where the body ends.
         const body_end = self.r_start + p.head_len + clen;
@@ -330,6 +334,33 @@ test "conn: returns closed when transport closes" {
     const t = ft.transport();
 
     try testing.expect(c.fillAndParse(t) == .closed);
+}
+
+test "conn: state is reading_body when body read blocks mid-way" {
+    const body = "{\"msg\":\"hi\"}"; // 12 bytes
+    const head = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\n\r\n";
+    var ft = FakeTransport.init(
+        testing.allocator,
+        &.{ head, body },
+    );
+    defer ft.deinit();
+    ft.block_after = 1; // deliver head, then block on body read
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+
+    // First call: head arrives, body read blocks → need_more.
+    const out1 = c.fillAndParse(t);
+    try testing.expect(out1 == .need_more);
+    try testing.expectEqual(State.reading_body, c.state);
+
+    // Second call: body arrives → parsed.
+    const out2 = c.fillAndParse(t);
+    try testing.expect(out2 == .parsed);
+    try testing.expectEqualStrings(body, out2.parsed.request.body);
 }
 
 test "conn: returns need_more on would_block before any data" {
