@@ -39,6 +39,7 @@ DURATION=10s CONNS=128 ./run.sh
 LOAD=wrk ./run.sh                     # oha | wrk | bombardier
 PIN=1 ./run.sh                        # pin server vs client to disjoint cores
                                       # (Linux/taskset) so they don't fight for CPU
+AB=1 ./run.sh                         # A/B zax Nagle on vs off (see below)
 ```
 
 `PIN=1` runs the server on the first half of the cores and the load generator on
@@ -47,7 +48,27 @@ this isolates the server's true tail latency from same-host oversubscription.
 Linux only; on macOS run the load generator on a separate machine instead.
 
 `run.sh` builds each server in release mode, boots it, warms up, runs the measured
-load for each scenario, then moves on. Copy req/s + p50/p99 into `results.md`.
+load for each scenario, then moves on. The table reports **req/s, p50, p99, p99.9
+and max** — the Nagle/delayed-ACK tail lives at **p99.9 + max**, not p99, so those
+two columns are what to watch. Copy them into `results.md`.
+
+### A/B the Nagle effect (`AB=1`)
+
+The zax server disables Nagle (`TCP_NODELAY`) by default. Set `ZAX_NODELAY=0` to
+leave Nagle on. `AB=1` runs zax **twice** — `zax-off` (Nagle on) then `zax-on`
+(Nagle off) — so you can compare the two directly:
+
+```sh
+AB=1 ./run.sh                         # adds zax-off / zax-on rows
+```
+
+Why this works on **any** box, even macOS unpinned: absolute same-host numbers are
+dominated by CPU oversubscription, so they can't validate the fix on their own. But
+oversubscription is **identical** across the two zax passes, so it cancels in the
+`zax-on` − `zax-off` delta on **p99.9/max** — that delta isolates Nagle. If they're
+roughly equal, the same-box tail is oversubscription (not Nagle), and `TCP_NODELAY`
+is still correct best-practice (axum/hyper and Go set it) but won't move same-box
+numbers. For absolute numbers, run `oha` from a separate machine.
 
 ## Toolchains
 

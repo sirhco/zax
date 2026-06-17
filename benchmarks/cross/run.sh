@@ -21,7 +21,10 @@ LOAD="${LOAD:-oha}"
 WARMUP="${WARMUP:-3s}"
 PIN="${PIN:-0}"
 RAW="${RAW:-0}"   # 1 = also print the full oha output per scenario (default: table only)
-ROWS=()           # accumulated "framework|scenario|reqs|p50|p99" for the summary table
+AB="${AB:-0}"     # 1 = run zax twice (ZAX_NODELAY on vs off) to A/B the Nagle tail.
+                  # The on-vs-off delta on p99.9/max cancels same-box oversubscription
+                  # (it's identical across both passes), so AB=1 is valid even unpinned.
+ROWS=()           # accumulated "framework|scenario|reqs|p50|p99|p999|max" for the table
 
 # When PIN=1, run the server on the first half of the cores and the load
 # generator on the second half (disjoint) via taskset, so client CPU never
@@ -69,7 +72,7 @@ FRAMEWORKS=(
 drive() {
   local name="$1" scenario="$2" url="$3"; shift 3
   local method="${1:-GET}" data="${2:-}"
-  local out reqs p50 p99
+  local out reqs p50 p99 p999 max
   case "$LOAD" in
     oha)
       if [ "$method" = POST ]; then
@@ -82,29 +85,46 @@ drive() {
       reqs=$(awk '/Requests\/sec:/{printf "%.0f", $2; exit}' <<<"$out")
       p50=$(awk '/^[[:space:]]*50\.00% in/{print $3; exit}' <<<"$out")
       p99=$(awk '/^[[:space:]]*99\.00% in/{print $3; exit}' <<<"$out")
-      printf '  %-5s %-7s %12s req/s   p50 %sms   p99 %sms\n' \
-        "$name" "$scenario" "${reqs:-?}" "${p50:-?}" "${p99:-?}"
+      # The Nagle/delayed-ACK tail lives at p99.9 + max, not p99 — surface both.
+      p999=$(awk '/^[[:space:]]*99\.90% in/{print $3; exit}' <<<"$out")
+      max=$(awk '/^[[:space:]]*Slowest:/{print $2; exit}' <<<"$out")
+      printf '  %-7s %-7s %12s req/s   p50 %sms   p99 %sms   p99.9 %sms   max %sms\n' \
+        "$name" "$scenario" "${reqs:-?}" "${p50:-?}" "${p99:-?}" "${p999:-?}" "${max:-?}"
       [ "$RAW" = 1 ] && printf '%s\n' "$out"
-      ROWS+=("$name|$scenario|${reqs:-?}|${p50:-?}|${p99:-?}")
+      ROWS+=("$name|$scenario|${reqs:-?}|${p50:-?}|${p99:-?}|${p999:-?}|${max:-?}")
       ;;
     wrk)
       echo "  ($LOAD: raw output below; summary table supports oha only)"
       $CLT_PIN wrk -d "$DURATION" -c "$CONNS" "$url"
-      ROWS+=("$name|$scenario|n/a|n/a|n/a")
+      ROWS+=("$name|$scenario|n/a|n/a|n/a|n/a|n/a")
       ;;
     bombardier)
       echo "  ($LOAD: raw output below; summary table supports oha only)"
       $CLT_PIN bombardier -d "$DURATION" -c "$CONNS" "$url"
-      ROWS+=("$name|$scenario|n/a|n/a|n/a")
+      ROWS+=("$name|$scenario|n/a|n/a|n/a|n/a|n/a")
       ;;
   esac
 }
 
+# Expand frameworks into runnable passes: "label|port|env|cmd". With AB=1, zax
+# runs twice — Nagle off (ZAX_NODELAY=0) then on (=1) — so the same-box tail can
+# be A/B'd; the other frameworks run once.
+PASSES=()
 for entry in "${FRAMEWORKS[@]}"; do
   read -r name port cmd <<<"$entry"
+  if [ "$AB" = 1 ] && [ "$name" = zax ]; then
+    PASSES+=("zax-off|$port|ZAX_NODELAY=0|$cmd")
+    PASSES+=("zax-on|$port|ZAX_NODELAY=1|$cmd")
+  else
+    PASSES+=("$name|$port||$cmd")
+  fi
+done
+
+for pass in "${PASSES[@]}"; do
+  IFS='|' read -r name port kv cmd <<<"$pass"
   echo
   echo "######################## $name (:$port) ########################"
-  $SRV_PIN $cmd >/dev/null 2>&1 &
+  env ${kv:+"$kv"} $SRV_PIN $cmd >/dev/null 2>&1 &
   pid=$!
   trap 'kill "$pid" 2>/dev/null || true' EXIT
   # wait for readiness
@@ -124,12 +144,14 @@ done
 
 # Summary table
 echo
-printf '==================== RESULTS (%s, %s conns, %s%s) ====================\n' \
-  "$DURATION" "$CONNS" "$LOAD" "$([ "$PIN" = 1 ] && echo ', pinned')"
-printf '%-6s %-8s %12s %10s %10s\n' "FRAMEWORK" "SCENARIO" "REQ/S" "P50(ms)" "P99(ms)"
+printf '==================== RESULTS (%s, %s conns, %s%s%s) ====================\n' \
+  "$DURATION" "$CONNS" "$LOAD" "$([ "$PIN" = 1 ] && echo ', pinned')" "$([ "$AB" = 1 ] && echo ', A/B')"
+printf '%-8s %-8s %12s %9s %9s %9s %9s\n' \
+  "FRAMEWORK" "SCENARIO" "REQ/S" "P50(ms)" "P99(ms)" "P99.9(ms)" "MAX(ms)"
 for row in "${ROWS[@]}"; do
-  IFS='|' read -r f s r a b <<<"$row"
-  printf '%-6s %-8s %12s %10s %10s\n' "$f" "$s" "$r" "$a" "$b"
+  IFS='|' read -r f s r a b c d <<<"$row"
+  printf '%-8s %-8s %12s %9s %9s %9s %9s\n' "$f" "$s" "$r" "$a" "$b" "$c" "$d"
 done
 echo
-echo "(p50/p99 parsed from oha; copy into results.md. Re-run with RAW=1 for full output.)"
+echo "(p50/p99/p99.9/max parsed from oha; copy into results.md. RAW=1 for full output.)"
+[ "$AB" = 1 ] && echo "(A/B: compare zax-on vs zax-off on P99.9/MAX — the delta isolates Nagle.)"

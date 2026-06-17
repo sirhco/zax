@@ -27,8 +27,12 @@ fn echo(a: zax.Alloc, body: zax.Json(struct { msg: []const u8 })) !zax.Response 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
+    // A/B knob for the bench harness: ZAX_NODELAY=0 leaves Nagle on so the
+    // run.sh AB=1 mode can measure the on-vs-off tail delta. Default = on.
+    const nodelay = if (init.environ_map.get("ZAX_NODELAY")) |v| !std.mem.eql(u8, v, "0") else true;
+
     var db = Db{};
-    var app = try Api.init(init.gpa, &db, .{});
+    var app = try Api.init(init.gpa, &db, .{ .tcp_nodelay = nodelay });
     defer app.deinit();
 
     try app.get("/", hello);
@@ -36,6 +40,6 @@ pub fn main(init: std.process.Init) !void {
     try app.post("/echo", echo);
 
     const port: u16 = 8081;
-    std.debug.print("zax bench server on http://127.0.0.1:{d}\n", .{port});
+    std.debug.print("zax bench server on http://127.0.0.1:{d} (tcp_nodelay={})\n", .{ port, nodelay });
     try app.serve(io, .{ .ip4 = .loopback(port) });
 }

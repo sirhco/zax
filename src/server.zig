@@ -62,6 +62,11 @@ pub const Options = struct {
     /// expose it via the `RequestId` extractor, and include it in access records.
     /// Off by default (zero overhead and identical behavior when disabled).
     request_id: bool = false,
+    /// Disable Nagle's algorithm (set `TCP_NODELAY`) on each accepted
+    /// connection so small responses go out immediately instead of waiting to
+    /// coalesce. On by default (matches axum/hyper and Go net/http). Set false
+    /// only to deliberately measure the Nagle/delayed-ACK effect.
+    tcp_nodelay: bool = true,
 };
 
 /// `App(AppState)` — a server bound to one concrete, read-only app-state type.
@@ -300,7 +305,8 @@ pub fn App(comptime AppState: type) type {
         fn handleConn(self: *Self, io: Io, stream_in: net.Stream) void {
             var stream = stream_in;
             defer stream.close(io);
-            setNoDelay(stream.socket.handle); // disable Nagle: small responses go out immediately
+            // disable Nagle (opt-out): small responses go out immediately
+            if (self.opts.tcp_nodelay) setNoDelay(stream.socket.handle);
 
             const read_buf = self.gpa.alloc(u8, self.opts.read_buffer_size) catch return;
             defer self.gpa.free(read_buf);
@@ -1821,6 +1827,11 @@ test "setNoDelay enables TCP_NODELAY on a socket" {
     const rc = std.c.getsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &val, &len);
     try testing.expect(rc == 0);
     try testing.expect(val != 0);
+}
+
+test "Options: tcp_nodelay defaults on (opt-out)" {
+    try testing.expect((Options{}).tcp_nodelay);
+    try testing.expect(!(Options{ .tcp_nodelay = false }).tcp_nodelay);
 }
 
 test "request id: generated, echoed, and exposed to handler" {
