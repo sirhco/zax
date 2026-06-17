@@ -20,11 +20,14 @@ CONNS="${CONNS:-64}"
 LOAD="${LOAD:-oha}"
 WARMUP="${WARMUP:-3s}"
 PIN="${PIN:-0}"
-RAW="${RAW:-0}"   # 1 = also print the full oha output per scenario (default: table only)
-AB="${AB:-0}"     # 1 = run zax twice (ZAX_NODELAY on vs off) to A/B the Nagle tail.
-                  # The on-vs-off delta on p99.9/max cancels same-box oversubscription
-                  # (it's identical across both passes), so AB=1 is valid even unpinned.
-ROWS=()           # accumulated "framework|scenario|reqs|p50|p99|p999|max" for the table
+RAW="${RAW:-0}"       # 1 = also print the full oha output per scenario (default: table only)
+AB="${AB:-0}"         # 1 = run zax twice (ZAX_NODELAY on vs off) to A/B the Nagle tail.
+                      # The on-vs-off delta on p99.9/max cancels same-box oversubscription
+                      # (it's identical across both passes), so AB=1 is valid even unpinned.
+INFLIGHT="${INFLIGHT:-0}"  # N>0 = run zax twice (ZAX_MAX_INFLIGHT=0 then =N) to A/B the
+                      # worker-pool cap. Adds a "zax-cap" row alongside the default "zax".
+                      # Composable with AB=1 (independent knobs; both affect only zax passes).
+ROWS=()               # accumulated "framework|scenario|reqs|p50|p99|p999|max" for the table
 
 # When PIN=1, run the server on the first half of the cores and the load
 # generator on the second half (disjoint) via taskset, so client CPU never
@@ -108,13 +111,18 @@ drive() {
 
 # Expand frameworks into runnable passes: "label|port|env|cmd". With AB=1, zax
 # runs twice — Nagle off (ZAX_NODELAY=0) then on (=1) — so the same-box tail can
-# be A/B'd; the other frameworks run once.
+# be A/B'd; the other frameworks run once. INFLIGHT=N is independent: when set,
+# zax runs twice (ZAX_MAX_INFLIGHT=0 then =N) to A/B the worker-pool cap.
+# Both knobs affect only zax; axum/go always run once.
 PASSES=()
 for entry in "${FRAMEWORKS[@]}"; do
   read -r name port cmd <<<"$entry"
-  if [ "$AB" = 1 ] && [ "$name" = zax ]; then
+  if [ "$name" = zax ] && [ "$AB" = 1 ]; then
     PASSES+=("zax-off|$port|ZAX_NODELAY=0|$cmd")
     PASSES+=("zax-on|$port|ZAX_NODELAY=1|$cmd")
+  elif [ "$name" = zax ] && [ "${INFLIGHT:-0}" != 0 ]; then
+    PASSES+=("zax|$port|ZAX_MAX_INFLIGHT=0|$cmd")
+    PASSES+=("zax-cap|$port|ZAX_MAX_INFLIGHT=$INFLIGHT|$cmd")
   else
     PASSES+=("$name|$port||$cmd")
   fi
@@ -155,3 +163,4 @@ done
 echo
 echo "(p50/p99/p99.9/max parsed from oha; copy into results.md. RAW=1 for full output.)"
 [ "$AB" = 1 ] && echo "(A/B: compare zax-on vs zax-off on P99.9/MAX — the delta isolates Nagle.)"
+[ "${INFLIGHT:-0}" != 0 ] && echo "(INFLIGHT=$INFLIGHT: compare zax vs zax-cap on P99.9/MAX — cap flattens the thread-per-conn tail.)"

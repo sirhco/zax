@@ -29,12 +29,19 @@ pub fn main(init: std.process.Init) !void {
     // run.sh AB=1 mode can measure the on-vs-off tail delta. Default = on.
     const nodelay = if (init.environ_map.get("ZAX_NODELAY")) |v| !std.mem.eql(u8, v, "0") else true;
 
+    // Worker-pool cap knob: ZAX_MAX_INFLIGHT=N limits concurrent in-flight connections.
+    // 0 = unbounded (default; unchanged behavior). INFLIGHT=N in run.sh sets this.
+    const max_in_flight: usize = if (init.environ_map.get("ZAX_MAX_INFLIGHT")) |v|
+        std.fmt.parseUnsigned(usize, v, 10) catch 0
+    else
+        0;
+
     // IO backend selector: ZAX_IO=evented -> std.Io.Evented (GCD on macOS, io_uring on Linux)
     // Anything else (incl. unset) -> init.io (std.Io.Threaded, one thread per connection).
     const use_evented = if (init.environ_map.get("ZAX_IO")) |v| std.mem.eql(u8, v, "evented") else false;
 
     var db = Db{};
-    var app = try Api.init(init.gpa, &db, .{ .tcp_nodelay = nodelay });
+    var app = try Api.init(init.gpa, &db, .{ .tcp_nodelay = nodelay, .max_in_flight = max_in_flight });
     defer app.deinit();
 
     try app.get("/", hello);
@@ -67,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         );
         std.process.exit(1);
     } else {
-        std.debug.print("zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, io=threaded)\n", .{ port, nodelay });
+        std.debug.print("zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, max_in_flight={d}, io=threaded)\n", .{ port, nodelay, max_in_flight });
         try app.serve(init.io, .{ .ip4 = .loopback(port) });
     }
 }

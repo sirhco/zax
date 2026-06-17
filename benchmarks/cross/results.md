@@ -109,6 +109,46 @@ moves **p99 ~10.5ms → ~7.4ms** (a real delayed-ACK win — keep it) but leaves
 the earlier "Nagle at p99.9" diagnosis was wrong. `TCP_NODELAY` stays (correct
 best-practice, helps p99) but it is not what drives the tail.
 
+## Worker-pool cap (`INFLIGHT=<ncores> ./run.sh`)
+
+`zax` = uncapped (`ZAX_MAX_INFLIGHT=0`). `zax-cap` = capped (`ZAX_MAX_INFLIGHT=N`).
+The cap limits concurrent in-flight connections via backpressure (kernel accept backlog),
+bounding the live-thread count under `Io.Threaded`. Hypothesis: p99.9/max flatten toward
+axum/go while median + throughput hold.
+
+### static — `GET /`
+
+| Framework / pass | req/s | p50 | p99 | p99.9 | max |
+|------------------|------:|----:|----:|------:|----:|
+| zax (uncapped)   |       |     |     |       |     |
+| zax-cap          |       |     |     |       |     |
+| axum             |       |     |     |       |     |
+| go               |       |     |     |       |     |
+
+### param — `GET /users/42`
+
+| Framework / pass | req/s | p50 | p99 | p99.9 | max |
+|------------------|------:|----:|----:|------:|----:|
+| zax (uncapped)   |       |     |     |       |     |
+| zax-cap          |       |     |     |       |     |
+| axum             |       |     |     |       |     |
+| go               |       |     |     |       |     |
+
+### json — `POST /echo`
+
+| Framework / pass | req/s | p50 | p99 | p99.9 | max |
+|------------------|------:|----:|----:|------:|----:|
+| zax (uncapped)   |       |     |     |       |     |
+| zax-cap          |       |     |     |       |     |
+| axum             |       |     |     |       |     |
+| go               |       |     |     |       |     |
+
+**Verdict (fill after running):** _TBD — run `INFLIGHT=<ncores> ./run.sh` and compare
+zax vs zax-cap on P99.9/MAX. If the cap flattens the tail toward axum/go (from ~36ms
+toward ~1ms), the thread-per-conn oversubscription diagnosis is confirmed and the cap
+is a practical lever. If the tail stays ~36ms, oversubscription overwhelms the cap and
+the remaining win is `std.Io.Evented`._
+
 ## Notes
 
 - **zax is fastest at the median and competitive on throughput.** p50 ~0.086ms is

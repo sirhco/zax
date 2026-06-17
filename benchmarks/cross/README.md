@@ -70,6 +70,42 @@ roughly equal, the same-box tail is oversubscription (not Nagle), and `TCP_NODEL
 is still correct best-practice (axum/hyper and Go set it) but won't move same-box
 numbers. For absolute numbers, run `oha` from a separate machine.
 
+### A/B the worker-pool cap (`INFLIGHT=N`)
+
+`ZAX_MAX_INFLIGHT=N` caps concurrent in-flight connections at N via backpressure: when N
+connections are being served, the accept loop stops accepting (new connections wait in the
+kernel accept backlog). This bounds the live-thread count under `Io.Threaded`, reducing
+CPU oversubscription. `INFLIGHT=N` in `run.sh` runs zax **twice** — once uncapped
+(`ZAX_MAX_INFLIGHT=0`, label `zax`) and once capped (`ZAX_MAX_INFLIGHT=N`, label
+`zax-cap`) — so p99.9/max can be compared directly. axum/go run once as usual.
+
+```sh
+INFLIGHT=$(nproc) ./run.sh            # cap = core count; adds zax / zax-cap rows
+INFLIGHT=8 ./run.sh                   # fixed cap of 8
+```
+
+A good starting value is roughly the core count. The hypothesis: p99.9/max flatten
+toward axum/go while median + throughput hold (backpressure shifts work to the kernel
+backlog instead of burning threads). `INFLIGHT` and `AB` are independent composable
+knobs — they can run together, but a clean single-knob run per section is clearest.
+
+#### App-level complement: `std.Io.Threaded.async_limit`
+
+`Options.max_in_flight` is the framework-level, `Io`-agnostic cap (works on any backend;
+zax owns it). A complementary runtime-level thread cap is also available: the app
+constructs `std.Io.Threaded` with `async_limit` before passing the `Io` to `serve`:
+
+```zig
+var threaded = std.Io.Threaded.init(gpa, .{ .async_limit = .limited(n) }); // see InitOptions
+const io = threaded.io();
+try app.serve(io, addr);
+```
+
+The two caps compose: `async_limit` bounds OS threads at the runtime level;
+`max_in_flight` bounds live connections at the framework level. `max_in_flight` is the
+one zax owns and the one we test/bench here; `async_limit` is set by the calling app
+and is outside zax's control.
+
 ### Off-box / true tail (confirm model vs oversubscription)
 
 Same-host (loopback) runs make the load generator fight the server for cores, so the
