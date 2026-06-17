@@ -301,8 +301,14 @@ anything else. What is actually validated:
   extractor that allocates, and a contrast test confirms it does.
 - **Reproducible micro + load benchmarks** — `zig build bench` (ReleaseFast)
   runs a discarded warmup pass then N timed samples, reporting
-  `median ns/op +/- stddev` for micro-benchmarks (parse/route/serialize) and
-  median throughput with latency percentiles for the end-to-end loopback run.
+  `median ns/op +/- stddev` for micro-benchmarks and median throughput with
+  latency percentiles for the end-to-end loopback run.
+  Micro-benchmarks cover: HTTP head parse, radix match (static+param), response
+  serialize, middleware chain (3 pass-throughs), wildcard and nested routing,
+  and the `Path`/`Query`/`Json` extractors.
+  The e2e section runs three named scenarios — static `GET /bench`, param
+  `GET /users/:id`, and JSON `POST /echo` — each with throughput and latency
+  percentiles.
   Configurable via flags forwarded after `--`:
 
   | Flag | Default | Meaning |
@@ -321,9 +327,13 @@ anything else. What is actually validated:
 - **Memory section** — after the throughput/latency output, a `-- memory
   (loopback, N conns x M reqs) --` section reports two figures:
   - `bytes/req` — cumulative bytes the server's allocator requested per
-    request over the measured load (includes amortized per-connection buffers;
-    near-zero for static handlers). Measured by wrapping the app allocator in
-    a counting allocator; the loopback client is not counted.
+    request, reported per scenario (static GET / param GET / JSON POST).
+    Includes amortized per-connection buffers; measured by wrapping the app
+    allocator in a counting allocator; the loopback client is not counted.
+    **Interpretability caveat:** at small request counts the per-connection
+    buffer amortization dominates, so the three scenarios read nearly
+    identical — cross-scenario differences only become meaningful at higher
+    request counts.
   - `peak RSS` — process lifetime high-water mark (whole process, across all
     bench sections) in MB, via `getrusage`.
 

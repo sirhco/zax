@@ -231,5 +231,7 @@ See [`deploy-https.md`](deploy-https.md).
 - Verified 0.16.0 primitives Zax is built on: [`zig016-api-notes.md`](zig016-api-notes.md)
 - Performance: `zig build bench` runs warmup + multi-sample benchmarks (median ns/op ± stddev) plus a
   memory section reporting `bytes/req` (allocator pressure per request, incl. amortized per-connection
-  buffers) and process `peak RSS` in MB.
+  buffers) and process `peak RSS` in MB. Micros cover parse, routing (static/param/wildcard/nested),
+  middleware chain, and Path/Query/Json extractors; e2e runs three named scenarios (static GET, param GET,
+  JSON POST) with per-scenario throughput.
   Flags via `--`: `--samples`, `--warmup`, `--iters`, `--conns`, `--reqs`. Read the caveats in `README.md`.

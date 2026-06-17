@@ -568,6 +568,7 @@ fn memoryMetrics(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config) !
         // bytes/req includes amortized per-connection accept/buffers (each load opens
         // fresh connections), so this is steady-state allocator pressure including
         // amortized connection setup, not pure per-request cost.
+        // Cross-scenario differences are dominated by those per-connection buffers at small loads; they only diverge meaningfully at high request counts.
         const per_req: f64 = @as(f64, @floatFromInt(after - before)) / @as(f64, @floatFromInt(total));
         try out.print("  [{s}] bytes/req {d:.1}\n", .{ sc.name, per_req });
     }
