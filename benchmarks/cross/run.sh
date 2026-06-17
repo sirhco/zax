@@ -20,6 +20,8 @@ CONNS="${CONNS:-64}"
 LOAD="${LOAD:-oha}"
 WARMUP="${WARMUP:-3s}"
 PIN="${PIN:-0}"
+RAW="${RAW:-0}"   # 1 = also print the full oha output per scenario (default: table only)
+ROWS=()           # accumulated "framework|scenario|reqs|p50|p99" for the summary table
 
 # When PIN=1, run the server on the first half of the cores and the load
 # generator on the second half (disjoint) via taskset, so client CPU never
@@ -60,23 +62,41 @@ FRAMEWORKS=(
   "go   8083 ./go/go-bench"
 )
 
-# Run one scenario with the configured load tool (warmup discarded, then measured).
+# drive <name> <scenario> <url> [method] [data]
+# Warmup (discarded) then a measured run; appends "name|scenario|reqs|p50|p99" to
+# ROWS. For oha the metrics are parsed into the summary table; wrk/bombardier
+# print raw and record n/a (parsing supports oha only).
 drive() {
-  local url="$1"; shift
-  local method="${1:-GET}"; local data="${2:-}"
+  local name="$1" scenario="$2" url="$3"; shift 3
+  local method="${1:-GET}" data="${2:-}"
+  local out reqs p50 p99
   case "$LOAD" in
     oha)
       if [ "$method" = POST ]; then
-        $CLT_PIN oha -z "$WARMUP" -c "$CONNS" --no-tui -m POST -d "$data" -T application/json "$url" >/dev/null
-        $CLT_PIN oha -z "$DURATION" -c "$CONNS" --no-tui -m POST -d "$data" -T application/json "$url"
+        $CLT_PIN oha -z "$WARMUP" -c "$CONNS" --no-tui -m POST -d "$data" -T application/json "$url" >/dev/null 2>&1
+        out=$($CLT_PIN oha -z "$DURATION" -c "$CONNS" --no-tui -m POST -d "$data" -T application/json "$url")
       else
-        $CLT_PIN oha -z "$WARMUP" -c "$CONNS" --no-tui "$url" >/dev/null
-        $CLT_PIN oha -z "$DURATION" -c "$CONNS" --no-tui "$url"
-      fi ;;
+        $CLT_PIN oha -z "$WARMUP" -c "$CONNS" --no-tui "$url" >/dev/null 2>&1
+        out=$($CLT_PIN oha -z "$DURATION" -c "$CONNS" --no-tui "$url")
+      fi
+      reqs=$(awk '/Requests\/sec:/{printf "%.0f", $2; exit}' <<<"$out")
+      p50=$(awk '/^[[:space:]]*50\.00% in/{print $3; exit}' <<<"$out")
+      p99=$(awk '/^[[:space:]]*99\.00% in/{print $3; exit}' <<<"$out")
+      printf '  %-5s %-7s %12s req/s   p50 %sms   p99 %sms\n' \
+        "$name" "$scenario" "${reqs:-?}" "${p50:-?}" "${p99:-?}"
+      [ "$RAW" = 1 ] && printf '%s\n' "$out"
+      ROWS+=("$name|$scenario|${reqs:-?}|${p50:-?}|${p99:-?}")
+      ;;
     wrk)
-      $CLT_PIN wrk -d "$DURATION" -c "$CONNS" "$url" ;;
+      echo "  ($LOAD: raw output below; summary table supports oha only)"
+      $CLT_PIN wrk -d "$DURATION" -c "$CONNS" "$url"
+      ROWS+=("$name|$scenario|n/a|n/a|n/a")
+      ;;
     bombardier)
-      $CLT_PIN bombardier -d "$DURATION" -c "$CONNS" "$url" ;;
+      echo "  ($LOAD: raw output below; summary table supports oha only)"
+      $CLT_PIN bombardier -d "$DURATION" -c "$CONNS" "$url"
+      ROWS+=("$name|$scenario|n/a|n/a|n/a")
+      ;;
   esac
 }
 
@@ -93,17 +113,23 @@ for entry in "${FRAMEWORKS[@]}"; do
     sleep 0.1
   done
 
-  echo "--- $name: static  GET / ---"
-  drive "http://127.0.0.1:$port/"
-  echo "--- $name: param   GET /users/42 ---"
-  drive "http://127.0.0.1:$port/users/42"
-  echo "--- $name: json    POST /echo ---"
-  drive "http://127.0.0.1:$port/echo" POST '{"msg":"hi"}'
+  drive "$name" static "http://127.0.0.1:$port/"
+  drive "$name" param  "http://127.0.0.1:$port/users/42"
+  drive "$name" json   "http://127.0.0.1:$port/echo" POST '{"msg":"hi"}'
 
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   trap - EXIT
 done
 
+# Summary table
 echo
-echo "Done. Record req/s + p50/p99 per (framework x scenario) into results.md."
+printf '==================== RESULTS (%s, %s conns, %s%s) ====================\n' \
+  "$DURATION" "$CONNS" "$LOAD" "$([ "$PIN" = 1 ] && echo ', pinned')"
+printf '%-6s %-8s %12s %10s %10s\n' "FRAMEWORK" "SCENARIO" "REQ/S" "P50(ms)" "P99(ms)"
+for row in "${ROWS[@]}"; do
+  IFS='|' read -r f s r a b <<<"$row"
+  printf '%-6s %-8s %12s %10s %10s\n' "$f" "$s" "$r" "$a" "$b"
+done
+echo
+echo "(p50/p99 parsed from oha; copy into results.md. Re-run with RAW=1 for full output.)"
