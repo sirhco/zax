@@ -119,8 +119,11 @@ try v1.post("/items", createItem);     // POST /api/v1/items
 
 ## Observability
 
-`app.observe(obs)` registers an `zax.Observer` that fires after every request —
-matched routes, 404, 405, and handler errors — including after streamed responses.
+`app.observe(obs)` registers an `zax.Observer` that fires after every routed
+request — matched routes, 404, 405, and handler errors — including after streamed
+responses. (Parse/transport-level failures that close the connection before
+routing — malformed head, read timeout, oversized or chunked body — have no
+parsed request and are not observed.)
 Multiple observers may be registered; they run in registration order. Zero
 overhead when none are registered.
 
