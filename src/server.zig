@@ -19,6 +19,8 @@ const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 
+const build_options = @import("build_options");
+
 const request = @import("http/request.zig");
 const Header = request.Header;
 const response = @import("http/response.zig");
@@ -31,6 +33,85 @@ const extract = @import("extract/extract.zig");
 const middleware = @import("middleware.zig");
 const err_mod = @import("error.zig");
 const observe_mod = @import("observe.zig");
+
+// ---------------------------------------------------------------------------
+// Compile-time-gated latency tracer.
+// When build_options.trace_latency is false this entire block is a no-op
+// set of zero-size types; the optimizer (and comptime branches in handleConn)
+// ensure zero code is emitted for the production path.
+// ---------------------------------------------------------------------------
+
+/// Per-segment stats: atomic running-max (ns) + count of requests that
+/// exceeded a 5 ms threshold.  All fields are i64 so we can CAS without
+/// the awkward i96 precision (truncation is fine for max-tracking).
+const TraceSegment = struct {
+    max_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    over_threshold: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+/// Which segment "dominated" a slow request (had the largest delta).
+const TraceSeg = enum(u8) { head, body, dispatch, write };
+
+/// Process-global lock-free tracer.  Only allocated/used when trace_latency
+/// is true; at comptime-false, handleConn never references it so the struct
+/// definition still compiles but is unreachable.
+const Trace = struct {
+    head: TraceSegment = .{},
+    body: TraceSegment = .{},
+    dispatch: TraceSegment = .{},
+    write: TraceSegment = .{},
+    /// Count of requests where each segment was the largest.
+    dominant: [4]std.atomic.Value(u64) = .{
+        std.atomic.Value(u64).init(0),
+        std.atomic.Value(u64).init(0),
+        std.atomic.Value(u64).init(0),
+        std.atomic.Value(u64).init(0),
+    },
+
+    const threshold_ns: i64 = 5_000_000; // 5 ms
+
+    fn record(_: *Trace, seg: *TraceSegment, delta: i64) void {
+        // CAS-max loop — lock-free, no allocation.
+        var cur = seg.max_ns.load(.monotonic);
+        while (delta > cur) {
+            cur = seg.max_ns.cmpxchgWeak(cur, delta, .monotonic, .monotonic) orelse break;
+        }
+        if (delta > threshold_ns) {
+            _ = seg.over_threshold.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn recordRequest(self: *Trace, h: i64, b2: i64, d: i64, w: i64) void {
+        self.record(&self.head, h);
+        self.record(&self.body, b2);
+        self.record(&self.dispatch, d);
+        self.record(&self.write, w);
+        // Tally dominant segment for this request.
+        var max_val = h;
+        var dom: TraceSeg = .head;
+        if (b2 > max_val) { max_val = b2; dom = .body; }
+        if (d > max_val) { max_val = d; dom = .dispatch; }
+        if (w > max_val) { dom = .write; }
+        _ = self.dominant[@intFromEnum(dom)].fetchAdd(1, .monotonic);
+    }
+
+    fn dump(self: *const Trace) void {
+        const names = [_][]const u8{ "head ", "body ", "disp ", "write" };
+        const segs = [_]*const TraceSegment{ &self.head, &self.body, &self.dispatch, &self.write };
+        std.debug.print("[latency-trace] segment  max_ms  over5ms  dominant\n", .{});
+        for (names, segs, 0..) |name, seg, i| {
+            const max_ms = @as(f64, @floatFromInt(seg.max_ns.load(.monotonic))) / 1_000_000.0;
+            const over = seg.over_threshold.load(.monotonic);
+            const dom = self.dominant[i].load(.monotonic);
+            std.debug.print("[latency-trace]   {s}  {d:.2}ms  {d}  {d}\n", .{ name, max_ms, over, dom });
+        }
+    }
+};
+
+/// The singleton tracer — only meaningful when trace_latency is true.
+/// We use a global so no allocation is needed and handleConn can reach it
+/// without threading it through every call site.
+var global_trace: Trace = .{};
 
 /// Maximum path parameters captured per request (compile-time, sizes the
 /// stack capture buffer).
@@ -315,6 +396,7 @@ pub fn App(comptime AppState: type) type {
         pub fn requestShutdown(self: *Self, io: Io) void {
             self.shutting_down.store(true, .release);
             if (self.server) |*s| s.socket.close(io);
+            if (comptime build_options.trace_latency) global_trace.dump();
         }
 
         /// Serve a connection: a keep-alive loop of request/response cycles over
@@ -347,11 +429,16 @@ pub fn App(comptime AppState: type) type {
                 _ = arena.reset(.retain_capacity);
                 cr.compact(); // request boundary: move pipelined leftover to front (start=0)
 
+                // Phase-timer stamps — comptime-elided when trace_latency is off.
+                const t_loop: i96 = if (comptime build_options.trace_latency) nowNs(io) else 0;
+
                 var hs: [request.max_headers]Header = undefined;
                 var parsed = readHead(&cr, &hs, read_to, idle_to) catch |e| {
                     terminalResponse(w, e);
                     break;
                 };
+
+                const t_head: i96 = if (comptime build_options.trace_latency) nowNs(io) else 0;
 
                 // Chunked request bodies are unsupported: reject and close.
                 if (parsed.request.isChunked()) {
@@ -365,6 +452,8 @@ pub fn App(comptime AppState: type) type {
                 };
                 const consumed = parsed.head_len + parsed.request.body.len;
 
+                const t_body: i96 = if (comptime build_options.trace_latency) nowNs(io) else 0;
+
                 const persistent = self.opts.keep_alive and
                     parsed.request.isPersistent() and
                     (served + 1) < self.opts.max_keep_alive_requests;
@@ -373,12 +462,25 @@ pub fn App(comptime AppState: type) type {
 
                 const t0: i96 = if (self.observers.items.len > 0) nowNs(io) else 0;
                 var resp = self.dispatch(io, &parsed.request, &arena, rid);
+
+                const t_disp: i96 = if (comptime build_options.trace_latency) nowNs(io) else 0;
+
                 if (self.opts.request_id) {
                     resp = resp.withHeader(arena.allocator(), "x-request-id", rid) catch resp;
                 }
                 const streamed = resp.streamer != null;
                 resp.keep_alive = persistent and !streamed;
                 if (!writeResponse(w, resp)) break;
+
+                if (comptime build_options.trace_latency) {
+                    const t_write = nowNs(io);
+                    const seg_head: i64 = @intCast(@max(@as(i96, 0), t_head - t_loop));
+                    const seg_body: i64 = @intCast(@max(@as(i96, 0), t_body - t_head));
+                    const seg_disp: i64 = @intCast(@max(@as(i96, 0), t_disp - t_body));
+                    const seg_write: i64 = @intCast(@max(@as(i96, 0), t_write - t_disp));
+                    global_trace.recordRequest(seg_head, seg_body, seg_disp, seg_write);
+                }
+
                 if (self.observers.items.len > 0) {
                     const dur: u64 = @intCast(@max(@as(i96, 0), nowNs(io) - t0));
                     const rec = observe_mod.AccessRecord{

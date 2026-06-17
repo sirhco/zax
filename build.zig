@@ -28,6 +28,16 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    // Build option: -Dtrace-latency=true enables compile-time phase timers in
+    // handleConn to localize the ~35ms keep-alive latency stall.  Off by default
+    // so normal builds and all 155 tests are byte-for-byte unaffected.
+    const opts = b.addOptions();
+    opts.addOption(
+        bool,
+        "trace_latency",
+        b.option(bool, "trace-latency", "Enable compile-time phase timers in handleConn (default: false)") orelse false,
+    );
+
     const mod = b.addModule("zax", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -40,6 +50,7 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+    mod.addOptions("build_options", opts);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
