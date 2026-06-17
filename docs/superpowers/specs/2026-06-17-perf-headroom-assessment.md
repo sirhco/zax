@@ -39,6 +39,15 @@ Hot path: `src/server.zig` `acceptLoop` → `handleConn` → `readHead`/`readBod
 - **`smp_allocator`** backing in ReleaseFast.
 - Zero-overhead-when-off **request_id** and **observer/metrics** hooks.
 
+## UPDATE 2026-06-17 (#2) — worker-pool cap benchmarked, tail NOT fixed
+
+The promoted lever (bound the worker pool) was implemented + measured: it **does not
+flatten the tail**. Cap sweep 8→48 leaves p99.9 ~35ms; at 8 threads on 18 cores
+(undersubscribed) the cluster persists → **oversubscription refuted**. The ~35ms tail is
+a fixed stall in zax's per-conn read path on `std.Io.Threaded`, independent of thread
+count. Real next step: **trace where the 35ms goes** (keep-alive `receiveTimeout` wakeup /
+thread park granularity), not more concurrency levers. Data: `benchmarks/cross/results.md`.
+
 ## UPDATE 2026-06-17 — spike result reranks the levers
 
 A spike + research round (`2026-06-17-evented-io-decision.md`) found that **evented IO

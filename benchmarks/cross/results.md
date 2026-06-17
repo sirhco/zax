@@ -109,63 +109,81 @@ moves **p99 ~10.5ms → ~7.4ms** (a real delayed-ACK win — keep it) but leaves
 the earlier "Nagle at p99.9" diagnosis was wrong. `TCP_NODELAY` stays (correct
 best-practice, helps p99) but it is not what drives the tail.
 
-## Worker-pool cap (`INFLIGHT=<ncores> ./run.sh`)
+## Worker-pool cap (`INFLIGHT=N ./run.sh`) — NEGATIVE RESULT
 
-`zax` = uncapped (`ZAX_MAX_INFLIGHT=0`). `zax-cap` = capped (`ZAX_MAX_INFLIGHT=N`).
-The cap limits concurrent in-flight connections via backpressure (kernel accept backlog),
-bounding the live-thread count under `Io.Threaded`. Hypothesis: p99.9/max flatten toward
-axum/go while median + throughput hold.
+`zax` = uncapped (`ZAX_MAX_INFLIGHT=0`). `zax-cap` = capped (`ZAX_MAX_INFLIGHT=N`). The
+cap limits concurrent in-flight connections via backpressure, bounding live threads under
+`Io.Threaded`. Hypothesis (from the decision doc): p99.9/max flatten toward axum/go.
+**Result: it does not.** Numbers below are the `INFLIGHT=18` run (18 = core count); a sweep
+of `INFLIGHT=8/18/32/48` was run (20s each) and all behave the same.
 
-### static — `GET /`
+### static — `GET /` (INFLIGHT=18)
 
-| Framework / pass | req/s | p50 | p99 | p99.9 | max |
-|------------------|------:|----:|----:|------:|----:|
-| zax (uncapped)   |       |     |     |       |     |
-| zax-cap          |       |     |     |       |     |
-| axum             |       |     |     |       |     |
-| go               |       |     |     |       |     |
+| Framework / pass | req/s  | p50    | p99     | p99.9   | max     |
+|------------------|-------:|-------:|--------:|--------:|--------:|
+| zax (uncapped)   | 169743 | 0.0847 |  6.4672 | 34.4023 | 43.6788 |
+| zax-cap          | 165714 | 0.0856 |  7.2220 | 35.3336 | 48.6202 |
+| axum             | 174559 | 0.3621 |  0.4807 |  0.5704 |  5.0764 |
+| go               | 129575 | 0.4783 |  1.0854 |  1.4135 |  2.0391 |
 
-### param — `GET /users/42`
+### param — `GET /users/42` (INFLIGHT=18)
 
-| Framework / pass | req/s | p50 | p99 | p99.9 | max |
-|------------------|------:|----:|----:|------:|----:|
-| zax (uncapped)   |       |     |     |       |     |
-| zax-cap          |       |     |     |       |     |
-| axum             |       |     |     |       |     |
-| go               |       |     |     |       |     |
+| Framework / pass | req/s  | p50    | p99     | p99.9   | max     |
+|------------------|-------:|-------:|--------:|--------:|--------:|
+| zax (uncapped)   | 167709 | 0.0847 | 10.3381 | 34.8325 | 47.4096 |
+| zax-cap          | 164398 | 0.0855 | 11.2955 | 35.5909 | 50.7566 |
+| axum             | 175295 | 0.3617 |  0.4731 |  0.5468 |  5.1565 |
+| go               | 129351 | 0.4777 |  1.1217 |  1.4501 |  3.4581 |
 
-### json — `POST /echo`
+### json — `POST /echo` (INFLIGHT=18)
 
-| Framework / pass | req/s | p50 | p99 | p99.9 | max |
-|------------------|------:|----:|----:|------:|----:|
-| zax (uncapped)   |       |     |     |       |     |
-| zax-cap          |       |     |     |       |     |
-| axum             |       |     |     |       |     |
-| go               |       |     |     |       |     |
+| Framework / pass | req/s  | p50    | p99     | p99.9   | max     |
+|------------------|-------:|-------:|--------:|--------:|--------:|
+| zax (uncapped)   | 163606 | 0.0873 | 10.7078 | 35.8111 | 58.3292 |
+| zax-cap          | 161099 | 0.0873 | 10.0186 | 36.3990 | 50.3694 |
+| axum             | 169056 | 0.3756 |  0.4833 |  0.5560 |  1.7633 |
+| go               | 107898 | 0.4126 |  2.1089 |  2.8830 |  5.2452 |
 
-**Verdict (fill after running):** _TBD — run `INFLIGHT=<ncores> ./run.sh` and compare
-zax vs zax-cap on P99.9/MAX. If the cap flattens the tail toward axum/go (from ~36ms
-toward ~1ms), the thread-per-conn oversubscription diagnosis is confirmed and the cap
-is a practical lever. If the tail stays ~36ms, oversubscription overwhelms the cap and
-the remaining win is `std.Io.Evented`._
+### Sweep (json p99.9 / max, ms) — flat across every cap
+
+| INFLIGHT | uncapped | 8 | 18 | 32 | 48 |
+|----------|---------:|--:|---:|---:|---:|
+| p99.9    | ~35.8 | 40.2 | 36.4 | 36.7 | 35.7 |
+| max      | ~52  | 54.4 | 50.4 | 50.3 | ~46 |
+
+**Verdict: the cap does NOT flatten the tail — oversubscription is refuted.** At
+`INFLIGHT=8` only **8 connections** are served (keep-alive holds a permit for the
+connection's lifetime, so oha's other 56 conns sit in the accept backlog all run) — i.e.
+**8 live threads on 18 cores, undersubscribed** — and the p99.9 cluster is *still ~35ms*.
+Few threads, idle cores, identical tail. So the ~35ms tail is **not** thread count /
+CPU oversubscription. (Side effect: at `INFLIGHT=8`, p50 fell 0.085→0.045ms — less
+contention helps the median, not the tail.) The cap remains a valid resource-bounding
+knob; it is **not** the latency-tail fix.
 
 ## Notes
 
-- **zax is fastest at the median and competitive on throughput.** p50 ~0.086ms is
-  ~4× better than axum (0.37ms) and ~5× better than go (0.48ms); req/s ~159–163k is
-  within ~5% of axum and ahead of go. Per-request, zax's hot path is excellent.
-- **The tail is the problem, and it's the concurrency model — not a socket option.**
-  zax p99.9 ~36ms / max ~51ms vs axum ~0.65ms/5ms and go ~1.5ms/8ms — **~50× worse**.
-  axum (tokio M:N) and go (goroutine scheduler) stay flat on the *same* oversubscribed
-  box; zax's **thread-per-connection** model (`std.Io.Threaded`, one OS thread per
-  conn) means 64 conns contend for cores and threads get parked ~35ms. This is the
-  textbook thread-per-conn-under-oversubscription signature.
-- **Implication:** the tail is hard evidence for the evented-IO lever
-  (`docs/superpowers/specs/2026-06-17-perf-headroom-assessment.md`, lever #1). Socket
-  tuning is exhausted; the next real win is `std.Io.Evented` (kqueue/epoll/io_uring)
-  replacing thread-per-conn.
-- **Caveat:** loopback, unpinned, macOS — absolute tail is inflated by client/server
-  CPU contention. To quantify how much is the model vs raw oversubscription, re-run
-  from a **separate machine** (or Linux `PIN=1`). The cross-framework flat-tail
-  contrast already strongly implicates the scheduler model, not the kernel.
+- **zax is fastest at the median and competitive on throughput.** p50 ~0.086ms is ~4×
+  better than axum and ~5× better than go; req/s ~160–170k is within ~5% of axum and
+  ahead of go. The per-request hot path is excellent.
+- **The ~35ms tail is a FIXED, intrinsic stall — not concurrency volume.** It is
+  rock-stable at p99.9 ~34–36ms / max ~46–60ms across *every* configuration tested:
+  uncapped 64-conn, capped down to 8-conn, Nagle on/off. axum (~0.55ms) and go (~1.4ms)
+  on the same box, same loopback, same oha do not have it. Combined with the cap
+  refutation (8 threads, 18 cores, still 35ms), this points to a **periodic stall in
+  zax's per-connection read path on `std.Io.Threaded`** — most likely the keep-alive
+  `receiveTimeout` wakeup / thread park-unpark granularity — independent of how many
+  connections are live.
+- **What this rules out:** Nagle (A/B), CPU oversubscription / thread count (this cap
+  sweep), and socket tuning generally. And `std.Io.Evented` is blocked upstream (no TCP
+  on Dispatch/Uring in 0.16 — `2026-06-17-evented-io-decision.md`), so it is not the
+  available fix either.
+- **Next direction — trace the stall, don't add knobs.** Instrument `handleConn`: stamp
+  time around `receiveTimeout`/the keep-alive read and the response write to locate where
+  the ~35ms goes. Check whether it's `Io.Threaded`-specific (e.g. poll/timer granularity,
+  thread wakeup latency) vs zax logic, and whether a non-keep-alive run or a different
+  `Io.Threaded` config changes it. That investigation — not more concurrency caps — is
+  the path to the tail.
+- **Caveat:** loopback, unpinned, macOS. An off-box / Linux `PIN=1` run (README "Off-box /
+  true tail") would confirm the stall isn't a macOS-loopback artifact — worth doing before
+  the tracing theme.
 </content>

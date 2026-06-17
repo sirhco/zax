@@ -4,6 +4,15 @@ Spike + research outcome for the zax latency-tail problem. Reverses the original
 "migrate to evented IO" hypothesis. Read the cross-bench context first:
 `benchmarks/cross/results.md` and `2026-06-17-perf-headroom-assessment.md`.
 
+> **UPDATE 2026-06-17 (post-implementation):** the "bound the worker pool" lever below
+> was implemented (`Options.max_in_flight`) and **benchmarked — it does NOT fix the tail.**
+> A cap sweep (8/18/32/48) leaves p99.9/max at ~35ms; even at 8 live threads on 18 cores
+> (undersubscribed) the cluster persists. **Oversubscription is refuted.** The ~35ms tail
+> is a fixed, intrinsic stall in zax's per-conn read path on `std.Io.Threaded` (likely
+> keep-alive `receiveTimeout` wakeup granularity). Next step is **tracing that stall**, not
+> more concurrency knobs. Full data + analysis: `benchmarks/cross/results.md`. The cap
+> remains a valid resource-bounding Option; it is just not the latency fix.
+
 ## Verdict
 
 1. **`std.Io.Evented` is a dead end on macOS and Linux in Zig 0.16** — its TCP socket
