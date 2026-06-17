@@ -9,6 +9,7 @@
 //! parse the request head, validate no chunked encoding, read the body by
 //! Content-Length, and return a `ParseOutcome`.  Response serialisation,
 //! dispatch, keep-alive, and the `step` driver are added in Tasks 3–4.
+//! Task 5 adds error→status mapping, deadlines, and truncation signalling.
 
 const std = @import("std");
 const parser = @import("../http/parser.zig");
@@ -98,6 +99,17 @@ pub const ParseOutcome = union(enum) {
 /// 0 means "bounded only by the read buffer".
 const default_max_body_size: usize = 0;
 
+/// Sentinel deadline_ns meaning "no deadline set / deadline disabled".
+const no_deadline: i96 = std.math.maxInt(i96);
+
+/// Return the current monotonic time in nanoseconds.
+/// Uses libc clock_gettime(MONOTONIC) — no Io handle needed; macOS-safe.
+pub fn monotonicNow() i96 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i96, ts.sec) * 1_000_000_000 + @as(i96, ts.nsec);
+}
+
 pub const Conn = struct {
     state: State = .reading_head,
 
@@ -146,6 +158,21 @@ pub const Conn = struct {
     /// Observer hook: called after each response is serialized, before writing.
     /// Null = zero-cost no-op. Task 8 will wire this up; the seam is here.
     on_response: ?*const fn (req: *const request.Request, resp: *const Response) void = null,
+
+    // -----------------------------------------------------------------------
+    // Task 5: deadlines + timeout configuration
+    // -----------------------------------------------------------------------
+
+    /// Read deadline in ms. Applied when entering reading_head / reading_body.
+    /// Mirrors Options.read_timeout_ms. 0 = no deadline.
+    read_timeout_ms: u32 = 30_000,
+    /// Idle keep-alive deadline in ms. Applied when entering keep_alive_idle.
+    /// Mirrors Options.idle_timeout_ms. 0 = no deadline.
+    idle_timeout_ms: u32 = 60_000,
+    /// Absolute monotonic deadline in nanoseconds for the current state.
+    /// Set by step() on state entry; read by the worker's timer wheel via
+    /// `conn.deadline_ns`. Sentinel `no_deadline` means no active deadline.
+    deadline_ns: i96 = no_deadline,
 
     /// Construct a `Conn` backed by the given lent buffers and arena.
     pub fn init(read_buf: []u8, write_buf: []u8, arena: *std.heap.ArenaAllocator) Conn {
@@ -273,14 +300,16 @@ pub const Conn = struct {
 
     /// Serialize `resp` into `write_buf` using a fixed-buffer writer (no IO).
     /// Sets `w_len` to the serialized byte count and resets `w_off` to 0.
-    /// Returns the serialized length.
-    /// Caller must ensure `write_buf` is large enough for the response; if the
-    /// response overflows the buffer the serialization is truncated (the fixed
-    /// writer returns error.WriteFailed which we treat as a short write — Task 5
-    /// will emit a 500 + close in that case; for now we just take what fit).
-    pub fn serializeResponse(self: *Conn, resp: Response) usize {
+    /// Returns the serialized length, or `error.ResponseTooLarge` if the
+    /// response did not fit in `write_buf` (fixed writer overflowed).
+    pub fn serializeResponse(self: *Conn, resp: Response) error{ResponseTooLarge}!usize {
         var w = std.Io.Writer.fixed(self.write_buf);
-        resp.write(&w) catch {};
+        resp.write(&w) catch {
+            // WriteFailed means the fixed buffer overflowed — signal truncation.
+            self.w_len = w.end;
+            self.w_off = 0;
+            return error.ResponseTooLarge;
+        };
         self.w_len = w.end;
         self.w_off = 0;
         return self.w_len;
@@ -334,23 +363,41 @@ pub const Conn = struct {
         while (true) {
             switch (self.state) {
                 .reading_head, .reading_body => {
+                    // Set read deadline on state entry (first time or re-entry).
+                    if (self.deadline_ns == no_deadline) {
+                        self.deadline_ns = if (self.read_timeout_ms == 0)
+                            no_deadline
+                        else
+                            monotonicNow() + @as(i96, self.read_timeout_ms) * 1_000_000;
+                    }
                     switch (self.fillAndParse(t)) {
                         .need_more => return .want_read,
                         .closed => {
                             self.state = .closing;
                             return .done_close;
                         },
-                        .failed => {
-                            // Task 5 will refine error→status mapping.
-                            // For now, emit a generic 400 and close.
-                            var err_resp = Response.fromStatus(.bad_request);
+                        .failed => |e| {
+                            // Map parse error → HTTP status.
+                            const status: response_mod.Status = switch (e) {
+                                error.Malformed => .bad_request, // 400
+                                error.ChunkedNotSupported => .length_required, // 411
+                                error.BodyTooLarge => .payload_too_large, // 413
+                                error.HeaderFieldsTooLarge => .request_header_fields_too_large, // 431
+                            };
+                            var err_resp = Response.fromStatus(status);
                             err_resp.keep_alive = false;
-                            _ = self.serializeResponse(err_resp);
+                            self.deadline_ns = no_deadline;
                             self.close_after_write = true;
+                            // Serialize; ignore truncation for error responses
+                            // (a short error response is still sent best-effort).
+                            _ = self.serializeResponse(err_resp) catch {};
                             self.state = .writing;
                             // fall through to writing on the next iteration
                         },
                         .parsed => |p| {
+                            // Clear deadline — we successfully parsed.
+                            self.deadline_ns = no_deadline;
+
                             // Advance r_start past this request so the next
                             // compact() sees only pipelined leftovers.
                             const consumed = p.head_len + p.request.body.len;
@@ -374,24 +421,19 @@ pub const Conn = struct {
                             // Observer hook (zero-cost when null).
                             if (self.on_response) |hook| hook(&p.request, &resp);
 
-                            // Serialize into write_buf.
-                            const serialized = self.serializeResponse(resp);
-
-                            // Detect overflow/truncation: if write_buf is exactly full
-                            // the response was truncated (the fixed writer stopped early).
-                            // Also treat a streamed response that didn't fit as overflow.
-                            const overflowed = serialized == self.write_buf.len or
-                                (is_streamed and serialized == self.write_buf.len);
-                            if (overflowed) {
-                                // Synthesize a 500 into write_buf and force close.
+                            // Serialize into write_buf; detect overflow via error signal.
+                            if (self.serializeResponse(resp)) |_| {
+                                if (is_streamed) {
+                                    // Streamed but fit: still close-after-write (v1 rule).
+                                    self.close_after_write = true;
+                                } else if (!persistent) {
+                                    self.close_after_write = true;
+                                }
+                            } else |_| {
+                                // Response overflowed write_buf — synthesize a 500 and close.
                                 var e500 = Response.fromStatus(.internal_server_error);
                                 e500.keep_alive = false;
-                                _ = self.serializeResponse(e500);
-                                self.close_after_write = true;
-                            } else if (is_streamed) {
-                                // Streamed but fit: still close-after-write (v1 rule).
-                                self.close_after_write = true;
-                            } else if (!persistent) {
+                                _ = self.serializeResponse(e500) catch {};
                                 self.close_after_write = true;
                             }
 
@@ -426,6 +468,11 @@ pub const Conn = struct {
                                 // pipelined data present — stay in the loop
                                 continue;
                             }
+                            // Enter idle state and set idle deadline.
+                            self.deadline_ns = if (self.idle_timeout_ms == 0)
+                                no_deadline
+                            else
+                                monotonicNow() + @as(i96, self.idle_timeout_ms) * 1_000_000;
                             self.state = .keep_alive_idle;
                             return .want_read;
                         },
@@ -434,6 +481,8 @@ pub const Conn = struct {
 
                 .keep_alive_idle => {
                     // Waiting for the next pipelined/keep-alive request.
+                    // Clear idle deadline and set read deadline for the new request.
+                    self.deadline_ns = no_deadline;
                     self.state = .reading_head;
                     // Loop: fillAndParse will call t.read; on would_block it
                     // returns .need_more → want_read. On data it proceeds.
@@ -447,6 +496,36 @@ pub const Conn = struct {
 
                 .closing => return .done_close,
             }
+        }
+    }
+
+    /// Called by the worker's timer wheel when `deadline_ns` has expired.
+    ///
+    /// - `reading_head` / `reading_body`: serialize a 408 Request Timeout into
+    ///   `write_buf` best-effort and return `.want_write` so the worker can drain
+    ///   it before closing. The caller must close after the write completes
+    ///   (`close_after_write` is set to `true`).
+    /// - `keep_alive_idle`: silent close — no bytes, returns `.done_close`.
+    /// - Any other state: returns `.done_close` (shouldn't happen normally).
+    pub fn onDeadline(self: *Conn) StepResult {
+        self.deadline_ns = no_deadline;
+        switch (self.state) {
+            .reading_head, .reading_body => {
+                var r408 = Response.fromStatus(.request_timeout);
+                r408.keep_alive = false;
+                self.close_after_write = true;
+                _ = self.serializeResponse(r408) catch {};
+                self.state = .writing;
+                return .want_write;
+            },
+            .keep_alive_idle => {
+                self.state = .closing;
+                return .done_close;
+            },
+            else => {
+                self.state = .closing;
+                return .done_close;
+            },
         }
     }
 };
@@ -622,7 +701,7 @@ test "conn: serializes a text Response into write_buf" {
     var c = Conn.init(&rbuf, &wbuf, &arena);
 
     const resp = Response.text("hello");
-    const len = c.serializeResponse(resp);
+    const len = try c.serializeResponse(resp);
 
     // Must have written something and positioned w_off at 0.
     try testing.expect(len > 0);
@@ -645,7 +724,7 @@ test "conn: pumpWrite completes in one shot when transport is free" {
     defer arena.deinit();
     var c = Conn.init(&rbuf, &wbuf, &arena);
 
-    _ = c.serializeResponse(Response.text("hello"));
+    _ = try c.serializeResponse(Response.text("hello"));
 
     var ft = FakeTransport.init(testing.allocator, &.{});
     defer ft.deinit();
@@ -664,7 +743,7 @@ test "conn: pumpWrite resumes after would_block (backpressure)" {
     var c = Conn.init(&rbuf, &wbuf, &arena);
 
     const resp = Response.text("hello");
-    const total_len = c.serializeResponse(resp);
+    const total_len = try c.serializeResponse(resp);
     try testing.expect(total_len > 0);
 
     // Block after 0 bytes written: first write call immediately returns .would_block.
@@ -837,4 +916,157 @@ test "conn: step — oversize response → 500 + done_close" {
     // Check that a 500 status appears (overflow path emits 500).
     try testing.expect(std.mem.indexOf(u8, written, "500") != null or
         std.mem.indexOf(u8, written, "HTTP/1.1 5") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Task 5 tests — error→status mapping, deadlines, truncation signal
+// ---------------------------------------------------------------------------
+
+test "conn: step — malformed head → 400 bad_request" {
+    const raw = "GARBAGE /path BADPROTO\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 400"));
+}
+
+test "conn: step — chunked transfer-encoding → 411 length_required" {
+    const raw = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 411"));
+}
+
+test "conn: step — body over max_body_size → 413 payload_too_large" {
+    const body = "hello world!"; // 12 bytes
+    const head = "POST /data HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{ head, body });
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.max_body_size = 8; // smaller than 12-byte body
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 413"));
+}
+
+test "conn: onDeadline while reading_head → 408 + want_write + close flag" {
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.state = .reading_head;
+
+    // Fire the deadline.
+    const result = c.onDeadline();
+    try testing.expectEqual(StepResult.want_write, result);
+    try testing.expect(c.close_after_write);
+    try testing.expectEqual(State.writing, c.state);
+
+    // write_buf should start with "HTTP/1.1 408".
+    const serialized = wbuf[0..c.w_len];
+    try testing.expect(std.mem.startsWith(u8, serialized, "HTTP/1.1 408"));
+
+    // Drain the write through a fake transport to confirm bytes flow.
+    var ft = FakeTransport.init(testing.allocator, &.{});
+    defer ft.deinit();
+    const tw = ft.transport();
+    const pump = c.pumpWrite(tw);
+    try testing.expectEqual(.wrote_all, pump);
+    try testing.expect(std.mem.startsWith(u8, ft.written.items, "HTTP/1.1 408"));
+}
+
+test "conn: onDeadline while keep_alive_idle → done_close, zero bytes written" {
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.state = .keep_alive_idle;
+    c.w_len = 0; // nothing in write buf
+
+    const result = c.onDeadline();
+    try testing.expectEqual(StepResult.done_close, result);
+    try testing.expectEqual(State.closing, c.state);
+    // No bytes serialized.
+    try testing.expectEqual(@as(usize, 0), c.w_len);
+}
+
+test "conn: serializeResponse signals ResponseTooLarge on overflow" {
+    var rbuf: [4096]u8 = undefined;
+    // Tiny write buf — a real HTTP response won't fit.
+    var wbuf: [16]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const result = c.serializeResponse(Response.text("hello"));
+    try testing.expectError(error.ResponseTooLarge, result);
+}
+
+test "conn: step — truncated response → 500 via real overflow signal" {
+    // Same as the overflow test above but now verifies the real signal path.
+    const raw = "GET /longpath HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [32]u8 = undefined; // tiny — will overflow
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    // Even if 500 itself is truncated to 32 bytes, the start of what we wrote
+    // must begin with "HTTP/1.1 5" (5xx = server error range).
+    const written = ft.written.items;
+    try testing.expect(written.len > 0);
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 5"));
 }
