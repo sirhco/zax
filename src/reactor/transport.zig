@@ -60,6 +60,8 @@ pub const FakeTransport = struct {
     reads: []const []const u8,
     /// Index of the next scripted chunk to return.
     read_idx: usize = 0,
+    /// Byte offset within the current chunk (for partial reads across small buffers).
+    chunk_offset: usize = 0,
     /// After this many successful reads, return `.would_block` once then resume.
     /// Defaults to `maxInt(usize)` (never block).
     block_after: usize = std.math.maxInt(usize),
@@ -104,7 +106,8 @@ pub const FakeTransport = struct {
             if (self.read_idx >= limit) return .closed;
         }
 
-        // One-shot would_block injection.
+        // One-shot would_block injection. Does NOT consume the current chunk:
+        // the same bytes will be returned on the next call.
         if (!self.blocked_once and self.read_idx >= self.block_after) {
             self.blocked_once = true;
             return .would_block;
@@ -114,10 +117,15 @@ pub const FakeTransport = struct {
         if (self.read_idx >= self.reads.len) return .closed;
 
         const chunk = self.reads[self.read_idx];
-        self.read_idx += 1;
-
-        const n = @min(chunk.len, buf.len);
-        @memcpy(buf[0..n], chunk[0..n]);
+        const remaining = chunk[self.chunk_offset..];
+        const n = @min(remaining.len, buf.len);
+        @memcpy(buf[0..n], remaining[0..n]);
+        self.chunk_offset += n;
+        if (self.chunk_offset == chunk.len) {
+            // Chunk fully consumed; advance to the next one.
+            self.read_idx += 1;
+            self.chunk_offset = 0;
+        }
         return .{ .ok = n };
     }
 
@@ -160,4 +168,59 @@ test "FakeTransport: would_block injected once at block_after" {
     try testing.expectEqual(@as(usize, 1), (t.read(&buf)).ok);
     try testing.expect((t.read(&buf)) == .would_block); // injected
     try testing.expectEqual(@as(usize, 1), (t.read(&buf)).ok); // resumes
+}
+
+test "FakeTransport: partial read across small buffer reassembles full chunk" {
+    // One 18-byte chunk, read into an 8-byte buffer. Must return every byte
+    // without loss and then signal closed.
+    const full = "GET / HTTP/1.1\r\n\r\n"; // 18 bytes
+    var ft = FakeTransport.init(testing.allocator, &.{full});
+    defer ft.deinit();
+    const t = ft.transport();
+    var buf: [8]u8 = undefined;
+    var assembled: std.ArrayListUnmanaged(u8) = .empty;
+    defer assembled.deinit(testing.allocator);
+
+    while (true) {
+        const result = t.read(&buf);
+        switch (result) {
+            .ok => |n| try assembled.appendSlice(testing.allocator, buf[0..n]),
+            .closed => break,
+            .would_block => return error.UnexpectedWouldBlock,
+        }
+    }
+
+    // All 18 bytes arrived, in order, with none dropped.
+    try testing.expectEqualStrings(full, assembled.items);
+}
+
+test "FakeTransport: closed_after_reads fires after exact count" {
+    var ft = FakeTransport.init(testing.allocator, &.{ "a", "b", "c" });
+    defer ft.deinit();
+    ft.closed_after_reads = 2; // close after 2 chunks
+    const t = ft.transport();
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), (t.read(&buf)).ok); // read 0
+    try testing.expectEqual(@as(usize, 1), (t.read(&buf)).ok); // read 1
+    try testing.expect((t.read(&buf)) == .closed); // threshold hit
+}
+
+test "FakeTransport: block_after fires only once, next read returns data" {
+    const full = "hello"; // 5 bytes
+    var ft = FakeTransport.init(testing.allocator, &.{full});
+    defer ft.deinit();
+    ft.block_after = 0; // block before the very first read
+    const t = ft.transport();
+    var buf: [8]u8 = undefined;
+
+    // First call: injected would_block; chunk NOT consumed.
+    try testing.expect((t.read(&buf)) == .would_block);
+
+    // Second call: returns the chunk normally.
+    const r = t.read(&buf);
+    try testing.expectEqual(@as(usize, full.len), r.ok);
+    try testing.expectEqualStrings(full, buf[0..r.ok]);
+
+    // Third call: no re-block, scripts exhausted → closed.
+    try testing.expect((t.read(&buf)) == .closed);
 }
