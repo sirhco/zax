@@ -117,6 +117,46 @@ const v1 = api.group("/v1", .{&requestId});
 try v1.post("/items", createItem);     // POST /api/v1/items
 ```
 
+## Observability
+
+`app.observe(obs)` registers an `zax.Observer` that fires after every request —
+matched routes, 404, 405, and handler errors — including after streamed responses.
+Multiple observers may be registered; they run in registration order. Zero
+overhead when none are registered.
+
+Each observer receives a `zax.AccessRecord`:
+
+| Field | Type | Description |
+|---|---|---|
+| `method` | `zax.Method` | HTTP method |
+| `path` | `[]const u8` | request path (slice into the read buffer) |
+| `status` | `u16` | response status code |
+| `duration_ns` | `u64` | dispatch + write time in nanoseconds |
+| `bytes` | `usize` | buffered response body length (0 for streamed responses) |
+
+The built-in `zax.AccessLogger` is thread-safe and writes one line per request.
+Default format is `.text` (`GET /users/42 200 0.412ms 18b`); set `.json` for
+newline-delimited JSON (`{"method":"GET","path":"/users/42","status":200,"dur_us":412,"bytes":18}`).
+Call `logger.observer()` to get the `Observer` to pass to `app.observe`.
+
+```zig
+pub fn main(init: std.process.Init) !void {
+    var app = try zax.App(*const Db).init(init.gpa, &db, .{});
+    defer app.deinit();
+
+    var stderr_writer = init.io.stderr(); // std.Io.Writer
+    var logger = zax.AccessLogger{ .writer = &stderr_writer, .format = .text };
+    try app.observe(logger.observer());
+
+    try app.get("/users/:id", getUser);
+    try app.serve(init.io, .{ .ip4 = .loopback(8080) });
+}
+```
+
+> **Streamed-bytes caveat:** `bytes` is the buffered response body length; it is
+> `0` for streamed responses (`Response.stream` / `Response.sse`) because the
+> streamed body bytes are not counted.
+
 ## Fallback
 
 Register a handler for requests that match no route — a custom 404 or an SPA

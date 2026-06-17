@@ -155,6 +155,25 @@ error bodies with `app.onError(&renderFn)`.
 `app.fallback(handler)` handles unmatched requests (custom 404 or SPA index); it
 runs through the global middleware chain.
 
+### Observability
+
+`app.observe(obs)` fires after every request (matched/404/405/error/streamed)
+with an `zax.AccessRecord{ method, path, status, duration_ns, bytes }`. Register
+multiple observers; they run in order.
+
+The built-in `zax.AccessLogger` writes one line per request (thread-safe). Use
+`.format = .text` (default) or `.format = .json`; call `logger.observer()` to
+get the `Observer`:
+
+```zig
+var stderr_writer = init.io.stderr();
+var logger = zax.AccessLogger{ .writer = &stderr_writer };
+try app.observe(logger.observer());
+// -> GET /health 200 0.121ms 3b
+```
+
+`bytes` is 0 for streamed responses.
+
 ### Wildcard / catch-all routes
 
 `*name` captures the rest of the path (with slashes) into one param — useful for
