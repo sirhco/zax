@@ -5,17 +5,18 @@
 //! so it participates in comptime analysis on every platform.  The one `test`
 //! block self-skips off-Linux via `return error.SkipZigTest`.
 //!
-//! ctx.io decision
-//! ---------------
+//! Dispatcher ctx contract (Task 8 → Task 9)
+//! ------------------------------------------
 //! `App(S).dispatch` takes a `std.Io` as its first argument (it is forwarded to
-//! `makeCtx` and stored in `Ctx.io`).  Handlers that use the `Files` extractor
-//! call blocking IO through that handle.  In the reactor model, blocking inside a
-//! handler stalls the *entire* worker event loop (no new accepts, no timer
-//! sweeps, no other connections can make progress) for the duration of the
-//! blocking call.  The Worker stores one `std.Io` (supplied at `init` time,
-//! intended to be the `init.io` passed to `serveEvented`) and passes it to
-//! every `dispatch` call verbatim.  USERS: do not use `Files` or any other
-//! blocking-IO extractor inside a handler served by a Worker; use only
+//! `makeCtx` and stored in `Ctx.io`).  Rather than storing `std.Io` on the
+//! Worker itself, the `std.Io` travels inside the `Dispatcher.ctx`.  Callers
+//! (Worker.init test, and `serveEvented` in Task 9) must build the Dispatcher
+//! with a ctx that bundles both `*App` and the `std.Io`, then have `dispatchFn`
+//! cast ctx → bundle and call `app.dispatch(bundle.io, req, arena, rid)`.
+//!
+//! USERS: do not use `Files` or any other blocking-IO extractor inside a handler
+//! served by a Worker; blocking IO stalls the entire worker event loop (no new
+//! accepts, no timer sweeps, no other connections can make progress).  Use only
 //! sync/compute-only extractors (Path, Query, Json, State, etc.).
 
 const std = @import("std");
@@ -62,9 +63,6 @@ pub const Worker = struct {
     opts: WorkerOpts,
     addr: net.IpAddress,
     shutdown: *std.atomic.Value(bool),
-    /// The `std.Io` handle given at init time.  Passed to every `dispatch` call.
-    /// Handlers must be sync-only; blocking IO here stalls the entire worker.
-    io: std.Io,
 
     /// Preallocated connection slots.
     slots: []Slot,
@@ -76,6 +74,10 @@ pub const Worker = struct {
     timer: TimerWheel,
     listen_fd: i32,
     wake_fd: i32, // eventfd used by wake()
+    /// Set when accept4 returns EMFILE/ENFILE (fd exhaustion).  The listen fd
+    /// is removed from epoll to stop busy-spinning; it is re-added in closeSlot
+    /// once a slot + fd frees up.
+    accept_paused: bool = false,
 
     // Sentinel data.u64 values for the listen and wake fds.
     // They must not collide with any valid slot index (0..max_connections-1).
@@ -98,7 +100,6 @@ pub const Worker = struct {
         opts: WorkerOpts,
         addr: net.IpAddress,
         shutdown: *std.atomic.Value(bool),
-        io: std.Io,
     ) !Worker {
         if (builtin.os.tag != .linux) unreachable;
 
@@ -159,7 +160,6 @@ pub const Worker = struct {
             .opts = opts,
             .addr = addr,
             .shutdown = shutdown,
-            .io = io,
             .slots = slots,
             .free = free,
             .free_len = opts.max_connections,
@@ -275,7 +275,18 @@ pub const Worker = struct {
             );
             const e = linux.errno(rc);
             if (e == .AGAIN) break; // EAGAIN == EWOULDBLOCK on Linux
-            if (e != .SUCCESS) break; // unexpected error — stop accepting
+            if (e == .MFILE or e == .NFILE) {
+                // fd table exhausted — remove listen fd from epoll to stop
+                // busy-spinning.  closeSlot will re-add it once a slot frees.
+                std.log.warn("accept4: fd exhaustion ({}), pausing accept", .{e});
+                self.poller.del(self.listen_fd);
+                self.accept_paused = true;
+                break;
+            }
+            if (e != .SUCCESS) {
+                std.log.warn("accept4: unexpected errno {}, stopping accept loop", .{e});
+                break;
+            }
             const conn_fd: i32 = @intCast(rc);
 
             // Set TCP_NODELAY if requested.
@@ -332,7 +343,11 @@ pub const Worker = struct {
     ) void {
         switch (result) {
             .want_read => {
-                self.poller.mod(fd, @intCast(slot_idx), true, false) catch {};
+                self.poller.mod(fd, @intCast(slot_idx), true, false) catch {
+                    // epoll_ctl MOD failed — connection is unregisterable; close it.
+                    self.closeSlot(slot_idx, fd);
+                    return;
+                };
                 // Update timer deadline.
                 if (c.deadline_ns != no_deadline) {
                     self.timer.insert(slot_idx, c.deadline_ns);
@@ -341,7 +356,10 @@ pub const Worker = struct {
                 }
             },
             .want_write => {
-                self.poller.mod(fd, @intCast(slot_idx), false, true) catch {};
+                self.poller.mod(fd, @intCast(slot_idx), false, true) catch {
+                    self.closeSlot(slot_idx, fd);
+                    return;
+                };
                 if (c.deadline_ns != no_deadline) {
                     self.timer.insert(slot_idx, c.deadline_ns);
                 } else {
@@ -359,11 +377,18 @@ pub const Worker = struct {
         _ = linux.close(@intCast(fd));
         self.timer.remove(slot_idx);
         self.freeSlot(slot_idx);
+        // If accept was paused due to fd exhaustion, re-register the listen fd
+        // now that a slot + fd have been freed.
+        if (self.accept_paused) {
+            self.poller.add(self.listen_fd, LISTEN_TOKEN, true, false) catch {};
+            self.accept_paused = false;
+        }
     }
 
     fn freeSlot(self: *Worker, slot_idx: usize) void {
         const slot = &self.slots[slot_idx];
         slot.active = false;
+        slot.fd = -1;
         // Reset arena (retain capacity so the allocator re-uses it).
         _ = slot.arena.reset(.retain_capacity);
         self.free[self.free_len] = slot_idx;
@@ -492,7 +517,9 @@ fn expiredCb(slot_idx: usize) void {
         },
         .want_read => {
             // Shouldn't happen from onDeadline, but handle gracefully.
-            w.poller.mod(fd, @intCast(slot_idx), true, false) catch {};
+            w.poller.mod(fd, @intCast(slot_idx), true, false) catch {
+                w.closeSlot(slot_idx, fd);
+            };
         },
     }
 }
@@ -547,12 +574,16 @@ test "worker: integration — accept, keep-alive, shutdown" {
     const testing = std.testing;
 
     // Build a minimal dispatcher that serves three routes.
-    const TestState = struct {};
-    const S = TestState{};
-    _ = S; // not used directly; dispatcher is a raw vtable
+    // The Dispatcher ctx bundles io + app state so io travels through the
+    // vtable rather than being stored on Worker (Task 9 contract: serveEvented
+    // builds the real Dispatcher the same way, bundling *App + init.io).
+    const Bundle = struct {
+        io: std.Io,
+    };
 
     const DispCtx = struct {
-        fn dispatch(_: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
+        fn dispatch(ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
+            _ = @as(*Bundle, @ptrCast(@alignCast(ctx))).io; // io available here
             _ = arena;
             if (std.mem.eql(u8, req.path, "/")) {
                 return Response.text("hello");
@@ -565,9 +596,14 @@ test "worker: integration — accept, keep-alive, shutdown" {
         }
     };
 
-    var dummy: u8 = 0;
+    // Use std.Io.Threaded for the bundle io (not actually exercised by these
+    // sync-only test handlers, but proves the contract compiles and links).
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var bundle = Bundle{ .io = threaded.io() };
+
     const disp = Dispatcher{
-        .ctx = @ptrCast(&dummy),
+        .ctx = @ptrCast(&bundle),
         .dispatchFn = DispCtx.dispatch,
     };
 
@@ -587,16 +623,10 @@ test "worker: integration — accept, keep-alive, shutdown" {
     // Bind to an ephemeral port on loopback.
     var shutdown = std.atomic.Value(bool).init(false);
 
-    // Use std.Io.Threaded for the worker io (not actually used by test handlers
-    // since they are all sync; required by the Worker.init signature).
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
     // Pick an ephemeral port (port 0 → kernel assigns).
     const listen_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
 
-    var worker = try Worker.init(testing.allocator, disp, opts, listen_addr, &shutdown, io);
+    var worker = try Worker.init(testing.allocator, disp, opts, listen_addr, &shutdown);
     defer worker.deinit();
 
     // Find out which port the kernel assigned by getsockname.
