@@ -13,7 +13,10 @@
 const std = @import("std");
 const parser = @import("../http/parser.zig");
 const request = @import("../http/request.zig");
+const response_mod = @import("../http/response.zig");
 const transport_mod = @import("transport.zig");
+
+const Response = response_mod.Response;
 
 const Transport = transport_mod.Transport;
 const Header = request.Header;
@@ -105,6 +108,11 @@ pub const Conn = struct {
     /// Upper bound on the accepted body size in bytes.
     /// 0 = bounded only by the available read buffer space.
     max_body_size: usize = default_max_body_size,
+
+    /// Number of valid bytes in `write_buf` (set by `serializeResponse`).
+    w_len: usize = 0,
+    /// Offset of the next byte to transmit (advanced by `pumpWrite`).
+    w_off: usize = 0,
 
     /// Construct a `Conn` backed by the given lent buffers and arena.
     pub fn init(read_buf: []u8, write_buf: []u8, arena: *std.heap.ArenaAllocator) Conn {
@@ -224,6 +232,45 @@ pub const Conn = struct {
         const head_abs = self.r_start + p.head_len;
         result.request.body = self.read_buf[head_abs .. head_abs + clen];
         return .{ .parsed = result };
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3: response serialization + non-blocking write with backpressure
+    // -----------------------------------------------------------------------
+
+    /// Serialize `resp` into `write_buf` using a fixed-buffer writer (no IO).
+    /// Sets `w_len` to the serialized byte count and resets `w_off` to 0.
+    /// Returns the serialized length.
+    /// Caller must ensure `write_buf` is large enough for the response; if the
+    /// response overflows the buffer the serialization is truncated (the fixed
+    /// writer returns error.WriteFailed which we treat as a short write — Task 5
+    /// will emit a 500 + close in that case; for now we just take what fit).
+    pub fn serializeResponse(self: *Conn, resp: Response) usize {
+        var w = std.Io.Writer.fixed(self.write_buf);
+        resp.write(&w) catch {};
+        self.w_len = w.end;
+        self.w_off = 0;
+        return self.w_len;
+    }
+
+    /// Drive a non-blocking write of `write_buf[w_off..w_len]` through `t`.
+    ///
+    /// - `.ok n` → advance `w_off` by `n`; if `w_off == w_len` → `.wrote_all`.
+    ///   A partial write (n < remaining) is treated like `.would_block` — the
+    ///   caller should re-arm the writable event and call again.
+    /// - `.would_block` → `.want_write` (resume next time the fd is writable).
+    /// - `.closed` → `.closed`.
+    pub fn pumpWrite(self: *Conn, t: Transport) enum { wrote_all, want_write, closed } {
+        const remaining = self.write_buf[self.w_off..self.w_len];
+        switch (t.write(remaining)) {
+            .ok => |n| {
+                self.w_off += n;
+                if (self.w_off == self.w_len) return .wrote_all;
+                return .want_write; // partial write — re-arm writable
+            },
+            .would_block => return .want_write,
+            .closed => return .closed,
+        }
     }
 };
 
@@ -384,4 +431,82 @@ test "conn: returns need_more on would_block before any data" {
     const out = c.fillAndParse(t);
     try testing.expect(out == .parsed);
     try testing.expectEqualStrings("/", out.parsed.request.path);
+}
+
+// ---------------------------------------------------------------------------
+// Task 3 tests — serializeResponse + pumpWrite
+// ---------------------------------------------------------------------------
+
+test "conn: serializes a text Response into write_buf" {
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+
+    const resp = Response.text("hello");
+    const len = c.serializeResponse(resp);
+
+    // Must have written something and positioned w_off at 0.
+    try testing.expect(len > 0);
+    try testing.expectEqual(@as(usize, 0), c.w_off);
+    try testing.expectEqual(len, c.w_len);
+
+    const out = wbuf[0..len];
+    // Status line.
+    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 200"));
+    // Content-Length header.
+    try testing.expect(std.mem.indexOf(u8, out, "content-length: 5") != null);
+    // Body at the end.
+    try testing.expect(std.mem.endsWith(u8, out, "hello"));
+}
+
+test "conn: pumpWrite completes in one shot when transport is free" {
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+
+    _ = c.serializeResponse(Response.text("hello"));
+
+    var ft = FakeTransport.init(testing.allocator, &.{});
+    defer ft.deinit();
+    const t = ft.transport();
+
+    const result = c.pumpWrite(t);
+    try testing.expectEqual(.wrote_all, result);
+    try testing.expectEqual(c.w_len, ft.written.items.len);
+}
+
+test "conn: pumpWrite resumes after would_block (backpressure)" {
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+
+    const resp = Response.text("hello");
+    const total_len = c.serializeResponse(resp);
+    try testing.expect(total_len > 0);
+
+    // Block after 0 bytes written: first write call immediately returns .would_block.
+    var ft = FakeTransport.init(testing.allocator, &.{});
+    defer ft.deinit();
+    ft.write_block_after_bytes = 0;
+    const t = ft.transport();
+
+    // First pump: transport blocks immediately — returns want_write, nothing written yet.
+    const r1 = c.pumpWrite(t);
+    try testing.expectEqual(.want_write, r1);
+    try testing.expectEqual(@as(usize, 0), ft.written.items.len);
+    try testing.expectEqual(@as(usize, 0), c.w_off);
+
+    // Second pump: block is lifted — writes everything.
+    const r2 = c.pumpWrite(t);
+    try testing.expectEqual(.wrote_all, r2);
+    try testing.expectEqual(total_len, ft.written.items.len);
+
+    // Entire serialized response arrived in order.
+    try testing.expectEqualStrings(wbuf[0..total_len], ft.written.items);
 }

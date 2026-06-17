@@ -75,6 +75,14 @@ pub const FakeTransport = struct {
     /// If set, return `.closed` after this many successful reads instead of
     /// waiting until `reads` is exhausted.
     closed_after_reads: ?usize = null,
+    /// If set, return `.would_block` once after this many total bytes have been
+    /// written via `writeFn`. One-shot: after firing, clears itself so writes
+    /// proceed normally. This lets tests simulate backpressure mid-response.
+    write_block_after_bytes: ?usize = null,
+    /// Total bytes written so far (used for `write_block_after_bytes`).
+    write_bytes_total: usize = 0,
+    /// Set to `true` internally when the one-shot write block has been fired.
+    write_blocked_once: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, reads: []const []const u8) FakeTransport {
         return .{
@@ -131,7 +139,28 @@ pub const FakeTransport = struct {
 
     fn writeFn(ctx: *anyopaque, buf: []const u8) IoResult {
         const self: *FakeTransport = @ptrCast(@alignCast(ctx));
+        // One-shot write-block: after `write_block_after_bytes` cumulative bytes
+        // have been written, return `.would_block` once then resume.
+        if (!self.write_blocked_once) {
+            if (self.write_block_after_bytes) |threshold| {
+                if (self.write_bytes_total >= threshold) {
+                    // Threshold already crossed — block this call (one-shot).
+                    self.write_blocked_once = true;
+                    self.write_block_after_bytes = null; // disarm
+                    return .would_block;
+                }
+                // Current write might cross the threshold — do a partial write
+                // up to the threshold so the NEXT call fires the block.
+                if (self.write_bytes_total + buf.len > threshold) {
+                    const partial = threshold - self.write_bytes_total;
+                    self.written.appendSlice(self.gpa, buf[0..partial]) catch return .closed;
+                    self.write_bytes_total += partial;
+                    return .{ .ok = partial };
+                }
+            }
+        }
         self.written.appendSlice(self.gpa, buf) catch return .closed;
+        self.write_bytes_total += buf.len;
         return .{ .ok = buf.len };
     }
 };
@@ -203,6 +232,23 @@ test "FakeTransport: closed_after_reads fires after exact count" {
     try testing.expectEqual(@as(usize, 1), (t.read(&buf)).ok); // read 0
     try testing.expectEqual(@as(usize, 1), (t.read(&buf)).ok); // read 1
     try testing.expect((t.read(&buf)) == .closed); // threshold hit
+}
+
+test "FakeTransport: write_block_after_bytes fires once then resumes" {
+    var ft = FakeTransport.init(testing.allocator, &.{});
+    defer ft.deinit();
+    // Block immediately: first write call should hit the threshold (0 bytes written).
+    ft.write_block_after_bytes = 0;
+    const t = ft.transport();
+
+    // First write: threshold already hit → would_block (one-shot).
+    try testing.expect(t.write("hello") == .would_block);
+    // Second write: block disarmed → writes normally.
+    try testing.expectEqual(IoResult{ .ok = 5 }, t.write("hello"));
+    // Third write: no re-block → also succeeds.
+    try testing.expectEqual(IoResult{ .ok = 6 }, t.write(" world"));
+    // All successful writes accumulated (the blocked call wrote nothing).
+    try testing.expectEqualStrings("hello world", ft.written.items);
 }
 
 test "FakeTransport: block_after fires only once, next read returns data" {
