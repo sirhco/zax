@@ -1,0 +1,356 @@
+//! Non-blocking per-connection state machine — read & parse phase (Task 2).
+//!
+//! `Conn` wraps two caller-owned buffers (read + write) and drives HTTP/1.1
+//! request ingestion without blocking the calling thread. All IO is mediated
+//! through the `Transport` vtable so the logic is fully unit-testable on any
+//! platform via `FakeTransport`.
+//!
+//! Task 2 scope: `fillAndParse` — fill the read buffer from the transport,
+//! parse the request head, validate no chunked encoding, read the body by
+//! Content-Length, and return a `ParseOutcome`.  Response serialisation,
+//! dispatch, keep-alive, and the `step` driver are added in Tasks 3–5.
+
+const std = @import("std");
+const parser = @import("../http/parser.zig");
+const request = @import("../http/request.zig");
+const transport_mod = @import("transport.zig");
+
+const Transport = transport_mod.Transport;
+const Header = request.Header;
+
+// ---------------------------------------------------------------------------
+// State / StepResult — full enums wired across Tasks 2–5
+// ---------------------------------------------------------------------------
+
+/// Per-connection state machine states.
+pub const State = enum {
+    reading_head,
+    reading_body,
+    dispatching,
+    writing,
+    keep_alive_idle,
+    closing,
+};
+
+/// What the worker event loop should arm after `step` returns.
+/// (Used from Task 4 onwards; defined here so downstream tasks see the type.)
+pub const StepResult = enum {
+    want_read,
+    want_write,
+    done_close,
+};
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
+
+/// Errors that can arise while reading/parsing a request.
+pub const RequestError = error{
+    /// More than `request.max_headers` header fields present.
+    HeaderFieldsTooLarge,
+    /// Body exceeds `max_body_size` or the read buffer.
+    BodyTooLarge,
+    /// Request line or headers are syntactically invalid.
+    Malformed,
+    /// Chunked transfer-encoding is not supported (v1.1 → reject with 411).
+    ChunkedNotSupported,
+};
+
+// ---------------------------------------------------------------------------
+// ParseOutcome
+// ---------------------------------------------------------------------------
+
+/// Result of a single `fillAndParse` call.
+pub const ParseOutcome = union(enum) {
+    /// More bytes are needed — transport returned `.would_block`; re-arm read.
+    need_more,
+    /// A complete request (head + body) has been parsed.
+    parsed: parser.Parsed,
+    /// A protocol or limit error occurred.
+    failed: RequestError,
+    /// The peer closed the connection.
+    closed,
+};
+
+// ---------------------------------------------------------------------------
+// Conn
+// ---------------------------------------------------------------------------
+
+/// Default body size cap when the caller does not set `max_body_size`.
+/// 0 means "bounded only by the read buffer".
+const default_max_body_size: usize = 0;
+
+pub const Conn = struct {
+    state: State = .reading_head,
+
+    /// Caller-owned read buffer (lent from the worker pool).
+    read_buf: []u8,
+    /// Caller-owned write buffer (lent from the worker pool).
+    write_buf: []u8,
+
+    /// Offset into `read_buf` where unconsumed data starts.
+    /// After a full request is consumed this advances to `head_len + body_len`
+    /// so pipelined requests (Task 4) can continue from the remainder.
+    r_start: usize = 0,
+    /// Offset into `read_buf` one past the last byte received.
+    r_end: usize = 0,
+
+    /// Scratch storage for parsed headers; slices inside `Parsed.request.headers`
+    /// point here — no heap allocation for the header array.
+    header_scratch: [request.max_headers]Header = undefined,
+
+    /// Arena for any per-request heap allocation (body copies, extractor results).
+    arena: *std.heap.ArenaAllocator,
+
+    /// Upper bound on the accepted body size in bytes.
+    /// 0 = bounded only by the available read buffer space.
+    max_body_size: usize = default_max_body_size,
+
+    /// Construct a `Conn` backed by the given lent buffers and arena.
+    pub fn init(read_buf: []u8, write_buf: []u8, arena: *std.heap.ArenaAllocator) Conn {
+        return .{
+            .read_buf = read_buf,
+            .write_buf = write_buf,
+            .arena = arena,
+        };
+    }
+
+    /// Buffered region: bytes received so far for the current request.
+    fn buffered(self: *const Conn) []const u8 {
+        return self.read_buf[self.r_start..self.r_end];
+    }
+
+    /// Read more bytes from the transport into `read_buf[r_end..]`, parse the
+    /// request head, validate it, and read body bytes if Content-Length is set.
+    ///
+    /// **One call = one read attempt.** On a non-blocking socket (or
+    /// `FakeTransport`) each successful read drains what the OS has buffered,
+    /// then the next call blocks (would_block) until the event loop fires again.
+    /// Callers drive the state machine by calling `fillAndParse` whenever the
+    /// event loop indicates the fd is readable, stopping when the outcome is
+    /// not `.need_more`.
+    ///
+    /// Zero-copy: `Parsed.request` fields are slices into `read_buf`; the
+    /// buffer must remain live for the lifetime of the returned `Parsed`.
+    pub fn fillAndParse(self: *Conn, t: Transport) ParseOutcome {
+        // ----------------------------------------------------------------
+        // Phase 1: if head already buffered, skip straight to body phase.
+        // ----------------------------------------------------------------
+        if (parser.parseHead(self.buffered(), &self.header_scratch)) |p| {
+            return self.readBody(t, p);
+        } else |err| switch (err) {
+            error.Incomplete => {}, // fall through to read
+            error.TooManyHeaders => return .{ .failed = error.HeaderFieldsTooLarge },
+            else => return .{ .failed = error.Malformed },
+        }
+
+        // ----------------------------------------------------------------
+        // Phase 2: read one batch of bytes, then re-attempt the parse.
+        // ----------------------------------------------------------------
+        const space = self.read_buf[self.r_end..];
+        if (space.len == 0) {
+            // Buffer full but head still incomplete → headers too large.
+            return .{ .failed = error.HeaderFieldsTooLarge };
+        }
+        switch (t.read(space)) {
+            .ok => |n| {
+                if (n == 0) return .closed;
+                self.r_end += n;
+            },
+            .would_block => return .need_more,
+            .closed => return .closed,
+        }
+
+        // ----------------------------------------------------------------
+        // Phase 3: try to parse with freshly received bytes.
+        // ----------------------------------------------------------------
+        if (parser.parseHead(self.buffered(), &self.header_scratch)) |p| {
+            return self.readBody(t, p);
+        } else |err| switch (err) {
+            error.Incomplete => return .need_more,
+            error.TooManyHeaders => return .{ .failed = error.HeaderFieldsTooLarge },
+            else => return .{ .failed = error.Malformed },
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 2: validate + read body by Content-Length.
+    // ----------------------------------------------------------------
+    fn readBody(self: *Conn, t: Transport, p: parser.Parsed) ParseOutcome {
+        // Reject chunked transfer-encoding (v1.1 → 411 in Task 5).
+        if (p.request.isChunked()) {
+            return .{ .failed = error.ChunkedNotSupported };
+        }
+
+        // No Content-Length → body is empty; done.
+        const clen = p.request.contentLength() orelse {
+            var result = p;
+            result.request.body = "";
+            return .{ .parsed = result };
+        };
+
+        // Compute effective body limit.
+        // The body must fit in read_buf after the head.
+        const buf_bound = self.read_buf.len - (self.r_start + p.head_len);
+        const limit = if (self.max_body_size == 0)
+            buf_bound
+        else
+            @min(self.max_body_size, buf_bound);
+
+        if (clen > limit) return .{ .failed = error.BodyTooLarge };
+
+        // The absolute offset into read_buf where the body ends.
+        const body_end = self.r_start + p.head_len + clen;
+
+        // Fill until the full body is buffered.
+        while (self.r_end < body_end) {
+            const space = self.read_buf[self.r_end..];
+            switch (t.read(space)) {
+                .ok => |n| {
+                    if (n == 0) return .closed;
+                    self.r_end += n;
+                },
+                .would_block => return .need_more,
+                .closed => return .closed,
+            }
+        }
+
+        // Attach body as a zero-copy slice.
+        var result = p;
+        const head_abs = self.r_start + p.head_len;
+        result.request.body = self.read_buf[head_abs .. head_abs + clen];
+        return .{ .parsed = result };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const FakeTransport = transport_mod.FakeTransport;
+
+test "conn: parses a request arriving in two reads" {
+    var ft = FakeTransport.init(
+        testing.allocator,
+        &.{ "GET /users/42 HTTP", "/1.1\r\nHost: x\r\n\r\n" },
+    );
+    defer ft.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+
+    // First chunk: head incomplete → need_more.
+    try testing.expect(c.fillAndParse(t) == .need_more);
+
+    // Second chunk: head complete → parsed.
+    const out = c.fillAndParse(t);
+    try testing.expect(out == .parsed);
+    try testing.expectEqualStrings("/users/42", out.parsed.request.path);
+    try testing.expectEqual(request.Method.GET, out.parsed.request.method);
+}
+
+test "conn: reads a POST body by content-length" {
+    const body = "{\"msg\":\"hi\"}";
+    const head = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\n\r\n";
+    var ft = FakeTransport.init(
+        testing.allocator,
+        &.{ head, body },
+    );
+    defer ft.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+
+    // Both chunks arrive; may take one or two calls.
+    var out: ParseOutcome = .need_more;
+    for (0..10) |_| {
+        out = c.fillAndParse(t);
+        if (out != .need_more) break;
+    }
+    try testing.expect(out == .parsed);
+    try testing.expectEqualStrings(body, out.parsed.request.body);
+    try testing.expectEqual(request.Method.POST, out.parsed.request.method);
+    try testing.expectEqualStrings("/echo", out.parsed.request.path);
+}
+
+test "conn: rejects chunked transfer-encoding" {
+    const raw = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+
+    const out = c.fillAndParse(t);
+    try testing.expect(out == .failed);
+    try testing.expectEqual(error.ChunkedNotSupported, out.failed);
+}
+
+test "conn: body over max_body_size returns BodyTooLarge" {
+    const body = "hello world!"; // 12 bytes
+    const head = "POST /data HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{ head, body });
+    defer ft.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.max_body_size = 8; // cap smaller than body
+    const t = ft.transport();
+
+    var out: ParseOutcome = .need_more;
+    for (0..10) |_| {
+        out = c.fillAndParse(t);
+        if (out != .need_more) break;
+    }
+    try testing.expect(out == .failed);
+    try testing.expectEqual(error.BodyTooLarge, out.failed);
+}
+
+test "conn: returns closed when transport closes" {
+    // Transport with no data at all — immediate close.
+    var ft = FakeTransport.init(testing.allocator, &.{});
+    defer ft.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+
+    try testing.expect(c.fillAndParse(t) == .closed);
+}
+
+test "conn: returns need_more on would_block before any data" {
+    var ft = FakeTransport.init(
+        testing.allocator,
+        &.{"GET / HTTP/1.1\r\nHost: x\r\n\r\n"},
+    );
+    defer ft.deinit();
+    ft.block_after = 0; // block before the very first chunk
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+
+    // First call → would_block → need_more.
+    try testing.expect(c.fillAndParse(t) == .need_more);
+
+    // Second call → data arrives → parsed.
+    const out = c.fillAndParse(t);
+    try testing.expect(out == .parsed);
+    try testing.expectEqualStrings("/", out.parsed.request.path);
+}

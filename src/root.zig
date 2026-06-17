@@ -71,6 +71,7 @@ pub const ServerOptions = server.Options;
 
 // --- Reactor (evented backend, additive) ---
 pub const reactor_transport = @import("reactor/transport.zig");
+pub const reactor_conn = @import("reactor/conn.zig");
 
 // Expose the build-time trace flag so downstream binaries (e.g. the cross-bench
 // server) can print it in their boot line without importing build_options directly.
