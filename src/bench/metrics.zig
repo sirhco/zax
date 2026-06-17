@@ -10,6 +10,9 @@ pub const Config = struct {
     reqs: usize = 5_000,
     samples: usize = 5,
     warmup: usize = 1,
+    json: bool = false,
+    check: bool = false,
+    tolerance: f64 = 0.15,
 };
 
 pub const ParseError = error{ UnknownFlag, MissingValue, BadValue };
@@ -19,6 +22,27 @@ pub fn parse(args: []const []const u8) ParseError!Config {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
+
+        // Boolean flags consume no value.
+        if (std.mem.eql(u8, arg, "--json")) {
+            cfg.json = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--check")) {
+            cfg.check = true;
+            continue;
+        }
+
+        // `--tolerance` takes an f64 value (must be a non-negative, non-NaN fraction).
+        if (std.mem.eql(u8, arg, "--tolerance")) {
+            if (i + 1 >= args.len) return error.MissingValue;
+            i += 1;
+            cfg.tolerance = std.fmt.parseFloat(f64, args[i]) catch return error.BadValue;
+            if (std.math.isNan(cfg.tolerance) or cfg.tolerance < 0) return error.BadValue;
+            continue;
+        }
+
+        // Remaining flags take a usize value.
         const field: *usize = if (std.mem.eql(u8, arg, "--iters"))
             &cfg.iters
         else if (std.mem.eql(u8, arg, "--conns"))
@@ -43,6 +67,21 @@ pub fn parse(args: []const []const u8) ParseError!Config {
     if (cfg.iters == 0 or cfg.conns == 0 or cfg.reqs == 0 or cfg.samples == 0)
         return error.BadValue;
     return cfg;
+}
+
+/// True when `current` is worse than `baseline` by more than `tol` (fractional).
+/// Lower is better for the gated metrics (ns/op, bytes/req).
+/// Written as `delta > baseline*tol` rather than `current > baseline*(1+tol)`:
+/// the latter rounds `100*1.15` to 114.999…, spuriously flagging an exact-tol
+/// value as a regression.
+pub fn regressed(baseline: f64, current: f64, tol: f64) bool {
+    return current - baseline > baseline * tol;
+}
+
+/// Percent change of `current` vs `baseline` (positive = worse). 0 if baseline == 0.
+pub fn pctDelta(baseline: f64, current: f64) f64 {
+    if (baseline == 0) return 0;
+    return (current - baseline) / baseline * 100.0;
 }
 
 /// Sorts `samples` in place and returns the median (mean of the two middle values for even length; 0 for empty).
@@ -138,4 +177,38 @@ test "median/stddev/percentile: empty inputs return 0" {
     try testing.expectApproxEqAbs(@as(f64, 0), stddev(&empty), 1e-9);
     const es: [0]i96 = .{};
     try testing.expectEqual(@as(i96, 0), percentile(&es, 50));
+}
+
+test "parse: boolean and float flags" {
+    const c = try parse(&.{ "--json", "--conns", "4" });
+    try testing.expect(c.json);
+    try testing.expect(!c.check);
+    try testing.expectEqual(@as(usize, 4), c.conns);
+
+    const d = try parse(&.{ "--check", "--tolerance", "0.2" });
+    try testing.expect(d.check);
+    try testing.expectApproxEqAbs(@as(f64, 0.2), d.tolerance, 1e-9);
+
+    const e = try parse(&.{});
+    try testing.expect(!e.json and !e.check);
+    try testing.expectApproxEqAbs(@as(f64, 0.15), e.tolerance, 1e-9);
+}
+
+test "parse: bad/negative tolerance" {
+    try testing.expectError(error.BadValue, parse(&.{ "--tolerance", "x" }));
+    try testing.expectError(error.BadValue, parse(&.{ "--tolerance", "-0.1" }));
+    try testing.expectError(error.MissingValue, parse(&.{"--tolerance"}));
+}
+
+test "regressed: tolerance band" {
+    try testing.expect(!regressed(100, 110, 0.15)); // +10% within 15%
+    try testing.expect(regressed(100, 120, 0.15)); // +20% beyond
+    try testing.expect(!regressed(100, 80, 0.15)); // improvement
+    try testing.expect(!regressed(100, 115, 0.15)); // exactly +15% not a regression
+}
+
+test "pctDelta" {
+    try testing.expectApproxEqAbs(@as(f64, 20), pctDelta(100, 120), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, -10), pctDelta(100, 90), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0), pctDelta(0, 5), 1e-9);
 }
