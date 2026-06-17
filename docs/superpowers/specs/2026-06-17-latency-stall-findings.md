@@ -52,10 +52,18 @@ ZAX_KEEPALIVE=0 ZAX_RUN_SECS=35 ./zig-out/bin/zax-bench 2>trace-e2.log &
 oha -z 30s -c 64 --no-tui http://127.0.0.1:8081/   # (oha keep-alives by default; the server closes each conn)
 wait; grep latency-trace trace-e2.log
 ```
-| segment | max_ms | over5ms | dominant |  | tail vanished? |
-|---------|-------:|--------:|---------:|--|----------------|
-| head    |        |         |          |  |                |
-| write   |        |         |          |  |                |
+**INVALID — ephemeral port exhaustion.** Non-keep-alive opens a new connection per
+request; on loopback at `-c 64` this exhausts ephemeral ports / piles up TIME_WAIT →
+oha success **54.5%**, 99,190 `os error 49 (Can't assign requested address)`, throughput
+collapsed to ~7k req/s (vs 4.95M reqs in E1), latency units garbled. `head` max 4984ms =
+readHead stalled on retrying connections, not the stall under study. The 35ms cluster did
+not appear, but that is **confounded** by the broken run, not evidence. Non-keep-alive is
+not cleanly benchable on this loopback box; rely on E1 + E5 instead.
+
+| segment | max_ms | over5ms | dominant | tail vanished? |
+|---------|-------:|--------:|---------:|----------------|
+| head    | 4984.69 (noise) | 12 | 37923 | run invalid |
+| write   | 0.09 | 0 | 81194 | — |
 
 ## E4 — thread-count sweep (`ZAX_THREADS=N`, use N≥2)
 Does the tail move with the worker pool size? (tests H3 — `Io.Threaded` granularity.)
@@ -82,9 +90,22 @@ On a Linux box (`Io.Threaded` = threads + blocking syscalls there too), repeat E
 | macOS    |             |              | ~35ms |
 | Linux    |             |              |       |
 
-## Verdict (fill in)
-- **Dominant segment / where the 35ms lives:** ______
-- **Hypothesis that held** (H1 read-wakeup / H2 write-flush / H3 Io.Threaded granularity / H4 zax logic): ______
-- **Component to blame** (zax logic / `std.Io.Threaded` / OS scheduler): ______
-- **Recommended fix theme:** ______ (e.g. different read/wait strategy, an `Io.Threaded`
-  config, an upstream std issue to file, or "wait for evented TCP").
+## Verdict (provisional — pending E5/Linux)
+- **Where the 35ms lives:** NOT in any zax segment. All per-request server work is <8ms
+  (head 8.15 / body 0.03 / disp 0.07 / write 0.15 ms max) vs oha p99.9 35.7ms. The stall is
+  in the **`std.Io.Threaded` blocking-IO + macOS kernel/loopback handoff** (post-`flush`
+  delivery / thread wakeup), outside zax's request processing.
+- **Hypothesis that held:** ~H3 — a **fixed timer/scheduling quantum in `Io.Threaded`**, not
+  H1 (read-wait: `head` only 8ms), not H4 (zax logic: all segments tiny). The tail is
+  rock-stable at ~35ms and **insensitive to thread count** (the earlier `max_in_flight` cap
+  test: 8 threads on 18 cores → still 35ms) and to compute → a fixed quantum, not contention.
+- **Component to blame:** `std.Io.Threaded` backend + macOS kernel/loopback scheduling.
+  **zax application code is exonerated.**
+- **Recommended fix theme (pending E5):**
+  - If E5 shows the ~35ms does **not** reproduce on Linux → it's a **macOS-loopback/Darwin
+    timer artifact**; document it, stop chasing, validate zax on a real Linux box. No zax
+    code fix.
+  - If it **does** reproduce on Linux → file an upstream `std.Io.Threaded` issue (blocking
+    read/write wakeup granularity); the real in-zax fix is an evented backend, still blocked
+    (`2026-06-17-evented-io-decision.md`).
+- **E2 (non-keep-alive) was invalid** (port exhaustion) and contributes no signal.
