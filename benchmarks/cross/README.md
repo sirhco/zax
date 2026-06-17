@@ -86,8 +86,9 @@ INFLIGHT=8 ./run.sh                   # fixed cap of 8
 
 A good starting value is roughly the core count. The hypothesis: p99.9/max flatten
 toward axum/go while median + throughput hold (backpressure shifts work to the kernel
-backlog instead of burning threads). `INFLIGHT` and `AB` are independent composable
-knobs — they can run together, but a clean single-knob run per section is clearest.
+backlog instead of burning threads). `INFLIGHT` and `AB` are **mutually exclusive for the zax passes — `AB=1` takes
+precedence** (INFLIGHT is ignored when AB=1 is set). Run them separately for a
+clean single-knob result per section.
 
 #### App-level complement: `std.Io.Threaded.async_limit`
 

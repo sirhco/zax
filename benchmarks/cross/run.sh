@@ -26,7 +26,8 @@ AB="${AB:-0}"         # 1 = run zax twice (ZAX_NODELAY on vs off) to A/B the Nag
                       # (it's identical across both passes), so AB=1 is valid even unpinned.
 INFLIGHT="${INFLIGHT:-0}"  # N>0 = run zax twice (ZAX_MAX_INFLIGHT=0 then =N) to A/B the
                       # worker-pool cap. Adds a "zax-cap" row alongside the default "zax".
-                      # Composable with AB=1 (independent knobs; both affect only zax passes).
+                      # NOTE: AB=1 and INFLIGHT are mutually exclusive for the zax passes —
+                      # AB=1 takes precedence (INFLIGHT is silently ignored when AB=1 is set).
 ROWS=()               # accumulated "framework|scenario|reqs|p50|p99|p999|max" for the table
 
 # When PIN=1, run the server on the first half of the cores and the load
@@ -111,9 +112,11 @@ drive() {
 
 # Expand frameworks into runnable passes: "label|port|env|cmd". With AB=1, zax
 # runs twice — Nagle off (ZAX_NODELAY=0) then on (=1) — so the same-box tail can
-# be A/B'd; the other frameworks run once. INFLIGHT=N is independent: when set,
-# zax runs twice (ZAX_MAX_INFLIGHT=0 then =N) to A/B the worker-pool cap.
-# Both knobs affect only zax; axum/go always run once.
+# be A/B'd; the other frameworks run once. INFLIGHT=N (when AB=0): zax runs twice
+# (ZAX_MAX_INFLIGHT=0 then =N) to A/B the worker-pool cap.
+# AB=1 and INFLIGHT are mutually exclusive for zax — AB=1 takes precedence.
+# axum/go always run once.
+[ "$AB" = 1 ] && [ "${INFLIGHT:-0}" != 0 ] && echo "WARNING: AB=1 takes precedence for zax; INFLIGHT ignored this run." >&2 || true
 PASSES=()
 for entry in "${FRAMEWORKS[@]}"; do
   read -r name port cmd <<<"$entry"
