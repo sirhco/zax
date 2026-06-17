@@ -17,6 +17,7 @@ pub const AccessRecord = struct {
     status: u16,
     duration_ns: u64,
     bytes: usize,
+    request_id: []const u8 = "",
 };
 
 /// Type-erased observer. `func` is invoked with the original `context` pointer
@@ -61,14 +62,25 @@ pub const AccessLogger = struct {
         switch (self.format) {
             .text => {
                 const ms = @as(f64, @floatFromInt(rec.duration_ns)) / 1_000_000.0;
-                try w.print("{s} {s} {d} {d:.3}ms {d}b\n", .{ @tagName(rec.method), rec.path, rec.status, ms, rec.bytes });
+                try w.print("{s} {s} {d} {d:.3}ms {d}b", .{ @tagName(rec.method), rec.path, rec.status, ms, rec.bytes });
+                if (rec.request_id.len > 0) {
+                    try w.writeAll(" id=");
+                    try w.writeAll(rec.request_id);
+                }
+                try w.writeAll("\n");
             },
             .json => {
                 try w.writeAll("{\"method\":\"");
                 try w.writeAll(@tagName(rec.method));
                 try w.writeAll("\",\"path\":");
                 try std.json.Stringify.encodeJsonString(rec.path, .{}, w);
-                try w.print(",\"status\":{d},\"dur_us\":{d},\"bytes\":{d}}}\n", .{ rec.status, rec.duration_ns / 1000, rec.bytes });
+                try w.print(",\"status\":{d},\"dur_us\":{d},\"bytes\":{d}", .{ rec.status, rec.duration_ns / 1000, rec.bytes });
+                if (rec.request_id.len > 0) {
+                    try w.writeAll(",\"request_id\":\"");
+                    try w.writeAll(rec.request_id);
+                    try w.writeAll("\"");
+                }
+                try w.writeAll("}\n");
             },
         }
         try w.flush(); // best-effort; on a fixed writer this errors but `log` swallows it (bytes already written)
@@ -217,6 +229,22 @@ test "access logger: text format" {
     const obs = lg.observer();
     obs.func(obs.context, .{ .method = .GET, .path = "/users/42", .status = 200, .duration_ns = 412_000, .bytes = 18 });
     try testing.expectEqualStrings("GET /users/42 200 0.412ms 18b\n", w.buffered());
+}
+
+test "access logger: includes request_id when present (text + json)" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var lg = AccessLogger{ .writer = &w, .format = .text };
+    const obs = lg.observer();
+    obs.func(obs.context, .{ .method = .GET, .path = "/p", .status = 200, .duration_ns = 412_000, .bytes = 18, .request_id = "abc-123" });
+    try testing.expectEqualStrings("GET /p 200 0.412ms 18b id=abc-123\n", w.buffered());
+
+    var buf2: [256]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&buf2);
+    var lg2 = AccessLogger{ .writer = &w2, .format = .json };
+    const obs2 = lg2.observer();
+    obs2.func(obs2.context, .{ .method = .GET, .path = "/p", .status = 200, .duration_ns = 412_000, .bytes = 18, .request_id = "abc-123" });
+    try testing.expect(std.mem.indexOf(u8, w2.buffered(), "\"request_id\":\"abc-123\"") != null);
 }
 
 test "access logger: json format escapes path" {
