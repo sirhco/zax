@@ -340,6 +340,15 @@ anything else. What is actually validated:
   These numbers are self-relative — not comparative against other frameworks
   or servers.
 
+- **Regression check** — capture a baseline with `zig build bench -- --json > src/bench/baseline.json`
+  (then recommit), then gate future runs with `zig build bench -- --check` (optionally
+  `--tolerance 0.2` to widen the default 15% band). The check gates the stable metrics only —
+  micro `ns/op` and per-scenario `bytes/req` — and exits nonzero on any regression. Throughput
+  and latency are emitted in `--json` but not gated (loopback noise makes them environment-sensitive).
+  The baseline encodes the numbers from the machine that generated it; use a stable CI runner or
+  a local before/after on the same machine for meaningful results. Because the numbers are
+  self-relative, a generous default tolerance (15%) is intentional.
+
 **Read the benchmark caveats.** The e2e numbers are **loopback, in-process,
 single-machine, and not comparative** — the client shares the process and Io
 with the server, so throughput is inflated and sub-microsecond latency is below

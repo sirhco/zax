@@ -235,3 +235,5 @@ See [`deploy-https.md`](deploy-https.md).
   middleware chain, and Path/Query/Json extractors; e2e runs three named scenarios (static GET, param GET,
   JSON POST) with per-scenario throughput.
   Flags via `--`: `--samples`, `--warmup`, `--iters`, `--conns`, `--reqs`. Read the caveats in `README.md`.
+  To capture a regression baseline: `zig build bench -- --json > src/bench/baseline.json` (then recommit);
+  to gate future runs: `zig build bench -- --check` (exits nonzero on regression; default tolerance 15%).
