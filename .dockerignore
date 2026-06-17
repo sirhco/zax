@@ -1,0 +1,8 @@
+.git
+**/.zig-cache
+**/zig-cache
+**/zig-out
+benchmarks/cross/axum/target
+benchmarks/cross/go/go-bench
+**/*.log
+.DS_Store

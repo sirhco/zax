@@ -187,3 +187,27 @@ knob; it is **not** the latency-tail fix.
   true tail") would confirm the stall isn't a macOS-loopback artifact — worth doing before
   the tracing theme.
 </content>
+
+## Linux (Docker linuxkit VM, arm64) — PIN=1 core-pinned
+
+First **core-pinned** cross-framework run (server vs client on disjoint cores; `taskset`
+works on Linux, mac can't). Run via `benchmarks/cross/docker/`. 15s, 64 conns. Absolute
+req/s carries Docker-VM overhead; the **relative** gap (same VM) is sound.
+
+| framework | scenario | req/s | p50 | p99 | p99.9 | max |
+|-----------|----------|------:|----:|----:|------:|----:|
+| zax  | static | 117326 | 0.0534 | 0.9629 | 53.4625 | 63.5676 |
+| zax  | param  | 115959 | 0.0549 | 0.5272 | 54.4679 | 66.7251 |
+| zax  | json   | 111000 | 0.0577 | 0.9858 | 56.7911 | 73.9299 |
+| axum | static | 434587 | 0.1410 | 0.2923 |  0.3645 |  3.7545 |
+| axum | param  | 442588 | 0.1385 | 0.2863 |  0.3573 |  2.2813 |
+| axum | json   | 447869 | 0.1351 | 0.2974 |  0.3730 |  2.0840 |
+| go   | static | 402036 | 0.0817 | 2.0535 |  2.8652 |  8.8668 |
+| go   | param  | 390450 | 0.0840 | 2.0806 |  2.8506 |  8.6216 |
+| go   | json   | 200734 | 0.1100 | 2.6246 |  3.3998 | 20.5402 |
+
+**Pinned reveals what loopback hid:** zax ~115k req/s vs **axum ~440k (≈4×)** and go
+~200–400k — zax is behind on **throughput**, not just the tail (p99.9 53–57ms vs axum 0.36ms,
+go 2.9ms). zax p50 is still best (0.054ms — hot path excellent). Root cause = `std.Io.Threaded`
+thread-per-conn (64 blocking threads on 9 pinned cores). The unpinned macOS "competitive
+throughput" was an artifact. See `docs/superpowers/specs/2026-06-17-latency-stall-findings.md`.

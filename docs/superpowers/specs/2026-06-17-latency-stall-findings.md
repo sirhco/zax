@@ -82,58 +82,85 @@ done
 | 8       |             |              |                       |
 | 18      |             |              |                       |
 
-## E5 — Linux (reproduce off macOS?)
-On a Linux box (`Io.Threaded` = threads + blocking syscalls there too), repeat E1. If the
-~35ms is macOS-only → Darwin scheduler/timer artifact; if it reproduces → the model.
-| platform | head max_ms | write max_ms | p99.9 |
-|----------|------------:|-------------:|------:|
-| macOS    |             |              | ~35ms |
-| Linux    |             |              |       |
+## E5 — Linux (Docker, linuxkit 6.12 aarch64 VM on the mac) — REPRODUCES
 
-## Verdict (FINAL — with one caveat: E5/Linux not yet run)
+Ran via `benchmarks/cross/docker/` (real Linux kernel in Docker's VM, native arm64).
 
-**zax's request-handling code is not the cause of the latency tail.** The trace localized
-the ~35ms out of every measured server segment; the remaining open question (is it
-macOS-specific?) is a single confirmation run, not a redesign. Details:
-- **Where the 35ms lives:** NOT in any zax segment. All per-request server work is <8ms
-  (head 8.15 / body 0.03 / disp 0.07 / write 0.15 ms max) vs oha p99.9 35.7ms. The stall is
-  in the **`std.Io.Threaded` blocking-IO + macOS kernel/loopback handoff** (post-`flush`
-  delivery / thread wakeup), outside zax's request processing.
-- **Hypothesis that held:** ~H3 — a **fixed timer/scheduling quantum in `Io.Threaded`**, not
-  H1 (read-wait: `head` only 8ms), not H4 (zax logic: all segments tiny). The tail is
-  rock-stable at ~35ms and **insensitive to thread count** (the earlier `max_in_flight` cap
-  test: 8 threads on 18 cores → still 35ms) and to compute → a fixed quantum, not contention.
-- **Component to blame:** `std.Io.Threaded` backend + macOS kernel/loopback scheduling.
-  **zax application code is exonerated.**
-- **Recommended fix theme (pending E5):**
-  - If E5 shows the ~35ms does **not** reproduce on Linux → it's a **macOS-loopback/Darwin
-    timer artifact**; document it, stop chasing, validate zax on a real Linux box. No zax
-    code fix.
-  - If it **does** reproduce on Linux → file an upstream `std.Io.Threaded` issue (blocking
-    read/write wakeup granularity); the real in-zax fix is an evented backend, still blocked
-    (`2026-06-17-evented-io-decision.md`).
+**Traced zax, GET / (15s, 64 conns):** oha p50 0.082 / p99 4.94 / **p99.9 43.0 / max 78** ms,
+136k req/s. Trace dump:
+| segment | max_ms | over5ms | dominant |
+|---------|-------:|--------:|---------:|
+| head    |   6.20 |       8 | 1878699  |
+| body    |   0.06 |       0 |        4 |
+| disp    |   0.16 |       0 |       32 |
+| write   |   6.18 |       3 |   167472 |
+
+| platform | head max | write max | oha p99.9 | verdict |
+|----------|---------:|----------:|----------:|---------|
+| macOS    |     8.15 |      0.15 |    ~35.7  | tail outside segments |
+| Linux    |     6.20 |      6.18 |     43.0  | **same — reproduces** |
+
+**The ~35–43ms tail reproduces on Linux**, and the trace again shows it is **outside zax's
+measured path** (max segment ~6ms vs p99.9 43ms). So it is **NOT a macOS/Darwin artifact** —
+it is the `std.Io.Threaded` thread-per-connection model + kernel IO handoff, on both OSes.
+
+### PIN=1 cross-framework (Linux, first core-pinned run — server vs client on disjoint cores)
+| framework | req/s | p50 | p99 | p99.9 | max |
+|-----------|------:|----:|----:|------:|----:|
+| **zax**   | ~115k | **0.054** | ~0.96 | **53–57** | 64–74 |
+| axum      | **~440k** | 0.14 | 0.29 | **0.36** | 2–4 |
+| go        | 200–400k | 0.08 | 2.1 | 2.9 | 9–20 |
+
+**New, bigger finding:** once properly **pinned** (server isolated to 9 of 18 cores), zax does
+~**115k req/s vs axum ~440k (≈4×) and go ~200–400k** — zax is now *behind both on throughput*,
+not just the tail. The macOS-loopback "competitive throughput" was an artifact of the unpinned
+client+server fighting equally. zax's p50 stays best (0.054ms — the per-request hot path is
+genuinely excellent), but the **thread-per-conn model can't keep 9 cores fed** (64 blocking
+threads on 9 cores) the way tokio's M:N work-stealing (axum) or goroutines (go) do. Same root
+cause as the tail: `std.Io.Threaded`.
+
+## Verdict (FINAL — E5/Linux confirmed)
+
+**zax's request-handling code is excellent and is NOT the cause; the limit is the
+`std.Io.Threaded` thread-per-connection backend, on both macOS and Linux.** E5 settled the
+open question: the tail reproduces on Linux (43ms) and the trace shows it is outside zax's
+segments on both OSes — not a Darwin artifact. The pinned Linux run added a bigger finding:
+zax is also ~4× behind axum on throughput once the server is core-isolated. Details:
+- **Where the tail lives:** NOT in any zax segment, on either OS. Per-request work is small
+  (macOS: head 8.15 / write 0.15; Linux: head 6.20 / write 6.18 ms max) vs oha p99.9 35–43ms.
+  The stall is in the **`std.Io.Threaded` blocking-IO + kernel handoff**, outside zax's
+  request processing.
+- **It is NOT a macOS artifact:** E5 (Linux 6.12 kernel) reproduces it — p99.9 43ms traced,
+  53–57ms pinned. Both platforms, same signature.
+- **Bigger finding (pinned Linux):** zax throughput ~115k vs **axum ~440k (≈4×)** and go
+  ~200–400k. zax is behind on **throughput**, not only the tail — the unpinned macOS
+  "competitive throughput" was a measurement artifact. zax p50 stays best (0.054ms); the
+  ceiling is the thread-per-conn concurrency model, not the per-request code.
+- **Component to blame:** `std.Io.Threaded` thread-per-connection backend (64 blocking
+  threads can't keep cores fed / wakeup granularity), confirmed on macOS + Linux.
+  **zax application code is exonerated** — its hot path is excellent (best median).
 - **E2 (non-keep-alive) was invalid** (port exhaustion) and contributes no signal.
 
 ## Next steps (in priority order)
 
-1. **Run E5 on Linux** (the single open confirmation). If the ~35ms is gone → close this
-   line: it's a macOS-loopback/Darwin artifact, zax is fine on real servers, no code change.
-   If it persists → open step 2. Until then, treat the tail as **most likely a macOS
-   measurement artifact**, not a zax defect.
-2. **Only if E5 reproduces on Linux:** file an upstream `std.Io.Threaded` issue (blocking
-   read/write wakeup granularity under many threads) with this trace as evidence; the only
-   in-zax fix is an evented backend, which is blocked upstream
-   (`2026-06-17-evented-io-decision.md`) — revisit when std ships io_uring TCP.
-3. **Stop adding socket/concurrency knobs.** Ruled out: Nagle (A/B), oversubscription /
-   thread count (cap sweep), per-request compute (this trace). None are the lever.
-4. **Tooling stays:** `-Dtrace-latency` + `ZAX_RUN_SECS`/`ZAX_KEEPALIVE`/`ZAX_THREADS` are
-   merged and zero-overhead-off — reuse them to re-confirm after any future `Io` change or
-   when re-testing on Linux.
+1. **File the upstream Zig issue** (`docs/upstream-zig/issue-1-evented-tcp-unimplemented.md`):
+   `std.Io.Evented` TCP ops are unimplemented on Uring/Dispatch. This is now strongly
+   justified — the evented backend is the only path that closes a **~4× throughput + ~150×
+   tail** gap to axum (tokio) on the same hardware. zax is already `Io`-pluggable; it's gated
+   entirely on this std gap. (Plus the small `issue-2-dispatch-deinit-slice.md`.)
+2. **Adopt `std.Io.Evented` in zax once std ships TCP** — the real fix for both throughput and
+   tail. Until then, the thread-per-conn ceiling stands; document it as a known limitation.
+3. **Stop adding socket/concurrency knobs.** Ruled out: Nagle (A/B), in-flight cap
+   (negative), per-request compute (trace). None is the lever; the backend is.
+4. **(Optional) bare-metal Linux confirmation** to remove the Docker-VM caveat — but the
+   conclusion (reproduces + 4× throughput gap) is robust from the same-VM relative numbers.
+5. **Tooling stays:** `-Dtrace-latency` + `ZAX_RUN_SECS`/`ZAX_KEEPALIVE`/`ZAX_THREADS` +
+   `benchmarks/cross/docker/` are reusable for the next `Io`/backend test. (Known tooling bug:
+   `ZAX_RUN_SECS` self-shutdown can hang under sustained load — use a `timeout` backstop.)
 
 ## Caveat
 
-All numbers here are **macOS loopback, unpinned**. The headline "zax tail ~50× axum/go" is
-on that same box; given the trace shows zax compute is clean and the stall sits in the
-`Io.Threaded`/kernel layer, the cross-framework gap may itself be partly a macOS-loopback
-artifact of the threaded backend. **E5/Linux (or an off-box run) is required before quoting
-the tail as a real-world zax characteristic.**
+Linux numbers are from **Docker's linuxkit VM on the mac (arm64), not bare metal** — absolute
+throughput carries VM overhead. But the comparison is apples-to-apples (zax/axum/go in the
+same VM), so the **~4× throughput gap and the reproduced ~43ms tail are sound**; only the
+absolute req/s figures are VM-affected. macOS numbers are loopback, unpinned.
