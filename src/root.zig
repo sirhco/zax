@@ -69,6 +69,9 @@ pub const server = @import("server.zig");
 pub const App = server.App;
 pub const ServerOptions = server.Options;
 
+// --- Reactor (evented backend, additive) ---
+pub const reactor_transport = @import("reactor/transport.zig");
+
 // Expose the build-time trace flag so downstream binaries (e.g. the cross-bench
 // server) can print it in their boot line without importing build_options directly.
 pub const trace_latency: bool = @import("build_options").trace_latency;
