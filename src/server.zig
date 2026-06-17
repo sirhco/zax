@@ -30,6 +30,7 @@ const Param = radix.Param;
 const extract = @import("extract/extract.zig");
 const middleware = @import("middleware.zig");
 const err_mod = @import("error.zig");
+const observe_mod = @import("observe.zig");
 
 /// Maximum path parameters captured per request (compile-time, sizes the
 /// stack capture buffer).
@@ -86,6 +87,7 @@ pub fn App(comptime AppState: type) type {
         router: R,
         opts: Options,
         mws: std.ArrayListUnmanaged(Chn.Middleware) = .empty,
+        observers: std.ArrayListUnmanaged(observe_mod.Observer) = .empty,
         fallback_handler: ?ErasedHandler = null,
         on_error: ?ErrorHandler = null,
         server: ?net.Server = null,
@@ -97,6 +99,7 @@ pub fn App(comptime AppState: type) type {
 
         pub fn deinit(self: *Self) void {
             self.mws.deinit(self.gpa);
+            self.observers.deinit(self.gpa);
             self.router.deinit();
         }
 
@@ -105,6 +108,13 @@ pub fn App(comptime AppState: type) type {
         /// routing, so 404/405 short-circuit before the chain).
         pub fn use(self: *Self, mw: Chn.Middleware) std.mem.Allocator.Error!void {
             try self.mws.append(self.gpa, mw);
+        }
+
+        /// Register an observer run after every request (matched, 404, 405, or
+        /// handler error) with method/path/status/duration/bytes. Multiple
+        /// observers may be registered; they run in registration order.
+        pub fn observe(self: *Self, obs: observe_mod.Observer) std.mem.Allocator.Error!void {
+            try self.observers.append(self.gpa, obs);
         }
 
         /// Set the handler run for requests that match no route (a custom 404 or
@@ -327,10 +337,22 @@ pub fn App(comptime AppState: type) type {
                     parsed.request.isPersistent() and
                     (served + 1) < self.opts.max_keep_alive_requests;
 
+                const t0: i96 = if (self.observers.items.len > 0) nowNs(io) else 0;
                 var resp = self.dispatch(io, &parsed.request, &arena);
                 const streamed = resp.streamer != null;
                 resp.keep_alive = persistent and !streamed;
                 if (!writeResponse(w, resp)) break;
+                if (self.observers.items.len > 0) {
+                    const dur: u64 = @intCast(@max(@as(i96, 0), nowNs(io) - t0));
+                    const rec = observe_mod.AccessRecord{
+                        .method = parsed.request.method,
+                        .path = parsed.request.path,
+                        .status = resp.status.code(),
+                        .duration_ns = dur,
+                        .bytes = resp.body.len,
+                    };
+                    for (self.observers.items) |obs| obs.func(obs.context, rec);
+                }
                 if (streamed) break; // connection-close framing: close after a stream
 
                 cr.consume(consumed);
@@ -418,6 +440,10 @@ fn allowHeader(arena: std.mem.Allocator, allowed: router.MethodSet) []const u8 {
 fn msTimeout(ms_val: u32) Io.Timeout {
     if (ms_val == 0) return .none;
     return .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(@intCast(ms_val)), .clock = .awake } };
+}
+
+fn nowNs(io: Io) i96 {
+    return Io.Timestamp.now(io, .awake).toNanoseconds();
 }
 
 /// A manual, timeout-capable connection reader. Owns a fixed buffer and a
@@ -1473,6 +1499,54 @@ test "fallback: SPA-style 200 + middleware applies; 405 unaffected" {
     var rb2: [2048]u8 = undefined;
     const r2 = doRequest(io, port, "DELETE /ping HTTP/1.1\r\nHost: x\r\n\r\n", &rb2);
     try testing.expect(std.mem.indexOf(u8, r2, "405 Method Not Allowed") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+const ObsCapture = struct {
+    method: request.Method = .GET,
+    path_buf: [64]u8 = undefined,
+    path_len: usize = 0,
+    status: u16 = 0,
+    count: usize = 0,
+};
+fn obsCapture(ctx: *anyopaque, rec: observe_mod.AccessRecord) void {
+    const c: *ObsCapture = @ptrCast(@alignCast(ctx));
+    c.method = rec.method;
+    const n = @min(rec.path.len, c.path_buf.len);
+    @memcpy(c.path_buf[0..n], rec.path[0..n]);
+    c.path_len = n;
+    c.status = rec.status;
+    c.count += 1;
+}
+
+test "observe: hook fires for matched and 404 with method/path/status" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ping", pingHandler);
+
+    var cap = ObsCapture{};
+    try app.observe(.{ .context = &cap, .func = obsCapture });
+
+    const port: u16 = 18190;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    _ = doRequest(io, port, "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expectEqual(@as(u16, 200), cap.status);
+    try testing.expectEqualStrings("/ping", cap.path_buf[0..cap.path_len]);
+    try testing.expect(cap.method == .GET);
+
+    var rb2: [2048]u8 = undefined;
+    _ = doRequest(io, port, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n", &rb2);
+    try testing.expectEqual(@as(u16, 404), cap.status); // observer covers non-matched
+    try testing.expect(cap.count >= 2);
 
     app.requestShutdown(io);
     loop_fut.await(io);
