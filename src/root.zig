@@ -50,6 +50,7 @@ pub const observe = @import("observe.zig");
 pub const Observer = observe.Observer;
 pub const AccessRecord = observe.AccessRecord;
 pub const AccessLogger = observe.AccessLogger;
+pub const RequestId = @import("extract/request_id.zig").RequestId;
 pub const Metrics = observe.Metrics;
 pub const MetricsSnapshot = observe.MetricsSnapshot;
 

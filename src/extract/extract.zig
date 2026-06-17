@@ -22,6 +22,9 @@ pub fn Context(comptime AppState: type) type {
         /// Whether `X-Forwarded-*` headers should be trusted (set by the server
         /// from `Options.trust_forwarded`; only true behind a controlled proxy).
         trust_forwarded: bool = false,
+        /// Per-request id (validated incoming `X-Request-Id` or a generated one);
+        /// empty unless `Options.request_id` is enabled. Exposed via `RequestId`.
+        request_id: []const u8 = "",
     };
 }
 

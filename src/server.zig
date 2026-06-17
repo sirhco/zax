@@ -57,6 +57,11 @@ pub const Options = struct {
     /// behind a reverse proxy you control (it terminates TLS and sets these);
     /// otherwise clients could spoof them. See docs/deploy-https.md.
     trust_forwarded: bool = false,
+    /// Enable per-request ids: validate an incoming `X-Request-Id` (safe charset,
+    /// ≤128 chars) or generate one, echo it on the response as `x-request-id`,
+    /// expose it via the `RequestId` extractor, and include it in access records.
+    /// Off by default (zero overhead and identical behavior when disabled).
+    request_id: bool = false,
 };
 
 /// `App(AppState)` — a server bound to one concrete, read-only app-state type.
@@ -92,6 +97,7 @@ pub fn App(comptime AppState: type) type {
         on_error: ?ErrorHandler = null,
         server: ?net.Server = null,
         shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        rid_counter: std.atomic.Value(u64) = .init(0),
 
         pub fn init(gpa: std.mem.Allocator, state: AppState, opts: Options) std.mem.Allocator.Error!Self {
             return .{ .gpa = gpa, .state = state, .router = try R.init(gpa), .opts = opts };
@@ -337,8 +343,13 @@ pub fn App(comptime AppState: type) type {
                     parsed.request.isPersistent() and
                     (served + 1) < self.opts.max_keep_alive_requests;
 
+                const rid: []const u8 = if (self.opts.request_id) self.computeRid(&parsed.request, arena.allocator()) else "";
+
                 const t0: i96 = if (self.observers.items.len > 0) nowNs(io) else 0;
-                var resp = self.dispatch(io, &parsed.request, &arena);
+                var resp = self.dispatch(io, &parsed.request, &arena, rid);
+                if (self.opts.request_id) {
+                    resp = resp.withHeader(arena.allocator(), "x-request-id", rid) catch resp;
+                }
                 const streamed = resp.streamer != null;
                 resp.keep_alive = persistent and !streamed;
                 if (!writeResponse(w, resp)) break;
@@ -350,6 +361,7 @@ pub fn App(comptime AppState: type) type {
                         .status = resp.status.code(),
                         .duration_ns = dur,
                         .bytes = resp.body.len,
+                        .request_id = rid,
                     };
                     for (self.observers.items) |obs| obs.func(obs.context, rec);
                 }
@@ -363,7 +375,7 @@ pub fn App(comptime AppState: type) type {
 
         /// Route one already-read request and run its handler. Every failure
         /// path maps to an HTTP status rather than propagating.
-        fn makeCtx(self: *Self, io: Io, req: *const request.Request, params: []const Param, arena: *std.heap.ArenaAllocator) Ctx {
+        fn makeCtx(self: *Self, io: Io, req: *const request.Request, params: []const Param, arena: *std.heap.ArenaAllocator, request_id: []const u8) Ctx {
             return .{
                 .req = req,
                 .params = params,
@@ -371,7 +383,19 @@ pub fn App(comptime AppState: type) type {
                 .arena = arena.allocator(),
                 .io = io,
                 .trust_forwarded = self.opts.trust_forwarded,
+                .request_id = request_id,
             };
+        }
+
+        /// Resolve the request id: reuse a valid incoming `X-Request-Id`, else
+        /// generate a monotonic 16-hex-digit id into `arena`. Falls back to "" if
+        /// allocation fails (the header echo simply omits a value).
+        fn computeRid(self: *Self, req: *const request.Request, arena: std.mem.Allocator) []const u8 {
+            if (req.header("x-request-id")) |h| {
+                if (validRid(h)) return h;
+            }
+            const n = self.rid_counter.fetchAdd(1, .monotonic);
+            return std.fmt.allocPrint(arena, "{x:0>16}", .{n}) catch "";
         }
 
         /// Classify an error and render it, using the app's on_error hook if set.
@@ -381,28 +405,28 @@ pub fn App(comptime AppState: type) type {
             return .{ .status = info.status, .body = info.reason };
         }
 
-        fn dispatch(self: *Self, io: Io, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
+        fn dispatch(self: *Self, io: Io, req: *const request.Request, arena: *std.heap.ArenaAllocator, request_id: []const u8) Response {
             var params_buf: [max_params]Param = undefined;
             const outcome = self.router.match(req.method, req.path, &params_buf) catch {
-                const ctx = self.makeCtx(io, req, &.{}, arena);
+                const ctx = self.makeCtx(io, req, &.{}, arena, request_id);
                 return self.renderError(err_mod.Error.BadRequest, &ctx);
             };
 
             switch (outcome) {
                 .not_found => {
-                    const ctx = self.makeCtx(io, req, &.{}, arena);
+                    const ctx = self.makeCtx(io, req, &.{}, arena, request_id);
                     if (self.fallback_handler) |fb|
                         return Chn.run(self.mws.items, fb, &ctx) catch |e| self.renderError(e, &ctx);
                     return self.renderError(err_mod.Error.NotFound, &ctx);
                 },
                 .method_not_allowed => |allowed| {
-                    const ctx = self.makeCtx(io, req, &.{}, arena);
+                    const ctx = self.makeCtx(io, req, &.{}, arena, request_id);
                     var resp = self.renderError(err_mod.Error.MethodNotAllowed, &ctx);
                     resp = resp.withHeader(ctx.arena, "allow", allowHeader(ctx.arena, allowed)) catch resp;
                     return resp;
                 },
                 .found => |f| {
-                    const ctx = self.makeCtx(io, req, f.params, arena);
+                    const ctx = self.makeCtx(io, req, f.params, arena, request_id);
                     return Chn.run(self.mws.items, f.handler, &ctx) catch |e| self.renderError(e, &ctx);
                 },
             }
@@ -420,6 +444,20 @@ fn writeResponse(w: *Io.Writer, resp: Response) bool {
     }
     resp.write(w) catch return false;
     w.flush() catch return false;
+    return true;
+}
+
+/// Whether `s` is a safe request-id to echo verbatim: non-empty, ≤128 chars, and
+/// limited to `[A-Za-z0-9._-]` (no whitespace, CR/LF, or header-injection bytes).
+fn validRid(s: []const u8) bool {
+    if (s.len == 0 or s.len > 128) return false;
+    for (s) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or
+            (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or
+            c == '.' or c == '_' or c == '-';
+        if (!ok) return false;
+    }
     return true;
 }
 
@@ -920,7 +958,7 @@ test "hot path: static-handler dispatch + serialize make zero heap allocations" 
     var hs: [request.max_headers]Header = undefined;
     const parsed = parser.parseHead("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", &hs) catch unreachable;
 
-    const resp = app.dispatch(undefined, &parsed.request, &arena);
+    const resp = app.dispatch(undefined, &parsed.request, &arena, "");
     try testing.expectEqualStrings("pong", resp.body);
 
     var ob: [256]u8 = undefined;
@@ -947,7 +985,7 @@ test "contrast: Json handler does allocate (discriminates the alloc check)" {
     var parsed = parser.parseHead(raw, &hs) catch unreachable;
     parsed.request.body = raw[parsed.head_len .. parsed.head_len + parsed.request.contentLength().?];
 
-    const resp = app.dispatch(undefined, &parsed.request, &arena);
+    const resp = app.dispatch(undefined, &parsed.request, &arena, "");
     try testing.expectEqualStrings("grace", resp.body);
     try testing.expect(failing.allocations > 0); // JSON parse used the arena
 }
@@ -1741,6 +1779,66 @@ test "group: empty pattern registers the group root" {
     var loop_fut = startTestApp(io, &app, port);
     var rb: [2048]u8 = undefined;
     try testing.expect(std.mem.indexOf(u8, doRequest(io, port, "GET /api HTTP/1.1\r\nHost: x\r\n\r\n", &rb), "200 OK") != null);
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+fn ridHandler(rid: @import("extract/request_id.zig").RequestId) Response {
+    return Response.text(rid.value);
+}
+
+test "validRid accepts safe tokens, rejects unsafe" {
+    try testing.expect(validRid("abc-123"));
+    try testing.expect(validRid("00000000000000a1"));
+    try testing.expect(!validRid(""));
+    try testing.expect(!validRid("bad id"));   // space
+    try testing.expect(!validRid("a\r\nb"));   // CRLF
+    try testing.expect(!validRid("a/b"));      // slash
+    try testing.expect(!validRid("x" ** 129)); // too long
+}
+
+test "request id: generated, echoed, and exposed to handler" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{ .request_id = true });
+    defer app.deinit();
+    try app.get("/rid", ridHandler);
+    const port: u16 = 18192;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const r = doRequest(io, port, "GET /rid HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "x-request-id: ") != null);
+
+    var rb2: [2048]u8 = undefined;
+    const r2 = doRequest(io, port, "GET /rid HTTP/1.1\r\nHost: x\r\nX-Request-Id: abc-123\r\n\r\n", &rb2);
+    try testing.expect(std.mem.indexOf(u8, r2, "x-request-id: abc-123\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, r2, "abc-123"));
+
+    var rb3: [2048]u8 = undefined;
+    const r3 = doRequest(io, port, "GET /rid HTTP/1.1\r\nHost: x\r\nX-Request-Id: bad id!\r\n\r\n", &rb3);
+    try testing.expect(std.mem.indexOf(u8, r3, "bad id!") == null);
+    try testing.expect(std.mem.indexOf(u8, r3, "x-request-id: ") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "request id: disabled by default -> no header, empty value" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/rid", ridHandler);
+    const port: u16 = 18193;
+    var loop_fut = startTestApp(io, &app, port);
+    var rb: [2048]u8 = undefined;
+    const r = doRequest(io, port, "GET /rid HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "x-request-id:") == null);
     app.requestShutdown(io);
     loop_fut.await(io);
 }
