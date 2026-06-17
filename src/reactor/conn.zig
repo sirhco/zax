@@ -103,11 +103,19 @@ const default_max_body_size: usize = 0;
 const no_deadline: i96 = std.math.maxInt(i96);
 
 /// Return the current monotonic time in nanoseconds.
-/// Uses libc clock_gettime(MONOTONIC) — no Io handle needed; macOS-safe.
+/// Uses the Linux vDSO clock_gettime syscall on Linux (no libc needed) and
+/// std.c on other platforms (macOS).
 pub fn monotonicNow() i96 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-    return @as(i96, ts.sec) * 1_000_000_000 + @as(i96, ts.nsec);
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        return @as(i96, ts.sec) * 1_000_000_000 + @as(i96, ts.nsec);
+    } else {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        return @as(i96, ts.sec) * 1_000_000_000 + @as(i96, ts.nsec);
+    }
 }
 
 pub const Conn = struct {

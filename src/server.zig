@@ -395,7 +395,14 @@ pub fn App(comptime AppState: type) type {
         /// call this.
         pub fn requestShutdown(self: *Self, io: Io) void {
             self.shutting_down.store(true, .release);
-            if (self.server) |*s| s.socket.close(io);
+            if (self.server) |*s| {
+                // shutdown(SHUT_RDWR) before close so that any thread blocked
+                // in accept() returns EINVAL / SocketNotListening immediately
+                // on all platforms (on Linux, close() alone is not guaranteed
+                // to unblock a concurrent accept() in another thread).
+                io.vtable.netShutdown(io.userdata, s.socket.handle, .both) catch {};
+                s.socket.close(io);
+            }
             if (comptime build_options.trace_latency) global_trace.dump();
         }
 
@@ -1939,15 +1946,34 @@ test "validRid accepts safe tokens, rejects unsafe" {
 }
 
 test "setNoDelay enables TCP_NODELAY on a socket" {
-    const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    try testing.expect(fd >= 0);
-    defer _ = std.c.close(fd);
-    setNoDelay(fd);
-    var val: c_int = 0;
-    var len: std.posix.socklen_t = @sizeOf(c_int);
-    const rc = std.c.getsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &val, &len);
-    try testing.expect(rc == 0);
-    try testing.expect(val != 0);
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .linux) {
+        // Linux: use syscalls directly — no libc needed in the test binary.
+        const linux = std.os.linux;
+        const sfd = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        const se = linux.errno(sfd);
+        if (se != .SUCCESS) return std.posix.unexpectedErrno(se);
+        const fd: i32 = @intCast(sfd);
+        defer _ = linux.close(@intCast(fd));
+        setNoDelay(fd);
+        var val: c_int = 0;
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        const grc = linux.getsockopt(fd, std.posix.IPPROTO.TCP, @intCast(std.posix.TCP.NODELAY), @ptrCast(&val), &len);
+        const ge = linux.errno(grc);
+        try testing.expect(ge == .SUCCESS);
+        try testing.expect(val != 0);
+    } else {
+        // macOS: use libc.
+        const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        try testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        setNoDelay(fd);
+        var val: c_int = 0;
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        const rc = std.c.getsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &val, &len);
+        try testing.expect(rc == 0);
+        try testing.expect(val != 0);
+    }
 }
 
 test "Options: tcp_nodelay defaults on (opt-out)" {
