@@ -473,11 +473,12 @@ pub fn App(comptime AppState: type) type {
                 .tcp_nodelay = self.opts.tcp_nodelay,
             };
 
-            // Init workers.
+            // Init workers.  Track counts separately so the single cleanup path
+            // below can handle both init and spawn failures without double-deinit.
             var inited: usize = 0;
-            errdefer {
-                for (0..inited) |i| workers_slice[i].deinit();
-            }
+            var spawned: usize = 0;
+            var spawn_err: ?anyerror = null;
+
             for (0..n_workers) |i| {
                 bundles[i] = AppIoBundle{ .app = self, .io = io };
                 const disp = Dispatcher{
@@ -491,37 +492,43 @@ pub fn App(comptime AppState: type) type {
                     addr,
                     &self.shutting_down,
                 ) catch |e| {
-                    return switch (@as(anyerror, e)) {
-                        error.OutOfMemory => error.OutOfMemory,
-                        else => error.Unexpected,
-                    };
+                    spawn_err = e;
+                    break;
                 };
                 worker_ptrs[i] = &workers_slice[i];
                 inited += 1;
             }
 
-            // Register worker pointers BEFORE spawning threads so requestShutdown
-            // can safely wake them.
-            self.evented_workers = worker_ptrs;
+            if (spawn_err == null) {
+                // Register worker pointers BEFORE spawning threads so
+                // requestShutdown can safely wake them.
+                self.evented_workers = worker_ptrs;
 
-            // Spawn threads.
-            var spawned: usize = 0;
-            for (0..n_workers) |i| {
-                threads[i] = std.Thread.spawn(.{}, Worker.run, .{&workers_slice[i]}) catch |e| {
-                    // Roll back: wake+join already-spawned threads, deinit workers.
-                    self.shutting_down.store(true, .release);
-                    for (0..spawned) |j| {
-                        workers_slice[j].wake();
-                        threads[j].join();
-                    }
-                    self.evented_workers = null;
-                    for (0..n_workers) |j| workers_slice[j].deinit();
-                    return switch (e) {
-                        error.OutOfMemory => error.OutOfMemory,
-                        else => error.SystemResources,
+                // Spawn threads.
+                for (0..n_workers) |i| {
+                    threads[i] = std.Thread.spawn(.{}, Worker.run, .{&workers_slice[i]}) catch |e| {
+                        spawn_err = e;
+                        break;
                     };
+                    spawned += 1;
+                }
+            }
+
+            if (spawn_err) |e| {
+                // Single cleanup path for both init-failure and spawn-failure.
+                // Order: signal shutdown → wake+join live threads → deinit each
+                // initialised worker exactly once → clear evented_workers.
+                self.shutting_down.store(true, .release);
+                for (0..spawned) |j| {
+                    workers_slice[j].wake();
+                    threads[j].join();
+                }
+                for (0..inited) |j| workers_slice[j].deinit();
+                self.evented_workers = null;
+                return switch (@as(anyerror, e)) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.SystemResources,
                 };
-                spawned += 1;
             }
 
             // Join all threads.
@@ -530,7 +537,7 @@ pub fn App(comptime AppState: type) type {
             // Clear evented_workers before frame returns (pointers become dangling).
             self.evented_workers = null;
 
-            // Deinit workers.
+            // Deinit workers exactly once on the normal path.
             for (0..n_workers) |i| workers_slice[i].deinit();
 
             if (comptime build_options.trace_latency) global_trace.dump();
