@@ -90,7 +90,11 @@ On a Linux box (`Io.Threaded` = threads + blocking syscalls there too), repeat E
 | macOS    |             |              | ~35ms |
 | Linux    |             |              |       |
 
-## Verdict (provisional — pending E5/Linux)
+## Verdict (FINAL — with one caveat: E5/Linux not yet run)
+
+**zax's request-handling code is not the cause of the latency tail.** The trace localized
+the ~35ms out of every measured server segment; the remaining open question (is it
+macOS-specific?) is a single confirmation run, not a redesign. Details:
 - **Where the 35ms lives:** NOT in any zax segment. All per-request server work is <8ms
   (head 8.15 / body 0.03 / disp 0.07 / write 0.15 ms max) vs oha p99.9 35.7ms. The stall is
   in the **`std.Io.Threaded` blocking-IO + macOS kernel/loopback handoff** (post-`flush`
@@ -109,3 +113,27 @@ On a Linux box (`Io.Threaded` = threads + blocking syscalls there too), repeat E
     read/write wakeup granularity); the real in-zax fix is an evented backend, still blocked
     (`2026-06-17-evented-io-decision.md`).
 - **E2 (non-keep-alive) was invalid** (port exhaustion) and contributes no signal.
+
+## Next steps (in priority order)
+
+1. **Run E5 on Linux** (the single open confirmation). If the ~35ms is gone → close this
+   line: it's a macOS-loopback/Darwin artifact, zax is fine on real servers, no code change.
+   If it persists → open step 2. Until then, treat the tail as **most likely a macOS
+   measurement artifact**, not a zax defect.
+2. **Only if E5 reproduces on Linux:** file an upstream `std.Io.Threaded` issue (blocking
+   read/write wakeup granularity under many threads) with this trace as evidence; the only
+   in-zax fix is an evented backend, which is blocked upstream
+   (`2026-06-17-evented-io-decision.md`) — revisit when std ships io_uring TCP.
+3. **Stop adding socket/concurrency knobs.** Ruled out: Nagle (A/B), oversubscription /
+   thread count (cap sweep), per-request compute (this trace). None are the lever.
+4. **Tooling stays:** `-Dtrace-latency` + `ZAX_RUN_SECS`/`ZAX_KEEPALIVE`/`ZAX_THREADS` are
+   merged and zero-overhead-off — reuse them to re-confirm after any future `Io` change or
+   when re-testing on Linux.
+
+## Caveat
+
+All numbers here are **macOS loopback, unpinned**. The headline "zax tail ~50× axum/go" is
+on that same box; given the trace shows zax compute is clean and the stall sits in the
+`Io.Threaded`/kernel layer, the cross-framework gap may itself be partly a macOS-loopback
+artifact of the threaded backend. **E5/Linux (or an off-box run) is required before quoting
+the tail as a real-world zax characteristic.**
