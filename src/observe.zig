@@ -75,7 +75,140 @@ pub const AccessLogger = struct {
     }
 };
 
+/// Thread-safe metrics collector implementing `Observer`. Aggregates request
+/// outcomes into lock-free atomic counters and a latency histogram, then exposes
+/// either a value-snapshot or Prometheus text exposition.
+///
+/// No lock needed: every field is an independent monotonic atomic counter; a
+/// snapshot reads them without a consistent point-in-time guarantee (acceptable
+/// for metrics). Histogram bucket bounds are in nanoseconds (matching
+/// `AccessRecord.duration_ns`) but exposed in seconds per Prometheus convention.
+pub const Metrics = struct {
+    pub const bucket_bounds_ns = [_]u64{ 5_000_000, 10_000_000, 25_000_000, 50_000_000, 100_000_000, 250_000_000, 500_000_000, 1_000_000_000, 2_500_000_000, 5_000_000_000, 10_000_000_000 };
+
+    /// `le` label strings, parallel to `bucket_bounds_ns`. Hardcoded so the
+    /// exposition renders exact literals (e.g. "0.005", "2.5", "10") without
+    /// float-formatting ambiguity.
+    pub const bucket_labels = [_][]const u8{ "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10" };
+
+    total: std.atomic.Value(u64) = .init(0),
+    class: [6]std.atomic.Value(u64) = @splat(.init(0)),
+    bytes_total: std.atomic.Value(u64) = .init(0),
+    duration_sum_ns: std.atomic.Value(u64) = .init(0),
+    buckets: [bucket_bounds_ns.len]std.atomic.Value(u64) = @splat(.init(0)),
+
+    pub fn observer(self: *Metrics) Observer {
+        return .{ .context = self, .func = record };
+    }
+
+    fn record(ctx: *anyopaque, rec: AccessRecord) void {
+        const self: *Metrics = @ptrCast(@alignCast(ctx));
+        _ = self.total.fetchAdd(1, .monotonic);
+        const cls = rec.status / 100;
+        if (cls >= 1 and cls <= 5) _ = self.class[cls].fetchAdd(1, .monotonic);
+        _ = self.bytes_total.fetchAdd(rec.bytes, .monotonic);
+        _ = self.duration_sum_ns.fetchAdd(rec.duration_ns, .monotonic);
+        for (bucket_bounds_ns, 0..) |bound, i| {
+            if (rec.duration_ns <= bound) {
+                _ = self.buckets[i].fetchAdd(1, .monotonic);
+                break;
+            }
+        }
+    }
+
+    pub fn snapshot(self: *const Metrics) MetricsSnapshot {
+        var s: MetricsSnapshot = undefined;
+        s.total = self.total.load(.monotonic);
+        for (&self.class, 0..) |*c, i| s.class[i] = c.load(.monotonic);
+        s.bytes_total = self.bytes_total.load(.monotonic);
+        s.duration_sum_ns = self.duration_sum_ns.load(.monotonic);
+        for (&self.buckets, 0..) |*b, i| s.buckets[i] = b.load(.monotonic);
+        return s;
+    }
+
+    pub fn writePrometheus(self: *const Metrics, w: *std.Io.Writer) !void {
+        const s = self.snapshot();
+        try w.writeAll(
+            \\# HELP zax_requests_total Total HTTP requests by status class.
+            \\# TYPE zax_requests_total counter
+            \\
+        );
+        try w.print("zax_requests_total{{class=\"1xx\"}} {d}\n", .{s.class[1]});
+        try w.print("zax_requests_total{{class=\"2xx\"}} {d}\n", .{s.class[2]});
+        try w.print("zax_requests_total{{class=\"3xx\"}} {d}\n", .{s.class[3]});
+        try w.print("zax_requests_total{{class=\"4xx\"}} {d}\n", .{s.class[4]});
+        try w.print("zax_requests_total{{class=\"5xx\"}} {d}\n", .{s.class[5]});
+        try w.writeAll(
+            \\# HELP zax_response_bytes_total Total response body bytes.
+            \\# TYPE zax_response_bytes_total counter
+            \\
+        );
+        try w.print("zax_response_bytes_total {d}\n", .{s.bytes_total});
+        try w.writeAll(
+            \\# HELP zax_request_duration_seconds Request duration in seconds.
+            \\# TYPE zax_request_duration_seconds histogram
+            \\
+        );
+        var cum: u64 = 0;
+        for (bucket_labels, 0..) |label, i| {
+            cum += s.buckets[i];
+            try w.print("zax_request_duration_seconds_bucket{{le=\"{s}\"}} {d}\n", .{ label, cum });
+        }
+        try w.print("zax_request_duration_seconds_bucket{{le=\"+Inf\"}} {d}\n", .{s.total});
+        const sum_s = @as(f64, @floatFromInt(s.duration_sum_ns)) / 1e9;
+        try w.print("zax_request_duration_seconds_sum {d:.6}\n", .{sum_s});
+        try w.print("zax_request_duration_seconds_count {d}\n", .{s.total});
+    }
+};
+
+/// Point-in-time copy of `Metrics` counters (plain `u64`s, no atomics).
+pub const MetricsSnapshot = struct {
+    total: u64,
+    class: [6]u64,
+    bytes_total: u64,
+    duration_sum_ns: u64,
+    buckets: [Metrics.bucket_bounds_ns.len]u64,
+};
+
 const testing = std.testing;
+
+test "metrics: counts, classes, bytes, sum, buckets" {
+    var m = Metrics{};
+    const obs = m.observer();
+    obs.func(obs.context, .{ .method = .GET, .path = "/a", .status = 200, .duration_ns = 3_000_000, .bytes = 10 });
+    obs.func(obs.context, .{ .method = .GET, .path = "/b", .status = 200, .duration_ns = 30_000_000, .bytes = 20 });
+    obs.func(obs.context, .{ .method = .GET, .path = "/c", .status = 404, .duration_ns = 2_000_000_000, .bytes = 0 });
+    obs.func(obs.context, .{ .method = .GET, .path = "/d", .status = 500, .duration_ns = 30_000_000_000, .bytes = 5 });
+
+    const s = m.snapshot();
+    try testing.expectEqual(@as(u64, 4), s.total);
+    try testing.expectEqual(@as(u64, 2), s.class[2]);
+    try testing.expectEqual(@as(u64, 1), s.class[4]);
+    try testing.expectEqual(@as(u64, 1), s.class[5]);
+    try testing.expectEqual(@as(u64, 35), s.bytes_total);
+    try testing.expectEqual(@as(u64, 3_000_000 + 30_000_000 + 2_000_000_000 + 30_000_000_000), s.duration_sum_ns);
+    try testing.expectEqual(@as(u64, 1), s.buckets[0]); // 3ms -> le 0.005
+    try testing.expectEqual(@as(u64, 1), s.buckets[3]); // 30ms -> le 0.05
+    try testing.expectEqual(@as(u64, 1), s.buckets[8]); // 2s -> le 2.5
+    // 30s -> no bucket (>10s), only in total/+Inf
+}
+
+test "metrics: prometheus exposition" {
+    var m = Metrics{};
+    const obs = m.observer();
+    obs.func(obs.context, .{ .method = .GET, .path = "/a", .status = 200, .duration_ns = 3_000_000, .bytes = 10 });
+    obs.func(obs.context, .{ .method = .GET, .path = "/b", .status = 200, .duration_ns = 3_000_000, .bytes = 10 });
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try m.writePrometheus(&w);
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "zax_requests_total{class=\"2xx\"} 2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "zax_request_duration_seconds_bucket{le=\"0.005\"} 2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "zax_request_duration_seconds_bucket{le=\"+Inf\"} 2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "zax_request_duration_seconds_count 2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "zax_response_bytes_total 20") != null);
+}
 
 test "access logger: text format" {
     var buf: [256]u8 = undefined;

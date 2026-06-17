@@ -50,6 +50,8 @@ pub const observe = @import("observe.zig");
 pub const Observer = observe.Observer;
 pub const AccessRecord = observe.AccessRecord;
 pub const AccessLogger = observe.AccessLogger;
+pub const Metrics = observe.Metrics;
+pub const MetricsSnapshot = observe.MetricsSnapshot;
 
 // --- Error model ---
 pub const err = @import("error.zig");
