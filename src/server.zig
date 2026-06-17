@@ -2013,9 +2013,10 @@ test "max_in_flight: default (0) is unbounded — all requests succeed" {
         try testing.expect(std.mem.indexOf(u8, results[i], "200 OK") != null);
         try testing.expect(std.mem.endsWith(u8, results[i], "ok"));
     }
-    // Don't assert exact max_seen — it may be 1..8 depending on scheduling.
-    // Just verify it's nonzero (at least one request ran).
-    try testing.expect(state.max_seen.load(.acquire) >= 1);
+    // Prove the harness genuinely produces concurrency: with no cap and 8
+    // concurrent clients each sleeping 5 ms, at least 2 must overlap.  This
+    // makes the capped test's `<= 2` assertion meaningful by contrast.
+    try testing.expect(state.max_seen.load(.acquire) >= 2);
 
     app.requestShutdown(io);
     loop_fut.await(io);
