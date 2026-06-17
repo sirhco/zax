@@ -1,0 +1,13 @@
+[package]
+name = "axum-bench"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -1,0 +1,6 @@
+# build artifacts
+zax/zig-out/
+zax/.zig-cache/
+axum/target/
+axum/Cargo.lock
+go/go-bench

@@ -1,0 +1,14 @@
+.{
+    .name = .zax_bench_cross,
+    .version = "0.0.0",
+    .fingerprint = 0x2849e6b1bb9de3ce,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zax = .{ .path = "../../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
