@@ -189,7 +189,11 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
 
     // 4. Middleware chain (3 pass-through middlewares wrapping a handler).
     {
-        const mws = [_]FChn.Middleware{ &passThru, &passThru, &passThru };
+        // `var` + escaped address forces the optimizer to treat the
+        // comptime-known middleware slice as opaque, defeating devirtualization
+        // and constant-folding of the whole chain under ReleaseFast.
+        var mws = [_]FChn.Middleware{ &passThru, &passThru, &passThru };
+        std.mem.doNotOptimizeAway(&mws);
         var fctx = FakeCtx{};
         var w: usize = 0;
         while (w < cfg.warmup) : (w += 1) {
@@ -197,6 +201,7 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             var i: usize = 0;
             while (i < iters) : (i += 1) {
                 const r = FChn.run(&mws, &chainHandler, &fctx) catch unreachable;
+                std.mem.doNotOptimizeAway(r);
                 sink +%= r.body.len;
             }
             std.mem.doNotOptimizeAway(sink);
@@ -207,6 +212,7 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             var i: usize = 0;
             while (i < iters) : (i += 1) {
                 const r = FChn.run(&mws, &chainHandler, &fctx) catch unreachable;
+                std.mem.doNotOptimizeAway(r);
                 sink +%= r.body.len;
             }
             const ns = nowNs(io) - t0;
@@ -280,15 +286,19 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
 
     // 7. Path extractor (struct field from a captured param).
     {
-        const params = [_]zax.Param{.{ .name = "id", .value = "42" }};
+        // Rotate the param value per iteration so the parse cannot be hoisted
+        // out of the loop as a constant under ReleaseFast.
+        const ids = [_][]const u8{ "42", "7", "1234", "99" };
         var fbuf: [512]u8 = undefined;
         var w: usize = 0;
         while (w < cfg.warmup) : (w += 1) {
             var sink: usize = 0;
             var i: usize = 0;
             while (i < iters) : (i += 1) {
+                const params = [_]zax.Param{.{ .name = "id", .value = ids[i % ids.len] }};
                 var fba = std.heap.FixedBufferAllocator.init(&fbuf);
                 const p = zax.Path(struct { id: u64 }).fromContext(.{ .params = &params, .arena = fba.allocator() }) catch unreachable;
+                std.mem.doNotOptimizeAway(p);
                 sink +%= p.value.id;
             }
             std.mem.doNotOptimizeAway(sink);
@@ -298,8 +308,10 @@ fn microBenchmarks(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, cfg: Config)
             const t0 = nowNs(io);
             var i: usize = 0;
             while (i < iters) : (i += 1) {
+                const params = [_]zax.Param{.{ .name = "id", .value = ids[i % ids.len] }};
                 var fba = std.heap.FixedBufferAllocator.init(&fbuf);
                 const p = zax.Path(struct { id: u64 }).fromContext(.{ .params = &params, .arena = fba.allocator() }) catch unreachable;
+                std.mem.doNotOptimizeAway(p);
                 sink +%= p.value.id;
             }
             const ns = nowNs(io) - t0;
