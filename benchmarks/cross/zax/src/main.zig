@@ -44,25 +44,28 @@ pub fn main(init: std.process.Init) !void {
     const port: u16 = 8081;
 
     if (use_evented) {
-        // std.Io.Evented on macOS is std.Io.Dispatch (GCD-backed fiber scheduler).
-        // Construction: init() wires the calling stack frame as the "main fiber".
-        // Server code must run inside a fiber spawned via io.async(), because
-        // acceptLoop() calls blocking-async ops (accept, read, write) that require
-        // a fiber context for suspension/resumption.
+        // SPIKE RESULT — std.Io.Evented cannot serve TCP in Zig 0.16, so we
+        // refuse up front instead of attempting it.
         //
-        // NOTE: ev.deinit() is intentionally omitted. Dispatch.deinit() calls
-        // ev.backing_allocator.free(ev.main_loop_stack[0..main_loop_stack_size])
-        // but slicing a [*]align(N)u8 with a comptime-known length yields
-        // *align(N)[N]u8 (size=.one), not []align(N)u8 (size=.slice), so
-        // Allocator.free's comptime assert fires. This is a Zig 0.16 std bug.
-        // For a bench server that runs until SIGKILL the OS reclaims all resources.
-        var ev: std.Io.Evented = undefined;
-        try ev.init(init.gpa, .{});
-        const ev_io = ev.io();
-        const backend = comptime @tagName(@import("builtin").os.tag);
-        std.debug.print("zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, io=evented/" ++ backend ++ ")\n", .{ port, nodelay });
-        var future = ev_io.async(Api.serve, .{ &app, ev_io, .{ .ip4 = .loopback(port) } });
-        try future.await(ev_io);
+        // What was tried (preserved in git history at the first spike commit):
+        // construct std.Io.Evented, run Api.serve inside a fiber via
+        // io.async()/future.await() (the fiber-entry model DOES work). But the
+        // serve aborts: the macOS (Dispatch) and Linux (Uring) backends wire
+        // their net ops (netListenIp/netAccept/netSend/netRead/...) to
+        // `*Unavailable` stubs — only the BSD Kqueue backend implements
+        // listen/accept, and it isn't selected on macOS or Linux. listen()
+        // therefore fails (error.NetworkDown) and the evented runtime aborts
+        // inside the fiber (SIGABRT) rather than returning a catchable error.
+        // zax's Io abstraction is pluggable and correct; std's evented backends
+        // simply lack socket IO. See
+        // docs/superpowers/specs/2026-06-17-evented-io-decision.md.
+        std.debug.print(
+            "ZAX_IO=evented unsupported: std.Io.Evented has no TCP on this platform " ++
+                "in Zig 0.16 (Dispatch/Uring net ops are Unavailable stubs). " ++
+                "See docs/superpowers/specs/2026-06-17-evented-io-decision.md\n",
+            .{},
+        );
+        std.process.exit(1);
     } else {
         std.debug.print("zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, io=threaded)\n", .{ port, nodelay });
         try app.serve(init.io, .{ .ip4 = .loopback(port) });
