@@ -300,6 +300,7 @@ pub fn App(comptime AppState: type) type {
         fn handleConn(self: *Self, io: Io, stream_in: net.Stream) void {
             var stream = stream_in;
             defer stream.close(io);
+            setNoDelay(stream.socket.handle); // disable Nagle: small responses go out immediately
 
             const read_buf = self.gpa.alloc(u8, self.opts.read_buffer_size) catch return;
             defer self.gpa.free(read_buf);
@@ -478,6 +479,19 @@ fn allowHeader(arena: std.mem.Allocator, allowed: router.MethodSet) []const u8 {
 fn msTimeout(ms_val: u32) Io.Timeout {
     if (ms_val == 0) return .none;
     return .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(@intCast(ms_val)), .clock = .awake } };
+}
+
+/// Disable Nagle's algorithm on a connection socket so a small response is sent
+/// immediately rather than held waiting for an ACK the peer may delay (~40 ms).
+/// Standard for HTTP servers. Best-effort: a socket-option failure must never
+/// break the connection.
+fn setNoDelay(handle: net.Socket.Handle) void {
+    std.posix.setsockopt(
+        handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        &std.mem.toBytes(@as(c_int, 1)),
+    ) catch {};
 }
 
 fn nowNs(io: Io) i96 {
@@ -1795,6 +1809,18 @@ test "validRid accepts safe tokens, rejects unsafe" {
     try testing.expect(!validRid("a\r\nb"));   // CRLF
     try testing.expect(!validRid("a/b"));      // slash
     try testing.expect(!validRid("x" ** 129)); // too long
+}
+
+test "setNoDelay enables TCP_NODELAY on a socket" {
+    const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    try testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    setNoDelay(fd);
+    var val: c_int = 0;
+    var len: std.posix.socklen_t = @sizeOf(c_int);
+    const rc = std.c.getsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &val, &len);
+    try testing.expect(rc == 0);
+    try testing.expect(val != 0);
 }
 
 test "request id: generated, echoed, and exposed to handler" {
