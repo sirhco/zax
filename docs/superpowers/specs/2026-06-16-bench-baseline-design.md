@@ -26,8 +26,10 @@ compares the current run to a committed baseline and exits nonzero on regression
    redirectable snapshot). Keys: micros by their report name (e.g. `parseHead`,
    `radix wildcard`); memory as `mem.<scenario>`; throughput as `thr.<scenario>`.
 3. **`--check`** runs the benchmark, then for each GATED metric looks up its key
-   in the committed baseline and flags a regression when `current > baseline ×
-   (1 + tolerance)` (lower is better for both ns/op and bytes/req). It prints
+   in the committed baseline and flags a regression when `current - baseline >
+   baseline × tolerance` (equivalent to `current > baseline × (1 + tolerance)`
+   but avoids float-rounding at the exact boundary; lower is better for both
+   ns/op and bytes/req). It prints
    `OK`/`FAIL  <key>: current vs baseline (+x%)` per gated metric, a summary, and
    `std.process.exit(1)` if any regressed (else exit 0). Missing baseline keys
    are reported as `(no baseline)` and never fail.
@@ -70,8 +72,9 @@ zig build bench [-- --json | --check [--tolerance F]]
   the float flag (`--tolerance`, parse f64, bad → `BadValue`); and the existing
   usize flags. Unknown → `UnknownFlag`; missing value for value-flags →
   `MissingValue`.
-- `pub fn regressed(baseline: f64, current: f64, tol: f64) bool` → `current >
-  baseline * (1 + tol)`.
+- `pub fn regressed(baseline: f64, current: f64, tol: f64) bool` → `current -
+  baseline > baseline * tol` (algebraically `current > baseline * (1 + tol)`, but
+  this form avoids f64 rounding flagging an exact +tol as a regression).
 - `pub fn pctDelta(baseline: f64, current: f64) f64` → `(current - baseline) /
   baseline * 100` (0 if baseline == 0).
 - Tests for all of the above.
