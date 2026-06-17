@@ -104,10 +104,21 @@ pub const Poller = struct {
     }
 
     /// Block until events are ready or `timeout_ms` elapses.
-    /// Returns the number of events written into `events`.
+    /// Returns the number of events written into `events` (0..events.len).
+    /// Never returns a sentinel: EINTR and other errors are mapped to 0 so the
+    /// caller's `for (events[0..n])` loop is always in-bounds.
     pub fn wait(self: *Poller, events: []linux.epoll_event, timeout_ms: i32) usize {
         if (builtin.os.tag != .linux) unreachable;
-        return linux.epoll_wait(self.epfd, events.ptr, @intCast(events.len), timeout_ms);
+        const rc = linux.epoll_wait(self.epfd, events.ptr, @intCast(events.len), timeout_ms);
+        const e = linux.errno(rc);
+        switch (e) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => return 0, // interrupted by signal — benign, loop will retry
+            else => {
+                std.log.warn("epoll_wait: unexpected errno {}", .{e});
+                return 0;
+            },
+        }
     }
 };
 
