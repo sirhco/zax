@@ -160,6 +160,37 @@ pub fn main(init: std.process.Init) !void {
 > `0` for streamed responses (`Response.stream` / `Response.sse`) because the
 > streamed body bytes are not counted.
 
+### Request IDs
+
+Enable per-request correlation IDs with `.{ .request_id = true }`:
+
+```zig
+var app = try zax.App(*const Db).init(init.gpa, &db, .{ .request_id = true });
+```
+
+When enabled, each request is assigned an ID: a validated incoming `x-request-id`
+header is accepted if it is 1–128 characters with charset `[A-Za-z0-9._-]`; an
+absent or unsafe header causes a 16-hex-digit ID to be generated instead (per-app
+atomic counter). The ID is:
+
+- accessible in handlers via the `zax.RequestId` extractor (`rid.value`) or
+  directly as `ctx.request_id`;
+- echoed on the response as the `x-request-id` header;
+- included in access-log records (`id=…` text / `"request_id":"…"` JSON) when an
+  `AccessLogger` is registered.
+
+Incoming IDs are validated against a safe charset before being echoed or logged,
+preventing CRLF response-header injection and log-injection attacks.
+
+```zig
+fn echoId(rid: zax.RequestId, a: zax.Alloc) !zax.Response {
+    const body = try std.fmt.allocPrint(a.value, "request id: {s}\n", .{rid.value});
+    return zax.Response.text(body);
+}
+```
+
+Off by default — zero overhead and identical behavior when disabled.
+
 ### Metrics
 
 `zax.Metrics` is a built-in observer that aggregates request outcomes into

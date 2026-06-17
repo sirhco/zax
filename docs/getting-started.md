@@ -174,6 +174,12 @@ try app.observe(logger.observer());
 
 `bytes` is 0 for streamed responses.
 
+Enable per-request correlation IDs with `.{ .request_id = true }` in `init`. Each
+request then gets a validated incoming `x-request-id` header or a generated
+16-hex-digit ID; it is echoed on the response and included in access-log records.
+Read it in a handler via the `zax.RequestId` extractor (`rid.value`) or
+`ctx.request_id`.
+
 `zax.Metrics` is a second built-in observer — wire it with
 `try app.observe(metrics.observer())`. It tracks total requests,
 per-status-class counters (1xx–5xx), total response bytes, and a
