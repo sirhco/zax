@@ -36,12 +36,28 @@ pub fn main(init: std.process.Init) !void {
     else
         0;
 
+    // Keep-alive knob (E2): ZAX_KEEPALIVE=0 disables HTTP keep-alive so each
+    // request uses a fresh connection. Default (unset / any other value) = on.
+    const keep_alive = if (init.environ_map.get("ZAX_KEEPALIVE")) |v| !std.mem.eql(u8, v, "0") else true;
+
+    // Thread-count knob (E4): ZAX_THREADS=N constructs a dedicated Threaded I/O
+    // backend with async_limit=N instead of reusing init.io. N=0 or unset → use
+    // init.io unchanged (today's default behavior).
+    const threads_n: usize = if (init.environ_map.get("ZAX_THREADS")) |v|
+        std.fmt.parseUnsigned(usize, v, 10) catch 0
+    else
+        0;
+
     // IO backend selector: ZAX_IO=evented -> std.Io.Evented (GCD on macOS, io_uring on Linux)
     // Anything else (incl. unset) -> init.io (std.Io.Threaded, one thread per connection).
     const use_evented = if (init.environ_map.get("ZAX_IO")) |v| std.mem.eql(u8, v, "evented") else false;
 
     var db = Db{};
-    var app = try Api.init(init.gpa, &db, .{ .tcp_nodelay = nodelay, .max_in_flight = max_in_flight });
+    var app = try Api.init(init.gpa, &db, .{
+        .tcp_nodelay = nodelay,
+        .max_in_flight = max_in_flight,
+        .keep_alive = keep_alive,
+    });
     defer app.deinit();
 
     try app.get("/", hello);
@@ -73,8 +89,22 @@ pub fn main(init: std.process.Init) !void {
             .{},
         );
         std.process.exit(1);
+    } else if (threads_n > 0) {
+        // E4: override the thread/async_limit count with a dedicated Threaded backend.
+        var threaded = std.Io.Threaded.init(init.gpa, .{
+            .async_limit = std.Io.Limit.limited(threads_n),
+        });
+        defer threaded.deinit();
+        std.debug.print(
+            "zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, max_in_flight={d}, keep_alive={}, threads={d}, trace={})\n",
+            .{ port, nodelay, max_in_flight, keep_alive, threads_n, zax.trace_latency },
+        );
+        try app.serve(threaded.io(), .{ .ip4 = .loopback(port) });
     } else {
-        std.debug.print("zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, max_in_flight={d}, io=threaded)\n", .{ port, nodelay, max_in_flight });
+        std.debug.print(
+            "zax bench server on http://127.0.0.1:{d} (tcp_nodelay={}, max_in_flight={d}, keep_alive={}, threads=init.io, trace={})\n",
+            .{ port, nodelay, max_in_flight, keep_alive, zax.trace_latency },
+        );
         try app.serve(init.io, .{ .ip4 = .loopback(port) });
     }
 }

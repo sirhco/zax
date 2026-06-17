@@ -12,6 +12,34 @@
 #                                    # cores (Linux/taskset) so they don't fight
 #                                    # for CPU — isolates the server's real tail
 #                                    # latency from same-host oversubscription
+#
+# ── Latency-trace experiments (spike/latency-trace branch) ──────────────────
+#
+# Build the zax bench server with phase timers enabled (E1/E2/E4/E5):
+#   ( cd zax && zig build -Dtrace-latency=true -Doptimize=ReleaseFast )
+#
+# Run it manually and kill with Ctrl-C / SIGTERM; the phase summary is printed
+# by requestShutdown when the server is stopped via zax.App.requestShutdown().
+# NOTE: run.sh itself calls kill on the PID (SIGTERM); the bench server does not
+# install a signal handler that calls requestShutdown, so the phase dump requires
+# the server be stopped through the API (or a SIGINT handler added to main.zig).
+# Until then, run the traced server manually to capture the dump:
+#   ./zax/zig-out/bin/zax-bench   # Ctrl-C to stop and see the phase summary
+#
+# Experiment knobs (set before starting the server):
+#   ZAX_KEEPALIVE=0          E2 — disable HTTP keep-alive (each request uses a
+#                                 fresh connection); does the 35ms tail vanish?
+#   ZAX_THREADS=N            E4 — override async_limit to N worker threads
+#                                 instead of the default (cpu_count - 1); does
+#                                 the tail move with fewer/more threads?
+#
+# Examples:
+#   ZAX_KEEPALIVE=0 ./zax/zig-out/bin/zax-bench   # E2: no keep-alive
+#   ZAX_THREADS=1   ./zax/zig-out/bin/zax-bench   # E4: single worker thread
+#   ZAX_THREADS=8   ./zax/zig-out/bin/zax-bench   # E4: 8 worker threads
+#
+# The existing ZAX_NODELAY and ZAX_MAX_INFLIGHT knobs remain unchanged.
+# ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 cd "$(dirname "$0")"
 
