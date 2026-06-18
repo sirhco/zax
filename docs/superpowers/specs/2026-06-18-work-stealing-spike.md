@@ -90,8 +90,43 @@ quiescent point, not concurrent access, so the single-owner invariant holds:
   `max`); drop migrated deadlines. The prototype `max` is a **best-case lower bound** — a negative
   result kills stealing cheaply; a positive result still leaves hard production work unproven.
 
-## Results
-_(pending gate — paste Run A/B/C tables + vmstat `st` here)_
+## Results — gate run 2026-06-18 (Chris, 64-vCPU cloud Linux VM, STEAL_CORES=2, single trial)
+
+`static GET /` row per run (full tables in /tmp/steal-{A,B,C}.txt):
+
+| run | induction | zax-ev req/s | zax-ev p50 | zax-ev p99 | zax-ev p99.9 | zax-ev MAX | axum MAX | httpz MAX |
+|-----|-----------|-------------:|-----------:|-----------:|-------------:|-----------:|---------:|----------:|
+| A | none (baseline) | 714009 | 0.076 | 0.225 | **0.438** | **34.06** | 15.19 | 14.22 |
+| B | STEAL=cpuset (4 workers / 2 cores) | 137381 | 0.173 | 9.92 | 20.39 | 36.82 | 15.11¹ | 7.39¹ |
+| C | STEAL=hog (cpuset + core-0 hog) | 97291 | 0.152 | 16.48 | 28.29 | 42.13 | 16.01¹ | 9.57¹ |
+
+¹ axum/go/httpz are NOT pinned by STEAL (it applies the cpuset to the zax passes only), so they ran on
+all 64 cores in B/C — their columns are NOT comparable to zax-ev under steal. Only zax A-vs-B/C is valid.
+
+### Analysis — the cpuset/hog induction does NOT reproduce the target signature
+- **Production vCPU-steal signature** (the thing we want to fix): p99.9 *intact*, an isolated worst-case
+  MAX spike, with *idle capacity on other cores* that a thief could use. Baseline **Run A already
+  exhibits it**: p99.9 0.438 ms (best of all four) but MAX 34.06 ms (~2.3× axum/httpz ~15 ms), produced
+  by the shared VM's background hypervisor steal — no induction required.
+- **What cpuset/hog actually did**: cramming 4 workers onto 2 cores is *global CPU oversubscription*, not
+  isolated steal. The whole distribution shifted up (p99 0.22→9.9→16.5 ms, p99.9 0.44→20→28 ms) and
+  throughput collapsed (714k→137k→97k). MAX barely moved (34→42) because it was already steal-dominated
+  at baseline. This is the already-studied oversubscription regime (cap A/B negative result,
+  `2026-06-17-latency-stall-findings.md`), not the work-stealing target.
+- **Why cpuset can't isolate it**: it removes the idle capacity (only 2 server cores), so there is
+  nothing to steal *to*. And SIGSTOP can't freeze a single worker thread (job-control signals are
+  process-wide on Linux). Faithfully isolating one stalled worker while others stay idle-capable would
+  need per-worker CPU-affinity pinning (pin worker[i]→core[i], then hog one core) — reactor-side
+  build-gated `chaos` code, not a shell knob.
+
+### Read on the weak spot's magnitude
+At 714k req/s × 30 s ≈ 21M requests, the 34 ms figure is the **single worst sample** (p99.9 is 0.438 ms,
+best in class). The "weak spot" is a ~1-in-21M tail event ~2.3× the peers' worst sample. Invasive
+work-stealing (live fd migration across pollers + cross-worker sync, breaking the zero-sync
+shared-nothing model) to shave that single sample is a marginal return.
+
+## Verdict
+_(pending Chris decision — build prototype for hard numbers vs document as NOT-WORTH-IT; see below)_
 
 ## Verdict
 _(pending)_
