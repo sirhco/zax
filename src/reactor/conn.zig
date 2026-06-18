@@ -57,6 +57,11 @@ pub const State = enum {
 pub const StepResult = enum {
     want_read,
     want_write,
+    /// Pull-stream producer returned chunk(0) and stream_repoll_ms > 0.
+    /// Worker must: disarm WRITE, keep READ armed (peer-close detection via HUP),
+    /// and insert the timer for `deadline_ns` (the repoll deadline).
+    /// On timer fire, `onDeadline` re-drives the conn into `.writing`.
+    want_stream_repoll,
     done_close,
 };
 
@@ -189,6 +194,10 @@ pub const Conn = struct {
     /// Idle keep-alive deadline in ms. Applied when entering keep_alive_idle.
     /// Mirrors Options.idle_timeout_ms. 0 = no deadline.
     idle_timeout_ms: u32 = 60_000,
+    /// Backoff before re-polling a not-ready pull-stream producer (chunk(0) returned).
+    /// 0 = disabled — fall back to old `.want_write` behavior (busy-spin).
+    /// Default 5 ms is a constant backoff; future: exponential backoff capped at idle_timeout.
+    stream_repoll_ms: u32 = 5,
     /// Absolute monotonic deadline in nanoseconds for the current state.
     /// Set by step() on state entry; read by the worker's timer wheel via
     /// `conn.deadline_ns`. Sentinel `no_deadline` means no active deadline.
@@ -519,7 +528,15 @@ pub const Conn = struct {
                                     self.w_off = 0;
                                     self.w_len = n;
                                     self.deadline_ns = no_deadline; // re-arm per-chunk stall deadline
-                                    if (n == 0) return .want_write; // empty chunk — yield to event loop
+                                    if (n == 0) {
+                                        // Producer not ready yet (sparse stream, e.g. SSE).
+                                        if (self.stream_repoll_ms == 0) return .want_write; // escape hatch: old behavior
+                                        self.w_off = 0;
+                                        self.w_len = 0;
+                                        self.state = .streaming; // parked marker: re-drive on timer fire
+                                        self.deadline_ns = monotonicNow() + @as(i96, self.stream_repoll_ms) * 1_000_000;
+                                        return .want_stream_repoll;
+                                    }
                                 },
                                 .done => {
                                     self.pull_streamer = null;
@@ -554,10 +571,18 @@ pub const Conn = struct {
                                 switch (ps.next(self.write_buf)) {
                                     .chunk => |n| {
                                         if (n == 0) {
-                                            // Empty chunk — yield to event loop; producer not ready yet.
+                                            // Producer not ready yet (sparse stream, e.g. SSE).
+                                            if (self.stream_repoll_ms == 0) {
+                                                // Escape hatch: old busy-spin behavior.
+                                                self.w_off = 0;
+                                                self.w_len = 0;
+                                                return .want_write;
+                                            }
                                             self.w_off = 0;
                                             self.w_len = 0;
-                                            return .want_write;
+                                            self.state = .streaming; // parked marker: re-drive on timer fire
+                                            self.deadline_ns = monotonicNow() + @as(i96, self.stream_repoll_ms) * 1_000_000;
+                                            return .want_stream_repoll;
                                         }
                                         self.w_off = 0;
                                         self.w_len = n;
@@ -620,11 +645,11 @@ pub const Conn = struct {
                 },
 
                 .streaming => {
-                    // Streaming is driven via .writing; this arm is unreachable in normal operation.
-                    // If somehow entered, treat as close.
-                    self.pull_streamer = null;
-                    self.state = .closing;
-                    return .done_close;
+                    // Readiness re-poll fired (or spurious re-drive): resume the write pump.
+                    // State was set to .streaming when chunk(0) was returned and stream_repoll_ms > 0.
+                    // w_len == 0, so the .writing arm's guard will call next() again.
+                    self.state = .writing;
+                    continue; // falls into the .writing arm → w_len==0 guard → calls next() again
                 },
 
                 .dispatching => {
@@ -667,10 +692,10 @@ pub const Conn = struct {
                 return .done_close;
             },
             .streaming => {
-                // Peer stalled mid-stream: silently close.
-                self.pull_streamer = null;
-                self.state = .closing;
-                return .done_close;
+                // Readiness re-poll deadline fired: resume the write pump.
+                // `deadline_ns` was already set to `no_deadline` at the top of onDeadline.
+                self.state = .writing; // resume pump; w_len==0 → next() called again
+                return .want_write; // routes through worker's existing expiredCb .want_write branch
             },
             .keep_alive_idle => {
                 self.state = .closing;
@@ -1486,4 +1511,357 @@ test "conn: pull streamer — partial write mid-chunk advances w_off, no bytes l
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "hello world"));
     // Total written = head + full 11-byte chunk.
     try testing.expectEqual(head_size + 11, written.len);
+}
+
+// ---------------------------------------------------------------------------
+// Task 7 (sparse-SSE) tests — stream_repoll_ms / want_stream_repoll
+// ---------------------------------------------------------------------------
+
+/// A pull streamer that returns chunk(0) `zeros_before` times, then a real chunk, then done.
+/// Tracks its `next` call count for busy-loop detection.
+const SparseCtx = struct {
+    zeros_before: usize,
+    payload: []const u8,
+    calls: usize = 0,
+    real_chunk_served: bool = false,
+    done: bool = false,
+
+    fn next(c: *SparseCtx, buf: []u8) response_mod.PullResult {
+        c.calls += 1;
+        if (!c.real_chunk_served and c.calls > c.zeros_before) {
+            c.real_chunk_served = true;
+            const n = @min(c.payload.len, buf.len);
+            @memcpy(buf[0..n], c.payload[0..n]);
+            return .{ .chunk = n };
+        }
+        if (c.real_chunk_served and !c.done) {
+            c.done = true;
+            return .done;
+        }
+        // Return chunk(0) — producer not ready.
+        return .{ .chunk = 0 };
+    }
+};
+
+test "conn: sparse stream — chunk(0) parks, no synchronous re-call" {
+    // Test 1: dispatch sparse streamer (chunk(0) then chunk("data") then done).
+    // One step after head is pumped → result == .want_stream_repoll, state == .streaming,
+    // deadline_ns != no_deadline, and ctx.calls == 1 (no busy loop inside one step).
+    const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = SparseCtx{ .zeros_before = 1, .payload = "data" };
+
+    const SparseDispatch = struct {
+        p: *SparseCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(SparseCtx, s.p, SparseCtx.next, "text/event-stream");
+        }
+    };
+    var sd = SparseDispatch{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = SparseDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    c.stream_repoll_ms = 5;
+    const t = ft.transport();
+
+    // Drive: reads request, dispatches, writes head, calls next() once → chunk(0) → park.
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.want_stream_repoll, result);
+    try testing.expectEqual(State.streaming, c.state);
+    try testing.expect(c.deadline_ns != no_deadline);
+    // next() called exactly once — no busy loop.
+    try testing.expectEqual(@as(usize, 1), ctx.calls);
+}
+
+test "conn: sparse stream — repoll re-drives and flushes data" {
+    // Test 2: from parked, call onDeadline() → want_write + state==.writing;
+    // then step() → next count increments, "data" appears in written.
+    const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = SparseCtx{ .zeros_before = 1, .payload = "data" };
+
+    const SparseDispatch2 = struct {
+        p: *SparseCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(SparseCtx, s.p, SparseCtx.next, "text/event-stream");
+        }
+    };
+    var sd = SparseDispatch2{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = SparseDispatch2.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    c.stream_repoll_ms = 5;
+    const t = ft.transport();
+
+    // Park the conn.
+    const r1 = c.step(t, d);
+    try testing.expectEqual(StepResult.want_stream_repoll, r1);
+    try testing.expectEqual(@as(usize, 1), ctx.calls);
+
+    // Simulate timer fire.
+    const r2 = c.onDeadline();
+    try testing.expectEqual(StepResult.want_write, r2);
+    try testing.expectEqual(State.writing, c.state);
+
+    // Re-drive: next() returns "data", then done.
+    const r3 = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, r3);
+    try testing.expect(ctx.calls > 1);
+    const written = ft.written.items;
+    try testing.expect(std.mem.indexOf(u8, written, "data") != null);
+}
+
+test "conn: sparse stream — chunk(0) then chunk(n) then done closes clean" {
+    // Test 3: full drive; payload present exactly once; served == 1.
+    const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = SparseCtx{ .zeros_before = 1, .payload = "hello" };
+
+    const SparseDispatch3 = struct {
+        p: *SparseCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(SparseCtx, s.p, SparseCtx.next, "text/event-stream");
+        }
+    };
+    var sd = SparseDispatch3{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = SparseDispatch3.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    c.stream_repoll_ms = 5;
+    const t = ft.transport();
+
+    // Step 1: park.
+    const r1 = c.step(t, d);
+    try testing.expectEqual(StepResult.want_stream_repoll, r1);
+    // Simulate timer fire → re-drive.
+    _ = c.onDeadline();
+    // Step 2: real chunk + done.
+    const r2 = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, r2);
+
+    const written = ft.written.items;
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "hello"));
+    try testing.expectEqual(@as(usize, 1), c.served);
+    try testing.expect(c.pull_streamer == null);
+}
+
+test "conn: sparse stream — chunk(0) then done closes clean, no extra body bytes" {
+    // Test 4: sparse ctx returns chunk(0) then done.
+    // park → onDeadline → step → done_close; no extra body bytes; pull_streamer == null.
+    const ZeroThenDoneCtx = struct {
+        calls: usize = 0,
+        fn next(c: *@This(), buf: []u8) response_mod.PullResult {
+            _ = buf;
+            c.calls += 1;
+            if (c.calls == 1) return .{ .chunk = 0 };
+            return .done;
+        }
+    };
+
+    const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = ZeroThenDoneCtx{};
+
+    const ZeroDispatch = struct {
+        p: *ZeroThenDoneCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(ZeroThenDoneCtx, s.p, ZeroThenDoneCtx.next, "text/event-stream");
+        }
+    };
+    var sd = ZeroDispatch{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = ZeroDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    c.stream_repoll_ms = 5;
+    const t = ft.transport();
+
+    // Step 1: park on chunk(0).
+    const r1 = c.step(t, d);
+    try testing.expectEqual(StepResult.want_stream_repoll, r1);
+    try testing.expectEqual(State.streaming, c.state);
+
+    // Simulate timer fire.
+    const r2 = c.onDeadline();
+    try testing.expectEqual(StepResult.want_write, r2);
+
+    // Step 2: next() returns done → done_close.
+    const r3 = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, r3);
+    try testing.expect(c.pull_streamer == null);
+    // No body bytes beyond head: head has no payload, and done was returned without chunk.
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200"));
+}
+
+test "conn: sparse stream — knob=0 fallback, chunk(0) returns want_write" {
+    // Test 5: with stream_repoll_ms == 0, chunk(0) falls back to old .want_write behavior.
+    const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = SparseCtx{ .zeros_before = 1, .payload = "data" };
+
+    const SparseDispatch5 = struct {
+        p: *SparseCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(SparseCtx, s.p, SparseCtx.next, "text/event-stream");
+        }
+    };
+    var sd = SparseDispatch5{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = SparseDispatch5.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    c.stream_repoll_ms = 0; // disabled: fallback to old behavior
+    const t = ft.transport();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.want_write, result);
+    // State must NOT be .streaming — stays .writing (no parking when knob is off).
+    try testing.expectEqual(State.writing, c.state);
+    // The repoll deadline must NOT have been set (no stream_repoll deadline stamp).
+    // (The stall deadline from the .writing entry arm may be set; that is fine.)
+    // Key invariant: state is .writing, not .streaming.
+}
+
+test "conn: sparse stream — both park sites fire want_stream_repoll" {
+    // Test 6a: producer returns chunk(0) on the first next after head (w_len==0 guard path).
+    // Test 6b: producer returns real chunk, write, then chunk(0) on refill (.wrote_all path).
+    // Both assert .want_stream_repoll.
+
+    // --- 6a: w_len==0 guard path ---
+    {
+        const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+        var ft = FakeTransport.init(testing.allocator, &.{raw});
+        defer ft.deinit();
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        // zeros_before=1 → first next() returns chunk(0) → w_len==0 guard path.
+        var ctx = SparseCtx{ .zeros_before = 1, .payload = "x" };
+
+        const D6a = struct {
+            p: *SparseCtx,
+            fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+                _ = req; _ = ar;
+                const s: *@This() = @ptrCast(@alignCast(self_ctx));
+                return Response.streamPull(SparseCtx, s.p, SparseCtx.next, "text/plain");
+            }
+        };
+        var sd = D6a{ .p = &ctx };
+        const d = Dispatcher{ .ctx = &sd, .dispatchFn = D6a.dispatch };
+
+        var c = Conn.init(&rbuf, &wbuf, &arena);
+        c.keep_alive = false;
+        c.stream_repoll_ms = 5;
+        const t = ft.transport();
+
+        const r = c.step(t, d);
+        try testing.expectEqual(StepResult.want_stream_repoll, r);
+    }
+
+    // --- 6b: .wrote_all refill path ---
+    // Producer: first next() returns a real chunk ("abc"), then chunk(0) on the second call.
+    {
+        const WroteAllSparseCtx = struct {
+            calls: usize = 0,
+            fn next(c: *@This(), buf: []u8) response_mod.PullResult {
+                c.calls += 1;
+                if (c.calls == 1) {
+                    const payload = "abc";
+                    @memcpy(buf[0..payload.len], payload);
+                    return .{ .chunk = payload.len };
+                }
+                if (c.calls == 2) return .{ .chunk = 0 };
+                return .done;
+            }
+        };
+
+        const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+        var ft = FakeTransport.init(testing.allocator, &.{raw});
+        defer ft.deinit();
+
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        var ctx = WroteAllSparseCtx{};
+
+        const D6b = struct {
+            p: *WroteAllSparseCtx,
+            fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+                _ = req; _ = ar;
+                const s: *@This() = @ptrCast(@alignCast(self_ctx));
+                return Response.streamPull(WroteAllSparseCtx, s.p, WroteAllSparseCtx.next, "text/plain");
+            }
+        };
+        var sd = D6b{ .p = &ctx };
+        const d = Dispatcher{ .ctx = &sd, .dispatchFn = D6b.dispatch };
+
+        var c = Conn.init(&rbuf, &wbuf, &arena);
+        c.keep_alive = false;
+        c.stream_repoll_ms = 5;
+        const t = ft.transport();
+
+        // Drive: reads request, writes head + "abc" chunk in one step,
+        // then .wrote_all refill calls next() → chunk(0) → park.
+        var result: StepResult = undefined;
+        for (0..10) |_| {
+            result = c.step(t, d);
+            if (result == .want_stream_repoll or result == .done_close) break;
+        }
+        try testing.expectEqual(StepResult.want_stream_repoll, result);
+        try testing.expectEqual(State.streaming, c.state);
+    }
 }

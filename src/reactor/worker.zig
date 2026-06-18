@@ -541,6 +541,20 @@ pub const Worker = struct {
                     self.timer.remove(slot_idx);
                 }
             },
+            .want_stream_repoll => {
+                // Producer returned chunk(0) — not ready yet (e.g. sparse SSE stream).
+                // Disarm WRITE to stop busy-spin; KEEP READ armed so a peer disconnect
+                // during a parked stream is reaped (RDHUP/EOF → hup → closeSlot).
+                self.poller.mod(fd, @intCast(slot_idx), true, false) catch {
+                    self.closeSlot(slot_idx, fd);
+                    return;
+                };
+                if (c.deadline_ns != no_deadline) {
+                    self.timer.insert(slot_idx, c.deadline_ns);
+                } else {
+                    self.timer.remove(slot_idx);
+                }
+            },
             .done_close => {
                 self.closeSlot(slot_idx, fd);
             },
@@ -707,6 +721,18 @@ fn expiredCb(slot_idx: usize) void {
             w.poller.mod(fd, @intCast(slot_idx), true, false) catch {
                 w.closeSlot(slot_idx, fd);
             };
+        },
+        .want_stream_repoll => {
+            // onDeadline for .streaming returns .want_write, not .want_stream_repoll.
+            // This branch is unreachable in practice but required by the exhaustive switch.
+            // Treat as another park: keep read armed, re-insert the timer.
+            w.poller.mod(fd, @intCast(slot_idx), true, false) catch {
+                w.closeSlot(slot_idx, fd);
+                return;
+            };
+            if (slot.conn.deadline_ns != no_deadline) {
+                w.timer.insert(slot_idx, slot.conn.deadline_ns);
+            }
         },
     }
 }
