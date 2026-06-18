@@ -162,8 +162,9 @@ pub const Options = struct {
     max_in_flight: usize = 0,
 };
 
-/// Options for the epoll-based evented backend (`serveEvented`).
-/// Linux only; on other platforms `serveEvented` returns `error.EventedUnsupported`.
+/// Options for the evented backend (`serveEvented`).
+/// Supported on Linux (epoll) and macOS/BSD (kqueue).
+/// Returns `error.EventedUnsupported` only on truly unsupported platforms (Windows, wasm).
 pub const EventedOptions = struct {
     /// Number of worker threads. 0 → auto-detect via `std.Thread.getCpuCount()`.
     /// On Linux, `getCpuCount` calls `sched_getaffinity(0)` and counts set bits,
@@ -424,7 +425,14 @@ pub fn App(comptime AppState: type) type {
             OutOfMemory,
             Unexpected,
         }!void {
-            if (comptime builtin.os.tag != .linux) return error.EventedUnsupported;
+            // Supported on Linux (epoll) and macOS/BSD (kqueue).
+            // Unsupported on Windows and wasm — no epoll/kqueue there.
+            const reactor_supported = comptime switch (builtin.os.tag) {
+                .linux, .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit,
+                .freebsd, .dragonfly, .netbsd, .openbsd => true,
+                else => false,
+            };
+            if (comptime !reactor_supported) return error.EventedUnsupported;
 
             // getCpuCount() on Linux calls sched_getaffinity(0) — already respects
             // taskset / cgroup cpuset masks, so this is never oversubscribed.
@@ -2340,13 +2348,138 @@ test "max_in_flight: default (0) is unbounded — all requests succeed" {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-platform socket helpers for serveEvented tests
+// (std.posix lacks socket/connect/close in Zig 0.16; use linux.* or std.c.*)
+// ---------------------------------------------------------------------------
+
+/// True when the evented reactor is available on this platform.
+const evented_supported = switch (builtin.os.tag) {
+    .linux, .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit,
+    .freebsd, .dragonfly, .netbsd, .openbsd => true,
+    else => false,
+};
+
+/// Create a blocking TCP socket.  Returns fd; caller must sev_closeFd.
+fn sevSocket() !i32 {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.SocketFailed;
+        return @intCast(rc);
+    } else {
+        const rc = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (rc < 0) return error.SocketFailed;
+        return rc;
+    }
+}
+
+/// Close a socket fd.
+fn sevCloseFd(fd: i32) void {
+    if (builtin.os.tag == .linux) {
+        _ = std.os.linux.close(@intCast(fd));
+    } else {
+        _ = std.c.close(fd);
+    }
+}
+
+/// Connect fd to localhost:port (blocking).  Returns false on failure.
+fn sevConnect(fd: i32, port: u16) bool {
+    var sa_in = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+        .zero = [_]u8{0} ** 8,
+    };
+    if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.connect(@intCast(fd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
+        return std.os.linux.errno(rc) == .SUCCESS;
+    } else {
+        const rc = std.c.connect(fd, @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
+        return rc == 0;
+    }
+}
+
+/// Sleep for `ms` milliseconds (cross-platform).
+fn sevSleep(ms: u64) void {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const ts = linux.timespec{
+            .sec = @intCast(ms / 1000),
+            .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+        };
+        _ = linux.nanosleep(&ts, null);
+    } else {
+        const ts = std.c.timespec{
+            .sec = @intCast(ms / 1000),
+            .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+        };
+        _ = std.c.nanosleep(&ts, null);
+    }
+}
+
+/// Write all bytes of `data` to `fd`.
+fn sevWrite(fd: i32, data: []const u8) !void {
+    var sent: usize = 0;
+    while (sent < data.len) {
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(std.os.linux.write(@intCast(fd), data[sent..].ptr, data.len - sent))
+        else
+            std.c.write(fd, data[sent..].ptr, data.len - sent);
+        if (n <= 0) return error.SendFailed;
+        sent += @intCast(n);
+    }
+}
+
+/// Read bytes from a blocking `fd` into `buf` until a complete HTTP response.
+fn sevRecvFull(fd: i32, buf: []u8) []u8 {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(std.os.linux.read(@intCast(fd), buf[total..].ptr, buf.len - total))
+        else
+            std.c.read(fd, buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |sep| {
+            if (std.mem.indexOf(u8, buf[0 .. sep + 4], "content-length: ")) |cl_start| {
+                const after = buf[cl_start + "content-length: ".len .. sep + 4];
+                const end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
+                const clen = std.fmt.parseInt(usize, after[0..end], 10) catch 0;
+                if (total - (sep + 4) >= clen) break;
+            } else break;
+        }
+    }
+    return buf[0..total];
+}
+
+/// Poll until localhost:port accepts a connection (up to max_attempts * 10ms).
+fn sevWaitListening(port: u16, max_attempts: usize) void {
+    var i: usize = 0;
+    while (i < max_attempts) : (i += 1) {
+        sevSleep(10);
+        const tfd = sevSocket() catch continue;
+        if (sevConnect(tfd, port)) {
+            sevCloseFd(tfd);
+            break;
+        }
+        sevCloseFd(tfd);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // serveEvented tests
 // ---------------------------------------------------------------------------
 
 test "serveEvented: returns EventedUnsupported on non-Linux" {
-    // This test runs on every platform. On Linux it self-skips (the path would
-    // actually start the evented loop). On macOS/Windows/etc it asserts the error.
-    if (builtin.os.tag == .linux) return error.SkipZigTest;
+    // This test only runs on platforms where the reactor is unsupported
+    // (Windows, wasm). On Linux and macOS/BSD the reactor is supported and
+    // serveEvented would actually start — so we skip there.
+    const reactor_supported = switch (builtin.os.tag) {
+        .linux, .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit,
+        .freebsd, .dragonfly, .netbsd, .openbsd => true,
+        else => false,
+    };
+    if (reactor_supported) return error.SkipZigTest;
 
     var threaded = Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -2361,28 +2494,19 @@ test "serveEvented: returns EventedUnsupported on non-Linux" {
 }
 
 test "serveEvented: 2-worker integration — keep-alive requests across 3 routes" {
-    // Linux-only integration test. Self-skips on macOS.
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // Runs on Linux (epoll) and macOS/BSD (kqueue). Skip on unsupported platforms.
+    if (!evented_supported) return error.SkipZigTest;
 
-    const linux = std.os.linux;
-
-    // Build the app with 3 routes.
     var db = Db{ .msg = "hello" };
     var app = try TestApp.init(testing.allocator, &db, .{});
     defer app.deinit();
     try app.get("/", pingHandler);
-    // /users/:id — reuse echoId (returns "forty-two" for id==42)
     try app.get("/users/:id", echoId);
-    // /echo — echo back body
     try app.post("/echo", pingHandler);
 
-    // Use port 0 so the kernel assigns; we read it back after Worker.init.
-    // But serveEvented doesn't expose the bound port. Work-around: use a fixed
-    // ephemeral port that is unlikely to be in use.
     const port: u16 = 18200;
     const addr = net.IpAddress{ .ip4 = .loopback(port) };
 
-    // Serve in a background thread.
     const ServeCtx = struct {
         app: *TestApp,
         io: Io,
@@ -2390,10 +2514,6 @@ test "serveEvented: 2-worker integration — keep-alive requests across 3 routes
         err: ?anyerror = null,
     };
     var serve_ctx = ServeCtx{ .app = &app, .io = undefined, .addr = addr };
-    // We need a fresh Io.Threaded here because Io.Threaded is not Send-safe to
-    // share across threads without going through a Future.  Use raw posix in the
-    // server thread instead; the app only needs io for the handler ctx.io which
-    // our test handlers never use.
     var srv_threaded = Io.Threaded.init(testing.allocator, .{});
     defer srv_threaded.deinit();
     serve_ctx.io = srv_threaded.io();
@@ -2407,71 +2527,8 @@ test "serveEvented: 2-worker integration — keep-alive requests across 3 routes
     };
     const srv_thread = try std.Thread.spawn(.{}, ServeThread.run, .{&serve_ctx});
 
-    // Wait for workers to be ready (they listen on the port).
-    {
-        var attempts: usize = 0;
-        while (attempts < 50) : (attempts += 1) {
-            const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-            _ = linux.nanosleep(&ts, null);
+    sevWaitListening(port, 50);
 
-            // Try connecting to confirm the port is open.
-            const tfd_rc = linux.socket(
-                std.posix.AF.INET,
-                std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
-                0,
-            );
-            if (linux.errno(tfd_rc) != .SUCCESS) continue;
-            const tfd: i32 = @intCast(tfd_rc);
-            var sa_in = std.posix.sockaddr.in{
-                .family = std.posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, port),
-                .addr = std.mem.nativeToBig(u32, 0x7F000001),
-                .zero = [_]u8{0} ** 8,
-            };
-            const rc = linux.connect(@intCast(tfd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
-            _ = linux.close(@intCast(tfd));
-            if (linux.errno(rc) == .SUCCESS) break;
-        }
-    }
-
-    // Helper: raw send+recv on a blocking socket.
-    const sendAll = struct {
-        fn f(fd: i32, data: []const u8) !void {
-            var sent: usize = 0;
-            while (sent < data.len) {
-                const n = linux.write(@intCast(fd), data[sent..].ptr, data.len - sent);
-                if (linux.errno(n) != .SUCCESS) return error.SendFailed;
-                sent += @intCast(n);
-            }
-        }
-    }.f;
-
-    const recvResponse = struct {
-        fn f(fd: i32, buf: []u8) ![]u8 {
-            var total: usize = 0;
-            while (total < buf.len) {
-                const n = linux.read(@intCast(fd), buf[total..].ptr, buf.len - total);
-                if (linux.errno(n) != .SUCCESS) return buf[0..total];
-                if (n == 0) return buf[0..total];
-                total += @intCast(n);
-                const so_far = buf[0..total];
-                if (std.mem.indexOf(u8, so_far, "\r\n\r\n")) |sep| {
-                    const headers = so_far[0 .. sep + 4];
-                    if (std.mem.indexOf(u8, headers, "content-length: ")) |cl_start| {
-                        const after = headers[cl_start + "content-length: ".len ..];
-                        const end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
-                        const clen = std.fmt.parseInt(usize, after[0..end], 10) catch 0;
-                        if (total - (sep + 4) >= clen) return buf[0..total];
-                    } else {
-                        return buf[0..total];
-                    }
-                }
-            }
-            return buf[0..total];
-        }
-    }.f;
-
-    // Spawn a handful of client threads each doing multiple keep-alive requests.
     const N_THREADS = 5;
     const N_REQS_PER_THREAD = 10;
     const Total = N_THREADS * N_REQS_PER_THREAD;
@@ -2485,31 +2542,15 @@ test "serveEvented: 2-worker integration — keep-alive requests across 3 routes
 
     const ClientThread = struct {
         fn run(ctx: *ClientCtx) void {
-            const cfd_rc = linux.socket(
-                std.posix.AF.INET,
-                std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
-                0,
-            );
-            if (linux.errno(cfd_rc) != .SUCCESS) return;
-            const cfd: i32 = @intCast(cfd_rc);
-            defer _ = linux.close(@intCast(cfd));
-
-            var sa_in = std.posix.sockaddr.in{
-                .family = std.posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, ctx.port),
-                .addr = std.mem.nativeToBig(u32, 0x7F000001),
-                .zero = [_]u8{0} ** 8,
-            };
-            const con_rc = linux.connect(@intCast(cfd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
-            if (linux.errno(con_rc) != .SUCCESS) return;
+            const cfd = sevSocket() catch return;
+            defer sevCloseFd(cfd);
+            if (!sevConnect(cfd, ctx.port)) return;
 
             var buf: [8192]u8 = undefined;
-
             var i: usize = 0;
             while (i < N_REQS_PER_THREAD) : (i += 1) {
-                const req = "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
-                sendAll(cfd, req) catch return;
-                const resp = recvResponse(cfd, &buf) catch return;
+                sevWrite(cfd, "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n") catch return;
+                const resp = sevRecvFull(cfd, &buf);
                 if (std.mem.indexOf(u8, resp, "200") != null and
                     std.mem.indexOf(u8, resp, "hello") != null)
                 {
@@ -2527,10 +2568,8 @@ test "serveEvented: 2-worker integration — keep-alive requests across 3 routes
     }
     for (0..N_THREADS) |i| client_threads[i].join();
 
-    // All requests must have been served correctly.
     try testing.expectEqual(Total, correct.load(.acquire));
 
-    // Request shutdown and wait for serveEvented to return.
     var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
     defer shutdown_threaded.deinit();
     app.requestShutdown(shutdown_threaded.io());
@@ -2540,17 +2579,13 @@ test "serveEvented: 2-worker integration — keep-alive requests across 3 routes
 }
 
 test "serveEvented: observer fires for each request" {
-    // Linux-only: epoll doesn't exist elsewhere.
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const linux = std.os.linux;
+    if (!evented_supported) return error.SkipZigTest;
 
     var db = Db{ .msg = "hello" };
     var app = try TestApp.init(testing.allocator, &db, .{});
     defer app.deinit();
     try app.get("/ping", pingHandler);
 
-    // Register an observer that counts and captures the last record.
     var cap = ObsCapture{};
     try app.observe(.{ .context = &cap, .func = obsCapture });
 
@@ -2577,91 +2612,23 @@ test "serveEvented: observer fires for each request" {
     };
     const srv_thread = try std.Thread.spawn(.{}, ServeThread.run, .{&serve_ctx});
 
-    // Wait for the worker to start listening.
-    {
-        var attempts: usize = 0;
-        while (attempts < 50) : (attempts += 1) {
-            const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-            _ = linux.nanosleep(&ts, null);
-            const tfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-            if (linux.errno(tfd_rc) != .SUCCESS) continue;
-            const tfd: i32 = @intCast(tfd_rc);
-            var sa_in = std.posix.sockaddr.in{
-                .family = std.posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, port),
-                .addr = std.mem.nativeToBig(u32, 0x7F000001),
-                .zero = [_]u8{0} ** 8,
-            };
-            const rc = linux.connect(@intCast(tfd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
-            _ = linux.close(@intCast(tfd));
-            if (linux.errno(rc) == .SUCCESS) break;
-        }
-    }
+    sevWaitListening(port, 50);
 
-    // Connect and send two requests.
-    const cfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd_rc));
-    const cfd: i32 = @intCast(cfd_rc);
-    defer _ = linux.close(@intCast(cfd));
-
-    var sa_connect = std.posix.sockaddr.in{
-        .family = std.posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001),
-        .zero = [_]u8{0} ** 8,
-    };
-    const con_rc = linux.connect(@intCast(cfd), @ptrCast(&sa_connect), @sizeOf(std.posix.sockaddr.in));
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(con_rc));
-
-    const sendAll = struct {
-        fn f(fd: i32, data: []const u8) !void {
-            var sent: usize = 0;
-            while (sent < data.len) {
-                const n = linux.write(@intCast(fd), data[sent..].ptr, data.len - sent);
-                if (linux.errno(n) != .SUCCESS) return error.SendFailed;
-                sent += @intCast(n);
-            }
-        }
-    }.f;
-
-    const recvFull = struct {
-        fn f(fd: i32, buf: []u8) []u8 {
-            var total: usize = 0;
-            while (total < buf.len) {
-                const n = linux.read(@intCast(fd), buf[total..].ptr, buf.len - total);
-                if (linux.errno(n) != .SUCCESS or n == 0) break;
-                total += @intCast(n);
-                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |sep| {
-                    if (std.mem.indexOf(u8, buf[0 .. sep + 4], "content-length: ")) |cl_start| {
-                        const after = buf[cl_start + "content-length: ".len .. sep + 4];
-                        const end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
-                        const clen = std.fmt.parseInt(usize, after[0..end], 10) catch 0;
-                        if (total - (sep + 4) >= clen) break;
-                    } else break;
-                }
-            }
-            return buf[0..total];
-        }
-    }.f;
+    const cfd = try sevSocket();
+    try testing.expect(sevConnect(cfd, port));
+    defer sevCloseFd(cfd);
 
     var buf1: [2048]u8 = undefined;
-    try sendAll(cfd, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
-    _ = recvFull(cfd, &buf1);
+    try sevWrite(cfd, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+    _ = sevRecvFull(cfd, &buf1);
 
     var buf2: [2048]u8 = undefined;
-    try sendAll(cfd, "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-    _ = recvFull(cfd, &buf2);
+    try sevWrite(cfd, "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    _ = sevRecvFull(cfd, &buf2);
 
-    // Small pause: observer fires synchronously on the worker thread, but the
-    // second response might not have been fully flushed yet.
-    {
-        const ts = linux.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
-        _ = linux.nanosleep(&ts, null);
-    }
+    sevSleep(20);
 
-    // Observer must have fired at least twice (once per request).
     try testing.expect(cap.count >= 2);
-    // Last request was a 404 for /nope.
     try testing.expectEqual(@as(u16, 404), cap.status);
 
     var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
@@ -2672,10 +2639,7 @@ test "serveEvented: observer fires for each request" {
 }
 
 test "serveEvented: request_id generated and echoed" {
-    // Linux-only: mirrors the threaded "request id: generated, echoed, and exposed to handler" test.
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const linux = std.os.linux;
+    if (!evented_supported) return error.SkipZigTest;
 
     var db = Db{ .msg = "" };
     var app = try TestApp.init(testing.allocator, &db, .{ .request_id = true });
@@ -2705,89 +2669,29 @@ test "serveEvented: request_id generated and echoed" {
     };
     const srv_thread = try std.Thread.spawn(.{}, ServeThread.run, .{&serve_ctx});
 
-    // Wait for the worker to start listening.
-    {
-        var attempts: usize = 0;
-        while (attempts < 50) : (attempts += 1) {
-            const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-            _ = linux.nanosleep(&ts, null);
-            const tfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-            if (linux.errno(tfd_rc) != .SUCCESS) continue;
-            const tfd: i32 = @intCast(tfd_rc);
-            var sa_in = std.posix.sockaddr.in{
-                .family = std.posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, port),
-                .addr = std.mem.nativeToBig(u32, 0x7F000001),
-                .zero = [_]u8{0} ** 8,
-            };
-            const rc = linux.connect(@intCast(tfd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
-            _ = linux.close(@intCast(tfd));
-            if (linux.errno(rc) == .SUCCESS) break;
-        }
-    }
+    sevWaitListening(port, 50);
 
-    const sendAll = struct {
-        fn f(fd: i32, data: []const u8) !void {
-            var sent: usize = 0;
-            while (sent < data.len) {
-                const n = linux.write(@intCast(fd), data[sent..].ptr, data.len - sent);
-                if (linux.errno(n) != .SUCCESS) return error.SendFailed;
-                sent += @intCast(n);
-            }
-        }
-    }.f;
-
-    const recvFull = struct {
-        fn f(fd: i32, buf: []u8) []u8 {
-            var total: usize = 0;
-            while (total < buf.len) {
-                const n = linux.read(@intCast(fd), buf[total..].ptr, buf.len - total);
-                if (linux.errno(n) != .SUCCESS or n == 0) break;
-                total += @intCast(n);
-                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |sep| {
-                    if (std.mem.indexOf(u8, buf[0 .. sep + 4], "content-length: ")) |cl_start| {
-                        const after = buf[cl_start + "content-length: ".len .. sep + 4];
-                        const end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
-                        const clen = std.fmt.parseInt(usize, after[0..end], 10) catch 0;
-                        if (total - (sep + 4) >= clen) break;
-                    } else break;
-                }
-            }
-            return buf[0..total];
-        }
-    }.f;
-
-    // Connect once (keep-alive).
-    const cfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd_rc));
-    const cfd: i32 = @intCast(cfd_rc);
-    defer _ = linux.close(@intCast(cfd));
-    var sa_connect = std.posix.sockaddr.in{
-        .family = std.posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001),
-        .zero = [_]u8{0} ** 8,
-    };
-    const con_rc = linux.connect(@intCast(cfd), @ptrCast(&sa_connect), @sizeOf(std.posix.sockaddr.in));
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(con_rc));
+    const cfd = try sevSocket();
+    try testing.expect(sevConnect(cfd, port));
+    defer sevCloseFd(cfd);
 
     // 1. No incoming x-request-id → server generates one and echoes it.
     var buf1: [2048]u8 = undefined;
-    try sendAll(cfd, "GET /rid HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
-    const r1 = recvFull(cfd, &buf1);
+    try sevWrite(cfd, "GET /rid HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+    const r1 = sevRecvFull(cfd, &buf1);
     try testing.expect(std.mem.indexOf(u8, r1, "x-request-id: ") != null);
 
-    // 2. Valid incoming x-request-id → server echoes it unchanged, handler sees it.
+    // 2. Valid incoming x-request-id → server echoes it unchanged.
     var buf2: [2048]u8 = undefined;
-    try sendAll(cfd, "GET /rid HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nX-Request-Id: abc-123\r\n\r\n");
-    const r2 = recvFull(cfd, &buf2);
+    try sevWrite(cfd, "GET /rid HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nX-Request-Id: abc-123\r\n\r\n");
+    const r2 = sevRecvFull(cfd, &buf2);
     try testing.expect(std.mem.indexOf(u8, r2, "x-request-id: abc-123\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, r2, "abc-123"));
 
-    // 3. Invalid incoming x-request-id (space) → server replaces with generated id, invalid not echoed.
+    // 3. Invalid incoming x-request-id → server replaces with generated id.
     var buf3: [2048]u8 = undefined;
-    try sendAll(cfd, "GET /rid HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Request-Id: bad id!\r\n\r\n");
-    const r3 = recvFull(cfd, &buf3);
+    try sevWrite(cfd, "GET /rid HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Request-Id: bad id!\r\n\r\n");
+    const r3 = sevRecvFull(cfd, &buf3);
     try testing.expect(std.mem.indexOf(u8, r3, "bad id!") == null);
     try testing.expect(std.mem.indexOf(u8, r3, "x-request-id: ") != null);
 

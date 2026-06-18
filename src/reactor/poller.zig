@@ -1,19 +1,21 @@
-//! Poller — thin epoll wrapper (Linux only).
+//! Poller — platform dispatcher.
 //!
-//! On non-Linux platforms the types are defined but all function bodies are
-//! `unreachable`; they are never constructed off-Linux so this is safe.  The
-//! library therefore compiles on macOS without error and the single test block
-//! self-skips off-Linux via `return error.SkipZigTest`.
+//! Selects the correct backend at comptime:
+//!   Linux  → epoll (this file's EpollPoller, via std.os.linux)
+//!   Darwin/BSD → kqueue (kqueue.zig)
+//!   Other  → compile-error (unreachable for supported targets)
 //!
-//! Syscall path: all epoll calls go through `std.os.linux` (raw syscall
-//! wrappers) because `std.posix` does not expose epoll in Zig 0.16.
+//! The `Poller` type and `eventFromRaw` function are re-exported so callers
+//! (worker.zig, tests) always reference `poller_mod.Poller` and
+//! `poller_mod.eventFromRaw` without caring which backend is active.
 //!
-//! The worker owns an event buffer typed as `[N]Poller.NativeEvent`; decode
-//! each raw event with `eventFromRaw`.  When a kqueue backend is added, it
-//! will define `NativeEvent = std.posix.Kevent` and the worker buffer type
-//! is unchanged.
+//! The `Event` type is the same on all platforms:
+//!   { data: u64, readable: bool, writable: bool, hup: bool }
 //!
-//! Usage (Linux only):
+//! Syscall path for epoll: all epoll calls go through `std.os.linux` (raw
+//! syscall wrappers) because `std.posix` does not expose epoll in Zig 0.16.
+//!
+//! Usage (all platforms):
 //!   var p = try Poller.init();
 //!   defer p.deinit();
 //!   try p.add(fd, slot_index, true, false);
@@ -29,10 +31,20 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 
 // ---------------------------------------------------------------------------
-// Public types (defined on all platforms so the library compiles everywhere)
+// Platform selection
 // ---------------------------------------------------------------------------
 
-/// A decoded epoll event.
+const is_bsd = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit,
+    .freebsd, .dragonfly, .netbsd, .openbsd => true,
+    else => false,
+};
+
+// ---------------------------------------------------------------------------
+// Public types (defined on all supported platforms)
+// ---------------------------------------------------------------------------
+
+/// A decoded event — same shape across epoll and kqueue backends.
 pub const Event = struct {
     /// The u64 value registered with add/mod (e.g. connection slot index).
     data: u64,
@@ -43,37 +55,60 @@ pub const Event = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Helper: translate a raw epoll_event to Event
+// Backend selection
+// ---------------------------------------------------------------------------
+
+const kqueue_mod = if (is_bsd) @import("kqueue.zig") else void;
+
+// ---------------------------------------------------------------------------
+// eventFromRaw — dispatch to the right backend decoder
 // ---------------------------------------------------------------------------
 
 /// Decode a raw `NativeEvent` into an `Event`.
-/// Only meaningful on Linux; bodies guarded — calling off-Linux is `unreachable`.
 pub fn eventFromRaw(raw: Poller.NativeEvent) Event {
-    if (builtin.os.tag != .linux) unreachable;
-    return .{
-        .data = raw.data.u64,
-        .readable = (raw.events & linux.EPOLL.IN) != 0,
-        .writable = (raw.events & linux.EPOLL.OUT) != 0,
-        .hup = (raw.events & (linux.EPOLL.HUP | linux.EPOLL.RDHUP | linux.EPOLL.ERR)) != 0,
-    };
+    if (builtin.os.tag == .linux) {
+        return .{
+            .data = raw.data.u64,
+            .readable = (raw.events & linux.EPOLL.IN) != 0,
+            .writable = (raw.events & linux.EPOLL.OUT) != 0,
+            .hup = (raw.events & (linux.EPOLL.HUP | linux.EPOLL.RDHUP | linux.EPOLL.ERR)) != 0,
+        };
+    } else if (is_bsd) {
+        // kqueue_mod.eventFromRaw returns a structurally identical Event.
+        // Convert field by field to produce this module's Event type.
+        const kev = kqueue_mod.eventFromRaw(raw);
+        return .{
+            .data = kev.data,
+            .readable = kev.readable,
+            .writable = kev.writable,
+            .hup = kev.hup,
+        };
+    } else {
+        unreachable;
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Poller
+// Poller — platform-dispatched struct
 // ---------------------------------------------------------------------------
 
-pub const Poller = struct {
+pub const Poller = if (builtin.os.tag == .linux) EpollPoller else if (is_bsd) kqueue_mod.Poller else void;
+
+// ---------------------------------------------------------------------------
+// EpollPoller (Linux only)
+// ---------------------------------------------------------------------------
+
+const EpollPoller = struct {
     epfd: i32,
 
     /// The native event type for this backend.  The worker allocates its event
-    /// buffer as `[N]Poller.NativeEvent` so a future kqueue backend can swap
+    /// buffer as `[N]Poller.NativeEvent` so the kqueue backend can swap
     /// this to `std.posix.Kevent` without touching the worker.
     pub const NativeEvent = linux.epoll_event;
 
-    /// Create an epoll instance via `epoll_create1(0)`.  Level-triggered for v1
-    /// (no `EPOLLET`).
-    pub fn init() !Poller {
-        if (builtin.os.tag != .linux) unreachable;
+    /// Create an epoll instance via `epoll_create1(0)`.  Level-triggered (no
+    /// EPOLLET).
+    pub fn init() !EpollPoller {
         const rc = linux.epoll_create1(0);
         const e = linux.errno(rc);
         if (e != .SUCCESS) return std.posix.unexpectedErrno(e);
@@ -81,16 +116,14 @@ pub const Poller = struct {
     }
 
     /// Close the epoll file descriptor.
-    pub fn deinit(self: *Poller) void {
-        if (builtin.os.tag != .linux) unreachable;
+    pub fn deinit(self: *EpollPoller) void {
         _ = linux.close(@intCast(self.epfd));
         self.epfd = -1;
     }
 
     /// Register `fd`.  `data` is stored in `epoll_event.data.u64`
     /// (use the connection slot index here).
-    pub fn add(self: *Poller, fd: i32, data: u64, read: bool, write: bool) !void {
-        if (builtin.os.tag != .linux) unreachable;
+    pub fn add(self: *EpollPoller, fd: i32, data: u64, read: bool, write: bool) !void {
         var ev = makeEvent(data, read, write);
         const rc = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_ADD, fd, &ev);
         const e = linux.errno(rc);
@@ -98,8 +131,7 @@ pub const Poller = struct {
     }
 
     /// Modify the interest set for an already-registered `fd`.
-    pub fn mod(self: *Poller, fd: i32, data: u64, read: bool, write: bool) !void {
-        if (builtin.os.tag != .linux) unreachable;
+    pub fn mod(self: *EpollPoller, fd: i32, data: u64, read: bool, write: bool) !void {
         var ev = makeEvent(data, read, write);
         const rc = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_MOD, fd, &ev);
         const e = linux.errno(rc);
@@ -107,8 +139,7 @@ pub const Poller = struct {
     }
 
     /// Deregister `fd`.  Errors are silently ignored (fd may already be closed).
-    pub fn del(self: *Poller, fd: i32) void {
-        if (builtin.os.tag != .linux) unreachable;
+    pub fn del(self: *EpollPoller, fd: i32) void {
         // Linux ≥ 2.6.9 ignores the event pointer for EPOLL_CTL_DEL.
         _ = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_DEL, fd, null);
     }
@@ -117,8 +148,7 @@ pub const Poller = struct {
     /// Returns the number of events written into `events` (0..events.len).
     /// Never returns a sentinel: EINTR and other errors are mapped to 0 so the
     /// caller's `for (events[0..n])` loop is always in-bounds.
-    pub fn wait(self: *Poller, events: []NativeEvent, timeout_ms: i32) usize {
-        if (builtin.os.tag != .linux) unreachable;
+    pub fn wait(self: *EpollPoller, events: []NativeEvent, timeout_ms: i32) usize {
         const rc = linux.epoll_wait(self.epfd, events.ptr, @intCast(events.len), timeout_ms);
         const e = linux.errno(rc);
         switch (e) {
@@ -133,7 +163,7 @@ pub const Poller = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Internal helpers (epoll only)
 // ---------------------------------------------------------------------------
 
 fn makeEvent(data: u64, read: bool, write: bool) linux.epoll_event {

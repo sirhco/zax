@@ -1,27 +1,30 @@
-//! Single-worker event loop: listen(SO_REUSEPORT) → epoll → Conn state machines.
+//! Single-worker event loop: listen(SO_REUSEPORT) → epoll/kqueue → Conn state machines.
 //!
-//! Linux only.  On macOS all types compile but all `Worker` fn bodies are
-//! `unreachable`; the module is reachable through `root.zig` / `refAllDecls`
-//! so it participates in comptime analysis on every platform.  The one `test`
-//! block self-skips off-Linux via `return error.SkipZigTest`.
+//! Linux: epoll backend.  macOS/BSD: kqueue backend.  Both are fully supported.
+//! On unsupported platforms (Windows, wasm) all `Worker` fn bodies are
+//! `unreachable`; tests self-skip via `return error.SkipZigTest`.
 //!
 //! Cross-platform shape
 //! --------------------
-//! OS-specific bits are isolated so a kqueue backend (V2b) can be added without
-//! touching this file:
+//! OS-specific bits are isolated:
 //!
-//!   • Socket syscalls: `std.posix.setsockopt` where available; `linux.*` raw
-//!     calls for functions (socket, bind, listen, accept4, close, getsockname)
-//!     that `std.posix` does not yet expose in Zig 0.16.
+//!   • Socket syscalls: `std.posix.setsockopt` where available; `std.os.linux.*`
+//!     raw calls on Linux; `std.c.*` on macOS/BSD for functions that `std.posix`
+//!     does not yet expose in Zig 0.16 (socket, bind, listen, accept, close,
+//!     getsockname, pipe, fcntl, nanosleep, write, read, connect).
 //!
-//!   • Wake mechanism: a self-pipe (`linux.pipe2` on Linux) replaces the former
-//!     Linux-only `eventfd`.  `wake()` writes 1 byte to the write end; the loop
-//!     drains the read end.  Both fds are stored on `Worker` and closed in
-//!     `deinit`.
+//!   • Wake mechanism: a self-pipe (pipe2 on Linux, pipe+fcntl on macOS) with
+//!     CLOEXEC|NONBLOCK on both ends.  `wake()` writes 1 byte; the loop drains.
+//!
+//!   • accept: Linux uses linux.accept4 (sets NONBLOCK+CLOEXEC atomically).
+//!     macOS has no accept4 — we use std.c.accept + fcntl(O_NONBLOCK|O_CLOEXEC).
+//!
+//!   • SIGPIPE: Linux uses MSG_NOSIGNAL on sendto.  macOS: SO_NOSIGPIPE is set
+//!     on each accepted fd at accept time to prevent SIGPIPE on writes to a
+//!     closed peer.
 //!
 //!   • Event buffer: typed as `[MAX_EVENTS]poller_mod.Poller.NativeEvent`.
-//!     The kqueue backend will define `NativeEvent = std.posix.Kevent`; the
-//!     worker declaration is unchanged.
+//!     epoll → linux.epoll_event; kqueue → std.posix.Kevent.
 //!
 //! Dispatcher ctx contract (Task 8 → Task 9)
 //! ------------------------------------------
@@ -77,8 +80,15 @@ pub const WorkerOpts = struct {
     sndbuf_override: u32 = 0,
 };
 
-/// A self-contained epoll worker: one listen socket, one self-pipe (wake), and
-/// a preallocated pool of connection slots each owning its own buffers + arena.
+// Whether this platform has a functional reactor backend.
+const reactor_supported = switch (builtin.os.tag) {
+    .linux, .macos, .ios, .tvos, .watchos, .visionos, .maccatalyst, .driverkit,
+    .freebsd, .dragonfly, .netbsd, .openbsd => true,
+    else => false,
+};
+
+/// A self-contained epoll/kqueue worker: one listen socket, one self-pipe (wake),
+/// and a preallocated pool of connection slots each owning its own buffers + arena.
 pub const Worker = struct {
     gpa: std.mem.Allocator,
     dispatcher: Dispatcher,
@@ -126,7 +136,7 @@ pub const Worker = struct {
         addr: net.IpAddress,
         shutdown: *std.atomic.Value(bool),
     ) !Worker {
-        if (builtin.os.tag != .linux) unreachable;
+        if (!reactor_supported) unreachable;
 
         const slots = try gpa.alloc(Slot, opts.max_connections);
         errdefer gpa.free(slots);
@@ -146,14 +156,23 @@ pub const Worker = struct {
         errdefer timer.deinit();
 
         // Create listen socket.
-        const lfd_rc = linux.socket(
-            std.posix.AF.INET,
-            std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
-            0,
-        );
-        if (linux.errno(lfd_rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(lfd_rc));
-        const lfd: i32 = @intCast(lfd_rc);
-        errdefer _ = linux.close(@intCast(lfd));
+        // Linux: linux.socket returns usize (raw syscall); macOS/BSD: std.c.socket returns c_int.
+        const lfd: i32 = if (builtin.os.tag == .linux) blk: {
+            const rc = linux.socket(
+                std.posix.AF.INET,
+                std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
+                0,
+            );
+            if (linux.errno(rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(rc));
+            break :blk @intCast(rc);
+        } else blk: {
+            const rc = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+            if (rc < 0) return std.posix.unexpectedErrno(std.posix.errno(rc));
+            // Set NONBLOCK + CLOEXEC via fcntl.
+            setFdFlags(rc, std.c.O{ .NONBLOCK = true, .CLOEXEC = true });
+            break :blk rc;
+        };
+        errdefer closeFd(lfd);
 
         // SO_REUSEADDR and SO_REUSEPORT via std.posix.setsockopt (available on
         // both Linux and macOS in Zig 0.16).
@@ -164,22 +183,44 @@ pub const Worker = struct {
         // Bind.
         var sa: std.posix.sockaddr = undefined;
         const sa_len = ipAddrToSockaddr(addr, &sa);
-        const bind_rc = linux.bind(lfd, &sa, sa_len);
-        if (linux.errno(bind_rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(bind_rc));
+        if (builtin.os.tag == .linux) {
+            const rc = linux.bind(lfd, &sa, sa_len);
+            if (linux.errno(rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(rc));
+        } else {
+            const rc = std.c.bind(lfd, @ptrCast(&sa), sa_len);
+            if (rc != 0) return std.posix.unexpectedErrno(std.posix.errno(rc));
+        }
 
         // Listen.
-        const listen_rc = linux.listen(lfd, BACKLOG);
-        if (linux.errno(listen_rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(listen_rc));
+        if (builtin.os.tag == .linux) {
+            const rc = linux.listen(lfd, BACKLOG);
+            if (linux.errno(rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(rc));
+        } else {
+            const rc = std.c.listen(lfd, BACKLOG);
+            if (rc != 0) return std.posix.unexpectedErrno(std.posix.errno(rc));
+        }
 
         // Self-pipe for wake(): CLOEXEC | NONBLOCK on both ends.
-        // pipe2 returns [read_end, write_end].
-        var pipe_fds: [2]i32 = undefined;
-        const pipe_rc = linux.pipe2(&pipe_fds, linux.O{ .CLOEXEC = true, .NONBLOCK = true });
-        if (linux.errno(pipe_rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(pipe_rc));
-        const wake_rd: i32 = pipe_fds[0];
-        const wake_wr: i32 = pipe_fds[1];
-        errdefer _ = linux.close(@intCast(wake_rd));
-        errdefer _ = linux.close(@intCast(wake_wr));
+        // Linux: pipe2 (atomic). macOS: pipe + fcntl (no pipe2 on macOS).
+        var wake_rd: i32 = undefined;
+        var wake_wr: i32 = undefined;
+        if (builtin.os.tag == .linux) {
+            var pipe_fds: [2]i32 = undefined;
+            const pipe_rc = linux.pipe2(&pipe_fds, linux.O{ .CLOEXEC = true, .NONBLOCK = true });
+            if (linux.errno(pipe_rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(pipe_rc));
+            wake_rd = pipe_fds[0];
+            wake_wr = pipe_fds[1];
+        } else {
+            var pipe_fds: [2]std.c.fd_t = undefined;
+            const pipe_rc = std.c.pipe(&pipe_fds);
+            if (pipe_rc != 0) return std.posix.unexpectedErrno(std.posix.errno(pipe_rc));
+            wake_rd = pipe_fds[0];
+            wake_wr = pipe_fds[1];
+            setFdFlags(wake_rd, std.c.O{ .NONBLOCK = true, .CLOEXEC = true });
+            setFdFlags(wake_wr, std.c.O{ .NONBLOCK = true, .CLOEXEC = true });
+        }
+        errdefer closeFd(wake_rd);
+        errdefer closeFd(wake_wr);
 
         var p = poller;
         try p.add(lfd, LISTEN_TOKEN, true, false);
@@ -203,10 +244,10 @@ pub const Worker = struct {
     }
 
     pub fn deinit(self: *Worker) void {
-        if (builtin.os.tag != .linux) unreachable;
-        _ = linux.close(@intCast(self.listen_fd));
-        _ = linux.close(@intCast(self.wake_rd));
-        _ = linux.close(@intCast(self.wake_wr));
+        if (!reactor_supported) unreachable;
+        closeFd(self.listen_fd);
+        closeFd(self.wake_rd);
+        closeFd(self.wake_wr);
         self.poller.deinit();
         self.timer.deinit();
         for (self.slots) |*s| s.deinit(self.gpa);
@@ -215,18 +256,22 @@ pub const Worker = struct {
         self.* = undefined;
     }
 
-    /// Write 1 byte to the self-pipe write end to break a blocked `epoll_wait`.
+    /// Write 1 byte to the self-pipe write end to break a blocked poll wait.
     /// Safe to call from any thread.
     pub fn wake(self: *Worker) void {
-        if (builtin.os.tag != .linux) unreachable;
+        if (!reactor_supported) unreachable;
         const byte: u8 = 1;
-        _ = linux.write(@intCast(self.wake_wr), @ptrCast(&byte), 1);
+        if (builtin.os.tag == .linux) {
+            _ = linux.write(@intCast(self.wake_wr), @ptrCast(&byte), 1);
+        } else {
+            _ = std.c.write(self.wake_wr, @ptrCast(&byte), 1);
+        }
     }
 
     /// Main event loop.  Runs until `shutdown.load(.acquire)` is true and a
-    /// `wake()` call (or timer expiry) breaks the `epoll_wait`.
+    /// `wake()` call (or timer expiry) breaks the poll wait.
     pub fn run(self: *Worker) void {
-        if (builtin.os.tag != .linux) unreachable;
+        if (!reactor_supported) unreachable;
 
         // Capture a pointer to self for use in the timer expiry callback.
         // We store it in a thread-local so the *const fn(usize) callback can
@@ -259,12 +304,22 @@ pub const Worker = struct {
                     self.acceptLoop();
                 } else if (ev.data == WAKE_TOKEN) {
                     // Drain the self-pipe read end (discard bytes; purpose is
-                    // only to unblock epoll_wait).
+                    // only to unblock the poll wait).
                     var drain: [64]u8 = undefined;
                     while (true) {
-                        const rc = linux.read(@intCast(self.wake_rd), &drain, drain.len);
-                        if (linux.errno(rc) == .AGAIN) break;
-                        if (linux.errno(rc) != .SUCCESS or rc == 0) break;
+                        if (builtin.os.tag == .linux) {
+                            const rc = linux.read(@intCast(self.wake_rd), &drain, drain.len);
+                            if (linux.errno(rc) == .AGAIN) break;
+                            if (linux.errno(rc) != .SUCCESS or rc == 0) break;
+                        } else {
+                            const rc = std.c.read(self.wake_rd, &drain, drain.len);
+                            if (rc < 0) {
+                                const e = std.posix.errno(rc);
+                                if (e == .AGAIN) break; // EAGAIN == EWOULDBLOCK on Darwin
+                                break;
+                            }
+                            if (rc == 0) break;
+                        }
                     }
                     // Shutdown check happens after the event loop below.
                 } else {
@@ -308,56 +363,106 @@ pub const Worker = struct {
         while (true) {
             var sa: std.posix.sockaddr = undefined;
             var salen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-            const rc = linux.accept4(
-                @intCast(self.listen_fd),
-                &sa,
-                &salen,
-                std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
-            );
-            const e = linux.errno(rc);
-            if (e == .AGAIN) break; // EAGAIN == EWOULDBLOCK on Linux
-            if (e == .MFILE or e == .NFILE) {
-                // fd table exhausted — remove listen fd from epoll to stop
-                // busy-spinning.  closeSlot will re-add it once a slot frees.
-                std.log.warn("accept4: fd exhaustion ({}), pausing accept", .{e});
-                self.poller.del(self.listen_fd);
-                self.accept_paused = true;
-                break;
+            const conn_fd: i32 = if (builtin.os.tag == .linux) blk: {
+                const rc = linux.accept4(
+                    @intCast(self.listen_fd),
+                    &sa,
+                    &salen,
+                    std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
+                );
+                const e = linux.errno(rc);
+                if (e == .AGAIN) break; // EAGAIN == EWOULDBLOCK
+                if (e == .MFILE or e == .NFILE) {
+                    std.log.warn("accept4: fd exhaustion ({}), pausing accept", .{e});
+                    self.poller.del(self.listen_fd);
+                    self.accept_paused = true;
+                    break;
+                }
+                if (e != .SUCCESS) {
+                    std.log.warn("accept4: unexpected errno {}, stopping accept loop", .{e});
+                    break;
+                }
+                break :blk @as(i32, @intCast(rc));
+            } else blk: {
+                // macOS/BSD: no accept4 — use accept + fcntl.
+                const rc = std.c.accept(self.listen_fd, @ptrCast(&sa), &salen);
+                if (rc < 0) {
+                    const e = std.posix.errno(rc);
+                    if (e == .AGAIN) break; // EAGAIN == EWOULDBLOCK on Darwin
+                    if (e == .MFILE or e == .NFILE) {
+                        std.log.warn("accept: fd exhaustion ({}), pausing accept", .{e});
+                        self.poller.del(self.listen_fd);
+                        self.accept_paused = true;
+                        break;
+                    }
+                    std.log.warn("accept: unexpected errno {}, stopping accept loop", .{e});
+                    break;
+                }
+                setFdFlags(rc, std.c.O{ .NONBLOCK = true, .CLOEXEC = true });
+                break :blk rc;
+            };
+
+            // macOS: set SO_NOSIGPIPE to prevent SIGPIPE when writing to a
+            // closed peer (Linux uses MSG_NOSIGNAL on sendto instead).
+            if (builtin.os.tag != .linux) {
+                const one: c_int = 1;
+                _ = std.c.setsockopt(
+                    conn_fd,
+                    std.posix.SOL.SOCKET,
+                    std.c.SO.NOSIGPIPE,
+                    &one,
+                    @sizeOf(c_int),
+                );
             }
-            if (e != .SUCCESS) {
-                std.log.warn("accept4: unexpected errno {}, stopping accept loop", .{e});
-                break;
-            }
-            const conn_fd: i32 = @intCast(rc);
 
             // Set TCP_NODELAY if requested.
             if (self.opts.tcp_nodelay) {
                 const one: c_int = 1;
-                _ = linux.setsockopt(
-                    conn_fd,
-                    std.posix.IPPROTO.TCP,
-                    @intCast(std.posix.TCP.NODELAY),
-                    @ptrCast(&one),
-                    @sizeOf(c_int),
-                );
+                if (builtin.os.tag == .linux) {
+                    _ = linux.setsockopt(
+                        conn_fd,
+                        std.posix.IPPROTO.TCP,
+                        @intCast(std.posix.TCP.NODELAY),
+                        @ptrCast(&one),
+                        @sizeOf(c_int),
+                    );
+                } else {
+                    _ = std.c.setsockopt(
+                        conn_fd,
+                        std.posix.IPPROTO.TCP,
+                        std.posix.TCP.NODELAY,
+                        &one,
+                        @sizeOf(c_int),
+                    );
+                }
             }
 
             // Override SO_SNDBUF if requested (useful in tests to force write
             // stalls on loopback where the default send buffer is very large).
             if (self.opts.sndbuf_override != 0) {
                 const sndbuf: c_int = @intCast(self.opts.sndbuf_override);
-                _ = linux.setsockopt(
-                    conn_fd,
-                    std.posix.SOL.SOCKET,
-                    std.posix.SO.SNDBUF,
-                    @ptrCast(&sndbuf),
-                    @sizeOf(c_int),
-                );
+                if (builtin.os.tag == .linux) {
+                    _ = linux.setsockopt(
+                        conn_fd,
+                        std.posix.SOL.SOCKET,
+                        std.posix.SO.SNDBUF,
+                        @ptrCast(&sndbuf),
+                        @sizeOf(c_int),
+                    );
+                } else {
+                    _ = std.c.setsockopt(
+                        conn_fd,
+                        std.posix.SOL.SOCKET,
+                        std.posix.SO.SNDBUF,
+                        &sndbuf,
+                        @sizeOf(c_int),
+                    );
+                }
             }
 
             // Grab a free slot; shed the connection if pool is exhausted.
             if (self.free_len == 0) {
-                _ = linux.close(@intCast(conn_fd));
+                closeFd(conn_fd);
                 continue;
             }
             self.free_len -= 1;
@@ -374,9 +479,9 @@ pub const Worker = struct {
             slot.fd = conn_fd;
             slot.active = true;
 
-            // Register with epoll (start readable).
+            // Register with poller (start readable).
             self.poller.add(conn_fd, @intCast(slot_idx), true, false) catch {
-                _ = linux.close(@intCast(conn_fd));
+                closeFd(conn_fd);
                 self.freeSlot(slot_idx);
                 continue;
             };
@@ -444,7 +549,7 @@ pub const Worker = struct {
 
     fn closeSlot(self: *Worker, slot_idx: usize, fd: i32) void {
         self.poller.del(fd);
-        _ = linux.close(@intCast(fd));
+        closeFd(fd);
         self.timer.remove(slot_idx);
         self.freeSlot(slot_idx);
         // If accept was paused due to fd exhaustion, re-register the listen fd
@@ -469,7 +574,7 @@ pub const Worker = struct {
         for (self.slots, 0..) |*slot, i| {
             if (!slot.active) continue;
             self.poller.del(slot.fd);
-            _ = linux.close(@intCast(slot.fd));
+            closeFd(slot.fd);
             self.timer.remove(i);
             _ = slot.arena.reset(.retain_capacity);
             slot.active = false;
@@ -544,20 +649,32 @@ fn sockReadFn(ctx: *anyopaque, buf: []u8) IoResult {
 
 fn sockWriteFn(ctx: *anyopaque, buf: []const u8) IoResult {
     const fd: i32 = @intCast(@intFromPtr(ctx));
-    // MSG_NOSIGNAL suppresses SIGPIPE on Linux when writing to a closed peer.
-    // On macOS there is no MSG_NOSIGNAL; SO_NOSIGPIPE is set on the socket
-    // instead (V2b will handle that at accept time).  For now the guard
-    // ensures this compiles on macOS while Linux behaviour is unchanged.
-    const MSG_NOSIGNAL: u32 = if (builtin.os.tag == .linux) linux.MSG.NOSIGNAL else 0;
-    const rc = linux.sendto(@intCast(fd), buf.ptr, buf.len, MSG_NOSIGNAL, null, 0);
-    const e = linux.errno(rc);
-    return switch (e) {
-        .SUCCESS => .{ .ok = @intCast(rc) },
-        .AGAIN => .would_block, // EAGAIN == EWOULDBLOCK on Linux
-        .CONNRESET, .CONNABORTED, .PIPE => .closed,
-        .INTR => .would_block,
-        else => .closed,
-    };
+    if (builtin.os.tag == .linux) {
+        // MSG_NOSIGNAL suppresses SIGPIPE on Linux when writing to a closed peer.
+        const rc = linux.sendto(@intCast(fd), buf.ptr, buf.len, linux.MSG.NOSIGNAL, null, 0);
+        const e = linux.errno(rc);
+        return switch (e) {
+            .SUCCESS => .{ .ok = @intCast(rc) },
+            .AGAIN => .would_block,
+            .CONNRESET, .CONNABORTED, .PIPE => .closed,
+            .INTR => .would_block,
+            else => .closed,
+        };
+    } else {
+        // macOS/BSD: SO_NOSIGPIPE is set on the socket at accept time so we
+        // don't need MSG_NOSIGNAL.  Use std.c.send (no flags needed).
+        const rc = std.c.send(fd, buf.ptr, buf.len, 0);
+        if (rc < 0) {
+            const e = std.posix.errno(rc);
+            return switch (e) {
+                .AGAIN => .would_block, // EAGAIN == EWOULDBLOCK on Darwin
+                .CONNRESET, .CONNABORTED, .PIPE => .closed,
+                .INTR => .would_block,
+                else => .closed,
+            };
+        }
+        return .{ .ok = @intCast(rc) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +708,35 @@ fn expiredCb(slot_idx: usize) void {
                 w.closeSlot(slot_idx, fd);
             };
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-platform fd helpers
+// ---------------------------------------------------------------------------
+
+/// Close a file descriptor.  Works on Linux (linux.close) and macOS/BSD (std.c.close).
+fn closeFd(fd: i32) void {
+    if (builtin.os.tag == .linux) {
+        _ = linux.close(@intCast(fd));
+    } else {
+        _ = std.c.close(fd);
+    }
+}
+
+/// Set O_NONBLOCK + O_CLOEXEC on `fd` via fcntl.  macOS/BSD only.
+/// On Linux, prefer to set these flags atomically at socket/pipe creation time.
+fn setFdFlags(fd: i32, flags: std.c.O) void {
+    // Get current file status flags and add the requested ones.
+    const cur = std.c.fcntl(fd, std.c.F.GETFL);
+    // Build the new flags value by ORing the packed struct bits.
+    // Cast through u32 to avoid packed-struct comparisons.
+    const cur_u: u32 = @bitCast(@as(std.c.O, @bitCast(@as(u32, @intCast(if (cur < 0) 0 else cur)))));
+    const add_u: u32 = @bitCast(flags);
+    _ = std.c.fcntl(fd, std.c.F.SETFL, cur_u | add_u);
+    // Also set FD_CLOEXEC via F.SETFD (separate from O_CLOEXEC on some BSDs).
+    if (flags.CLOEXEC) {
+        _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
     }
 }
 
@@ -634,26 +780,156 @@ fn ipAddrToSockaddr(addr: net.IpAddress, out: *std.posix.sockaddr) std.posix.soc
 }
 
 // ---------------------------------------------------------------------------
+// Test helpers — cross-platform socket primitives
+// ---------------------------------------------------------------------------
+
+/// Get the bound port from a listening fd via getsockname.
+fn testGetPort(fd: i32) u16 {
+    var sa: std.posix.sockaddr = undefined;
+    var sa_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    if (builtin.os.tag == .linux) {
+        _ = linux.getsockname(@intCast(fd), &sa, &sa_len);
+    } else {
+        _ = std.c.getsockname(fd, @ptrCast(&sa), &sa_len);
+    }
+    const sa_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&sa));
+    return std.mem.bigToNative(u16, sa_in.port);
+}
+
+/// Create a blocking client socket and connect to localhost:port.
+/// Returns the fd; caller must closeFd.
+fn testConnect(port: u16) !i32 {
+    const fd: i32 = if (builtin.os.tag == .linux) blk: {
+        const rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.SocketFailed;
+        break :blk @as(i32, @intCast(rc));
+    } else blk: {
+        const rc = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (rc < 0) return error.SocketFailed;
+        setFdFlags(rc, std.c.O{ .CLOEXEC = true });
+        break :blk rc;
+    };
+    errdefer closeFd(fd);
+
+    var sa_in = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+        .zero = [_]u8{0} ** 8,
+    };
+    const ok: bool = if (builtin.os.tag == .linux) blk: {
+        const rc = linux.connect(@intCast(fd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
+        break :blk linux.errno(rc) == .SUCCESS;
+    } else blk: {
+        const rc = std.c.connect(fd, @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
+        break :blk rc == 0;
+    };
+    if (!ok) return error.ConnectFailed;
+    return fd;
+}
+
+/// Sleep for `ms` milliseconds.
+fn testSleep(ms: u64) void {
+    if (builtin.os.tag == .linux) {
+        const ts = linux.timespec{
+            .sec = @intCast(ms / 1000),
+            .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+        };
+        _ = linux.nanosleep(&ts, null);
+    } else {
+        const ts = std.c.timespec{
+            .sec = @intCast(ms / 1000),
+            .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+        };
+        _ = std.c.nanosleep(&ts, null);
+    }
+}
+
+/// Write all bytes to fd.
+fn testWrite(fd: i32, data: []const u8) !void {
+    var sent: usize = 0;
+    while (sent < data.len) {
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(linux.write(@intCast(fd), data[sent..].ptr, data.len - sent))
+        else
+            std.c.write(fd, data[sent..].ptr, data.len - sent);
+        if (n <= 0) return error.SendFailed;
+        sent += @intCast(n);
+    }
+}
+
+/// Read bytes from a blocking fd into buf until a complete HTTP response.
+fn testRecvResponse(fd: i32, buf: []u8) []u8 {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(linux.read(@intCast(fd), buf[total..].ptr, buf.len - total))
+        else
+            std.c.read(fd, buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+        const so_far = buf[0..total];
+        if (std.mem.indexOf(u8, so_far, "\r\n\r\n")) |sep| {
+            const headers = so_far[0 .. sep + 4];
+            if (std.mem.indexOf(u8, headers, "content-length: ")) |cl_start| {
+                const after = headers[cl_start + "content-length: ".len ..];
+                const end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
+                const clen = std.fmt.parseInt(usize, after[0..end], 10) catch 0;
+                if (total - (sep + 4) >= clen) break;
+            } else break;
+        }
+    }
+    return buf[0..total];
+}
+
+/// Set fd to non-blocking mode.
+fn testSetNonblock(fd: i32) void {
+    if (builtin.os.tag == .linux) {
+        _ = linux.fcntl(@intCast(fd), linux.F.SETFL, linux.SOCK.NONBLOCK);
+    } else {
+        setFdFlags(fd, std.c.O{ .NONBLOCK = true });
+    }
+}
+
+/// Read one chunk from fd in non-blocking mode.
+/// Returns: positive = bytes read, 0 = EOF, -1 = EAGAIN, -2 = RST/error.
+fn testReadNonblock(fd: i32, buf: []u8) isize {
+    if (builtin.os.tag == .linux) {
+        const rc = linux.read(@intCast(fd), buf.ptr, buf.len);
+        const e = linux.errno(rc);
+        if (e == .SUCCESS and rc == 0) return 0; // EOF
+        if (e == .AGAIN) return -1;
+        if (e == .CONNRESET or e == .PIPE) return -2;
+        if (e != .SUCCESS) return -2;
+        return @intCast(rc);
+    } else {
+        const rc = std.c.read(fd, buf.ptr, buf.len);
+        if (rc == 0) return 0; // EOF
+        if (rc < 0) {
+            const e = std.posix.errno(rc);
+            if (e == .AGAIN) return -1; // EAGAIN == EWOULDBLOCK on Darwin
+            return -2;
+        }
+        return rc;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 test "worker: integration — accept, keep-alive, shutdown" {
-    // Self-skip on non-Linux: epoll doesn't exist.
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // Skip only on platforms without a reactor backend (Windows, wasm).
+    if (!reactor_supported) return error.SkipZigTest;
 
     const testing = std.testing;
 
     // Build a minimal dispatcher that serves three routes.
-    // The Dispatcher ctx bundles io + app state so io travels through the
-    // vtable rather than being stored on Worker (Task 9 contract: serveEvented
-    // builds the real Dispatcher the same way, bundling *App + init.io).
-    const Bundle = struct {
-        io: std.Io,
-    };
+    const Bundle = struct { io: std.Io };
 
     const DispCtx = struct {
         fn dispatch(ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
-            _ = @as(*Bundle, @ptrCast(@alignCast(ctx))).io; // io available here
+            _ = @as(*Bundle, @ptrCast(@alignCast(ctx))).io;
             _ = arena;
             if (std.mem.eql(u8, req.path, "/")) {
                 return Response.text("hello");
@@ -666,8 +942,6 @@ test "worker: integration — accept, keep-alive, shutdown" {
         }
     };
 
-    // Use std.Io.Threaded for the bundle io (not actually exercised by these
-    // sync-only test handlers, but proves the contract compiles and links).
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     var bundle = Bundle{ .io = threaded.io() };
@@ -677,7 +951,6 @@ test "worker: integration — accept, keep-alive, shutdown" {
         .dispatchFn = DispCtx.dispatch,
     };
 
-    // Build opts.
     const opts = WorkerOpts{
         .max_connections = 64,
         .read_buffer_size = 16 * 1024,
@@ -690,128 +963,45 @@ test "worker: integration — accept, keep-alive, shutdown" {
         .tcp_nodelay = true,
     };
 
-    // Bind to an ephemeral port on loopback.
     var shutdown = std.atomic.Value(bool).init(false);
-
-    // Pick an ephemeral port (port 0 → kernel assigns).
     const listen_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
 
     var worker = try Worker.init(testing.allocator, disp, opts, listen_addr, &shutdown);
     defer worker.deinit();
 
-    // Find out which port the kernel assigned by getsockname.
-    var bound: std.posix.sockaddr = undefined;
-    var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-    const grc = linux.getsockname(@intCast(worker.listen_fd), &bound, &bound_len);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(grc));
-    const bound_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&bound));
-    const port = std.mem.bigToNative(u16, bound_in.port);
+    const port = testGetPort(worker.listen_fd);
 
-    // Start the worker in a thread.
     const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
 
-    // Give the worker a moment to enter epoll_wait.
-    {
-        const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-        _ = linux.nanosleep(&ts, null);
-    }
+    testSleep(10);
 
-    // Connect a raw client socket.
-    const cfd_rc = linux.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
-        0,
-    );
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd_rc));
-    const cfd: i32 = @intCast(cfd_rc);
-    defer _ = linux.close(@intCast(cfd));
-
-    var sa_in = std.posix.sockaddr.in{
-        .family = std.posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001),
-        .zero = [_]u8{0} ** 8,
-    };
-    const connect_rc = linux.connect(
-        @intCast(cfd),
-        @ptrCast(&sa_in),
-        @sizeOf(std.posix.sockaddr.in),
-    );
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(connect_rc));
-
-    // Helper: send + receive on the blocking client socket.
-    const sendAll = struct {
-        fn f(fd: i32, data: []const u8) !void {
-            var sent: usize = 0;
-            while (sent < data.len) {
-                const n = linux.write(@intCast(fd), data[sent..].ptr, data.len - sent);
-                if (linux.errno(n) != .SUCCESS) return error.SendFailed;
-                sent += @intCast(n);
-            }
-        }
-    }.f;
-
-    const recvResponse = struct {
-        fn f(fd: i32, buf: []u8) ![]u8 {
-            var total: usize = 0;
-            while (total < buf.len) {
-                const n = linux.read(@intCast(fd), buf[total..].ptr, buf.len - total);
-                if (linux.errno(n) != .SUCCESS) return buf[0..total];
-                if (n == 0) return buf[0..total];
-                total += @intCast(n);
-                // Check if we have a complete HTTP response: headers + body.
-                const so_far = buf[0..total];
-                // Find header/body separator.
-                if (std.mem.indexOf(u8, so_far, "\r\n\r\n")) |sep| {
-                    // Check if Content-Length is present to know how much body to expect.
-                    const headers = so_far[0 .. sep + 4];
-                    if (std.mem.indexOf(u8, headers, "content-length: ")) |cl_start| {
-                        const after = headers[cl_start + "content-length: ".len ..];
-                        const end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
-                        const clen = std.fmt.parseInt(usize, after[0..end], 10) catch 0;
-                        const body_received = total - (sep + 4);
-                        if (body_received >= clen) return buf[0..total];
-                    } else {
-                        // No content-length: assume done (e.g. 0-byte body).
-                        return buf[0..total];
-                    }
-                }
-            }
-            return buf[0..total];
-        }
-    }.f;
+    const cfd = try testConnect(port);
+    defer closeFd(cfd);
 
     // --- Request 1: GET / ---
-    const req1 = "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
-    try sendAll(cfd, req1);
-
+    try testWrite(cfd, "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
     var rbuf1: [4096]u8 = undefined;
-    const resp1 = try recvResponse(cfd, &rbuf1);
+    const resp1 = testRecvResponse(cfd, &rbuf1);
     try testing.expect(std.mem.indexOf(u8, resp1, "200") != null);
     try testing.expect(std.mem.indexOf(u8, resp1, "hello") != null);
 
-    // --- Request 2: GET / on same connection (keep-alive) ---
-    const req2 = "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
-    try sendAll(cfd, req2);
-
+    // --- Request 2: keep-alive ---
+    try testWrite(cfd, "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
     var rbuf2: [4096]u8 = undefined;
-    const resp2 = try recvResponse(cfd, &rbuf2);
+    const resp2 = testRecvResponse(cfd, &rbuf2);
     try testing.expect(std.mem.indexOf(u8, resp2, "200") != null);
     try testing.expect(std.mem.indexOf(u8, resp2, "hello") != null);
 
-    // --- Shutdown ---
     shutdown.store(true, .release);
     worker.wake();
     thread.join();
 }
 
 test "worker: idle connection closed after read timeout (no bytes sent)" {
-    // Linux-only: epoll doesn't exist elsewhere.
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!reactor_supported) return error.SkipZigTest;
 
     const testing = std.testing;
 
-    // Minimal dispatcher — never called for this test (client sends nothing).
     const Bundle = struct { io: std.Io };
     const DispCtx = struct {
         fn dispatch(ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
@@ -831,7 +1021,6 @@ test "worker: idle connection closed after read timeout (no bytes sent)" {
         .dispatchFn = DispCtx.dispatch,
     };
 
-    // Short read_timeout so the test completes quickly.
     const opts = WorkerOpts{
         .max_connections = 64,
         .read_buffer_size = 4 * 1024,
@@ -839,7 +1028,7 @@ test "worker: idle connection closed after read timeout (no bytes sent)" {
         .keep_alive = false,
         .max_keep_alive_requests = 1,
         .max_body_size = 0,
-        .read_timeout_ms = 200, // 200 ms — short enough for a unit test
+        .read_timeout_ms = 200,
         .idle_timeout_ms = 200,
         .tcp_nodelay = true,
     };
@@ -850,112 +1039,49 @@ test "worker: idle connection closed after read timeout (no bytes sent)" {
     var worker = try Worker.init(testing.allocator, disp, opts, listen_addr, &shutdown);
     defer worker.deinit();
 
-    // Find out which port the kernel assigned.
-    var bound: std.posix.sockaddr = undefined;
-    var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-    const grc = linux.getsockname(@intCast(worker.listen_fd), &bound, &bound_len);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(grc));
-    const bound_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&bound));
-    const port = std.mem.bigToNative(u16, bound_in.port);
-
-    // Start the worker.
+    const port = testGetPort(worker.listen_fd);
     const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
 
-    // Brief pause for the worker to enter epoll_wait.
-    {
-        const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-        _ = linux.nanosleep(&ts, null);
-    }
+    testSleep(10);
 
     // Connect a client but send ZERO bytes.
-    const cfd_rc = linux.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
-        0,
-    );
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd_rc));
-    const cfd: i32 = @intCast(cfd_rc);
-    defer _ = linux.close(@intCast(cfd));
-
-    var sa_in = std.posix.sockaddr.in{
-        .family = std.posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001),
-        .zero = [_]u8{0} ** 8,
-    };
-    const connect_rc = linux.connect(
-        @intCast(cfd),
-        @ptrCast(&sa_in),
-        @sizeOf(std.posix.sockaddr.in),
-    );
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(connect_rc));
+    const cfd = try testConnect(port);
+    defer closeFd(cfd);
 
     // Wait up to 1 s for the worker to time-out and close the idle connection.
-    // On read timeout the worker sends a 408 Request Timeout and then closes.
-    // Drain all incoming bytes until we get EOF (read returns 0).
     var got_eof = false;
     var drain_buf: [4096]u8 = undefined;
     var attempts: usize = 0;
     while (attempts < 20) : (attempts += 1) {
-        const ts = linux.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
-        _ = linux.nanosleep(&ts, null);
-
-        const n = linux.read(@intCast(cfd), &drain_buf, drain_buf.len);
-        const e = linux.errno(n);
-        if (e == .SUCCESS and n == 0) {
-            got_eof = true; // clean EOF — worker closed the connection
+        testSleep(50);
+        const n = testReadNonblock(cfd, &drain_buf);
+        if (n == 0 or n == -2) { // EOF or RST
+            got_eof = true;
             break;
         }
-        if (e == .CONNRESET or e == .PIPE) {
-            got_eof = true; // RST — also counts as closed
-            break;
-        }
-        // n > 0: we received the 408 response bytes — keep draining until EOF.
-        // EAGAIN: nothing yet, keep waiting.
+        // n > 0: drained some bytes (likely 408 response); keep polling.
+        // n == -1: EAGAIN, nothing yet.
     }
 
-    try testing.expect(got_eof); // idle connection must be closed by the timeout
+    try testing.expect(got_eof);
 
-    // Slot is reusable: the free-list length should have recovered.
-    // We can't easily inspect worker internals from outside the struct,
-    // but we verify by connecting *again* and doing a real request — if the
-    // slot was properly freed we get a 200; if not, the pool would be at
-    // capacity and the second connect would be shed.
-    const cfd2_rc = linux.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
-        0,
-    );
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd2_rc));
-    const cfd2: i32 = @intCast(cfd2_rc);
-    defer _ = linux.close(@intCast(cfd2));
+    // Verify the slot was freed by doing a real request on a second connection.
+    const cfd2 = try testConnect(port);
+    defer closeFd(cfd2);
 
-    const con2_rc = linux.connect(
-        @intCast(cfd2),
-        @ptrCast(&sa_in),
-        @sizeOf(std.posix.sockaddr.in),
-    );
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(con2_rc));
-
-    // Send a valid request on the second connection.
-    const req_str = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
-    var sent: usize = 0;
-    while (sent < req_str.len) {
-        const n = linux.write(@intCast(cfd2), req_str[sent..].ptr, req_str.len - sent);
-        if (linux.errno(n) != .SUCCESS) break;
-        sent += @intCast(n);
-    }
-
+    try testWrite(cfd2, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     var rbuf: [2048]u8 = undefined;
     var total: usize = 0;
     var attempts2: usize = 0;
     while (total < rbuf.len and attempts2 < 40) : (attempts2 += 1) {
-        const n = linux.read(@intCast(cfd2), rbuf[total..].ptr, rbuf.len - total);
-        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(linux.read(@intCast(cfd2), rbuf[total..].ptr, rbuf.len - total))
+        else
+            std.c.read(cfd2, rbuf[total..].ptr, rbuf.len - total);
+        if (n <= 0) break;
         total += @intCast(n);
         if (std.mem.indexOf(u8, rbuf[0..total], "\r\n\r\n") != null) break;
     }
-
     try testing.expect(std.mem.indexOf(u8, rbuf[0..total], "200") != null);
 
     shutdown.store(true, .release);
@@ -964,17 +1090,13 @@ test "worker: idle connection closed after read timeout (no bytes sent)" {
 }
 
 test "worker: write-stall deadline — server reaps a peer that stops reading" {
-    // Linux-only: epoll + SO_RCVBUF behaviour tested here.
+    // TCP_WINDOW_CLAMP is Linux-specific; skip on macOS/BSD.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     const testing = std.testing;
 
-    // Response body must fit in write_buffer_size (4 KB) but exceed the
-    // combined SO_SNDBUF (2 KB override) + SO_RCVBUF (1 KB) so the server's
-    // send() hits EAGAIN and enters the want_write stall path.
-    // Body 3 KB + ~100 bytes headers = ~3.1 KB → fits in 4 KB write buffer
-    // but exceeds the 2 KB sndbuf_override + 1 KB rcvbuf = 3 KB total.
-    const BODY_SIZE: usize = 3 * 1024; // 3 KB
+    // Response body must exceed sndbuf_override + client rcvbuf to force EAGAIN.
+    const BODY_SIZE: usize = 3 * 1024;
 
     const Bundle = struct { io: std.Io };
     const DispCtx = struct {
@@ -982,7 +1104,6 @@ test "worker: write-stall deadline — server reaps a peer that stops reading" {
             _ = @as(*Bundle, @ptrCast(@alignCast(ctx))).io;
             _ = req;
             _ = arena;
-            // Build a 3 KB body: all 'X' bytes.
             var body_buf: [BODY_SIZE]u8 = undefined;
             @memset(&body_buf, 'X');
             return Response.text(&body_buf);
@@ -998,19 +1119,16 @@ test "worker: write-stall deadline — server reaps a peer that stops reading" {
         .dispatchFn = DispCtx.dispatch,
     };
 
-    // Short read_timeout_ms doubles as the write-stall deadline.
     const opts = WorkerOpts{
         .max_connections = 64,
         .read_buffer_size = 16 * 1024,
-        .write_buffer_size = 4 * 1024, // fits the 3 KB body + headers
+        .write_buffer_size = 4 * 1024,
         .keep_alive = false,
         .max_keep_alive_requests = 1,
         .max_body_size = 0,
-        .read_timeout_ms = 300, // 300 ms write-stall deadline
+        .read_timeout_ms = 300,
         .idle_timeout_ms = 5000,
         .tcp_nodelay = true,
-        // Force a tiny SO_SNDBUF on accepted fds so the server hits EAGAIN
-        // quickly on loopback (default loopback sndbuf is ~200 KB).
         .sndbuf_override = 2048,
     };
 
@@ -1020,56 +1138,22 @@ test "worker: write-stall deadline — server reaps a peer that stops reading" {
     var worker = try Worker.init(testing.allocator, disp, opts, listen_addr, &shutdown);
     defer worker.deinit();
 
-    var bound: std.posix.sockaddr = undefined;
-    var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-    const grc = linux.getsockname(@intCast(worker.listen_fd), &bound, &bound_len);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(grc));
-    const bound_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&bound));
-    const port = std.mem.bigToNative(u16, bound_in.port);
-
+    const port = testGetPort(worker.listen_fd);
     const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
 
-    // Wait for worker to enter epoll_wait.
-    {
-        const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-        _ = linux.nanosleep(&ts, null);
-    }
+    testSleep(10);
 
-    // Create client socket with a very small receive buffer (1 KB).
-    // This ensures the server's send() fills the client window quickly and
-    // blocks (EAGAIN / want_write) — the classic write-stall scenario.
-    const cfd_rc = linux.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
-        0,
-    );
+    // Create client socket with a very small receive buffer.
+    const cfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd_rc));
     const cfd: i32 = @intCast(cfd_rc);
-    defer _ = linux.close(@intCast(cfd));
+    defer closeFd(cfd);
 
-    // Set SO_RCVBUF to minimum so the kernel allocates a tiny receive buffer.
     const rcvbuf: c_int = 128;
-    _ = linux.setsockopt(
-        @intCast(cfd),
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVBUF,
-        @ptrCast(&rcvbuf),
-        @sizeOf(c_int),
-    );
-    // TCP_WINDOW_CLAMP = 10: clamp the advertised receive window to 1 byte.
-    // Once 1 byte lands in the kernel receive buffer (and we never read),
-    // the client advertises window=0.  The server's send() then returns
-    // EAGAIN → want_write stall.  This is reliable even on loopback where
-    // the default send buffer would otherwise absorb the whole response.
+    _ = linux.setsockopt(@intCast(cfd), std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, @ptrCast(&rcvbuf), @sizeOf(c_int));
     const TCP_WINDOW_CLAMP: u32 = 10;
     const wclamp: c_int = 1;
-    _ = linux.setsockopt(
-        @intCast(cfd),
-        std.posix.IPPROTO.TCP,
-        TCP_WINDOW_CLAMP,
-        @ptrCast(&wclamp),
-        @sizeOf(c_int),
-    );
+    _ = linux.setsockopt(@intCast(cfd), std.posix.IPPROTO.TCP, TCP_WINDOW_CLAMP, @ptrCast(&wclamp), @sizeOf(c_int));
 
     var sa_in = std.posix.sockaddr.in{
         .family = std.posix.AF.INET,
@@ -1077,61 +1161,29 @@ test "worker: write-stall deadline — server reaps a peer that stops reading" {
         .addr = std.mem.nativeToBig(u32, 0x7F000001),
         .zero = [_]u8{0} ** 8,
     };
-    const connect_rc = linux.connect(
-        @intCast(cfd),
-        @ptrCast(&sa_in),
-        @sizeOf(std.posix.sockaddr.in),
-    );
+    const connect_rc = linux.connect(@intCast(cfd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(connect_rc));
 
-    // Send a valid GET request.
-    const req_str = "GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
-    var sent: usize = 0;
-    while (sent < req_str.len) {
-        const n = linux.write(@intCast(cfd), req_str[sent..].ptr, req_str.len - sent);
-        if (linux.errno(n) != .SUCCESS) break;
-        sent += @intCast(n);
-    }
+    try testWrite(cfd, "GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
 
-    // Do NOT read the response — let the server's send fill the tiny receive
-    // window.  The server will hit EAGAIN → want_write → write-stall deadline.
-    // After ~300 ms the server should close the connection.
+    // Do NOT read — let the server's send fill the tiny receive window.
+    testSetNonblock(cfd);
 
-    // Set the client socket non-blocking so we can drain + detect EOF without
-    // blocking the test thread indefinitely.
-    // linux.SOCK.NONBLOCK == O_NONBLOCK on Linux (same constant, 0o4000).
-    _ = linux.fcntl(@intCast(cfd), linux.F.SETFL, linux.SOCK.NONBLOCK);
-
-    // Poll for EOF/RST: drain all available data (consuming it), watching for
-    // rc==0 (EOF) or ECONNRESET (RST) which signals the server closed.
-    // We try up to ~1.5 s (30 × 50 ms) to allow the 300 ms deadline to fire.
     var drain_buf: [4096]u8 = undefined;
     var got_close = false;
     var attempts: usize = 0;
     while (attempts < 30) : (attempts += 1) {
-        const ts = linux.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
-        _ = linux.nanosleep(&ts, null);
-
-        // Drain all available bytes in a tight loop.
+        testSleep(50);
         var inner: usize = 0;
         while (inner < 256) : (inner += 1) {
-            const rc = linux.read(@intCast(cfd), &drain_buf, drain_buf.len);
-            const e = linux.errno(rc);
-            if (e == .SUCCESS and rc == 0) {
-                got_close = true; // clean EOF
-                break;
-            }
-            if (e == .CONNRESET or e == .PIPE) {
-                got_close = true; // RST
-                break;
-            }
-            if (e == .AGAIN) break; // no more data right now
-            // rc > 0: consumed bytes, keep draining
+            const n = testReadNonblock(cfd, &drain_buf);
+            if (n == 0 or n == -2) { got_close = true; break; }
+            if (n == -1) break;
         }
         if (got_close) break;
     }
 
-    try testing.expect(got_close); // server must reap the stalled connection
+    try testing.expect(got_close);
 
     shutdown.store(true, .release);
     worker.wake();
