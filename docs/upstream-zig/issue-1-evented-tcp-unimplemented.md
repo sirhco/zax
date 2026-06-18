@@ -100,13 +100,27 @@ mainstream platforms. We hit it building an evented backend for a Zig web framew
 framework's `Io` is fully generic and runs on `Io.Threaded` today, but swapping in
 `Io.Evented` dies at `listen`.
 
-Concretely, the missing evented backend is costing real performance. Benchmarked on Linux
-(core-pinned, server vs load-generator on disjoint cores), the same framework on `Io.Threaded`
-(thread-per-connection) does **~115k req/s with a p99.9 of ~53ms**, while Rust/axum (tokio,
-evented) on the identical hardware does **~440k req/s with p99.9 ~0.36ms** — a ~4× throughput
-and ~150× tail-latency gap, traced not to the framework's request code (all per-request work
-profiles <7ms) but to the thread-per-connection IO model. An `Io.Evented` TCP backend is the
-direct fix, and it is gated entirely on this gap.
+Concretely, the missing evented backend is costing real performance, and we have measured
+exactly what it would recover. Benchmarked on Linux (core-pinned, server vs load-generator on
+disjoint cores, same hardware):
+
+| backend | req/s | p50 | p99.9 |
+|---|---|---|---|
+| our framework on `Io.Threaded` (thread-per-conn) | ~115k | 0.053ms | **~53ms** |
+| Rust/axum (tokio, evented) | ~447k | 0.137ms | 0.35ms |
+| **our framework on a hand-rolled epoll reactor (stock Zig)** | **~750k** | **0.074ms** | **0.35ms** |
+
+When we worked around this gap by writing our own non-blocking **epoll reactor** inside the
+framework (bypassing `std.Io` for the socket layer), the same request code jumped from ~115k
+to **~750k req/s** and the ~53ms p99.9 tail collapsed to **~0.35ms** — faster than axum/tokio
+on the same box. So the request path was never the bottleneck; the thread-per-connection
+`Io.Threaded` model was, and an evented reactor fully fixes it.
+
+That hand-rolled reactor is precisely the workload `std.Io.Evented` is meant to serve. We only
+built it because `Io.Evented` can't `listen`/`accept`/`recv`/`send` — had the TCP ops been
+implemented, the framework's already-`Io`-generic server would have run on `Io.Evented`
+unchanged, with no bespoke reactor and no `std` bypass. Implementing these ops would give every
+Zig `std.Io` server this performance for free.
 
 ## Questions for maintainers
 
