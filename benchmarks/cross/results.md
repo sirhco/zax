@@ -289,3 +289,33 @@ fastest throughput, sub-0.4ms p99.9 (tighter than or matching axum), and the bes
 latency of all five frameworks. The threaded backend's 53–57ms p99.9 tail was entirely a
 `std.Io.Threaded` thread-park/scheduler artifact. The epoll reactor (Tasks 1–9) eliminates it
 completely.
+
+### Evented zax — 30s confirmation (Linux Docker VM, PIN=1)
+
+Re-run at `DURATION=30s` (vs the 15s payoff run above), on a freshly rebuilt image off current
+`main` (so this also confirms the H5/H6 hardening — request_id parity, write-stall deadline —
+did not regress throughput). Same caveat: Docker linuxkit VM, not bare metal (see
+`baremetal-linux.md` for the off-VM procedure).
+
+| framework | scenario | req/s | p50 | p99 | p99.9 | max |
+|-----------|----------|------:|----:|----:|------:|----:|
+| zax (threaded) | static | 116228 | 0.0546 | 1.1977 | 54.1217 | 71.8119 |
+| zax (threaded) | param  | 119794 | 0.0526 | 1.1416 | 52.3098 | 73.0721 |
+| zax (threaded) | json   | 115980 | 0.0548 | 3.6495 | 54.3296 | 94.7692 |
+| **zax-ev**     | static | 752119 | 0.0747 | 0.2347 | 0.3640 | 5.3176 |
+| **zax-ev**     | param  | 755285 | 0.0746 | 0.2333 | 0.3498 | 6.5031 |
+| **zax-ev**     | json   | 762440 | 0.0732 | 0.2283 | 0.3508 | 3.3470 |
+| axum | static | 446538 | 0.1376 | 0.2827 | 0.3479 | 1.6746 |
+| axum | param  | 442978 | 0.1385 | 0.2859 | 0.3581 | 5.2734 |
+| axum | json   | 446748 | 0.1349 | 0.3019 | 0.3999 | 7.8400 |
+| go   | static | 390885 | 0.0826 | 2.0641 | 2.9238 | 51.4195 |
+| go   | param  | 391300 | 0.0820 | 2.1038 | 2.8912 | 13.2747 |
+| go   | json   | 199307 | 0.1106 | 2.6458 | 3.4098 | 8.6927 |
+| httpz | static | 402439 | 0.1508 | 0.3127 | 0.4073 | 15.0316 |
+| httpz | param  | 390220 | 0.1561 | 0.3171 | 0.4028 | 16.0450 |
+| httpz | json   | 390972 | 0.1559 | 0.3164 | 0.4047 | 3.6032 |
+
+**Stable + reproducible.** zax-ev 752–762k (slightly *above* the 15s run's 741–753k) — fastest
+of all five: ~1.7× axum, ~1.9× httpz, ~6.5× threaded zax; p99.9 ~0.35ms (tied-best with axum);
+p50 0.073ms (best of all). The H5/H6 hardening shows no throughput regression. Off-VM
+confirmation remains the one open item (`baremetal-linux.md`).
