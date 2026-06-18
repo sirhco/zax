@@ -135,6 +135,27 @@ pub fn serveEvented(self: *App, addr: net.IpAddress, opts: EventedOptions) !void
 - **Perf (Docker cross-bench):** add an evented zax variant; compare vs httpz/axum/go,
   targeting httpz-class throughput/tail while keeping zax's best-in-class p50.
 
+## Evented backend v1 limitations
+
+These are deliberate v1 scope decisions, not bugs. They diverge from the threaded backend in
+known, documented ways:
+
+1. **No `request_id` on the evented path.** `Options.request_id = true` has no effect under
+   `serveEvented`: no `x-request-id` response header is emitted, and the `AccessRecord`
+   passed to observers always carries `request_id = ""`. Generating a request ID requires a
+   monotonic counter per-connection that is not yet threaded through the `Dispatcher` vtable.
+2. **No write-stall deadline.** A peer that stalls mid-write — advertises zero TCP window and
+   never RSTs — holds a slot indefinitely (the write-side has no timeout). A peer that
+   closes or RSTs *is* caught via `EPOLLHUP`/`EPOLLRDHUP` and the slot is freed promptly.
+   True write-stall eviction requires an `EPOLLOUT`-armed deadline, deferred to v2.
+3. **Handlers must not use `ctx.io` for blocking IO.** Any handler that calls a blocking-IO
+   extractor (e.g. `Files`, async DB queries over `io`) stalls the entire worker event loop:
+   no new accepts, no timer sweeps, no other connections make progress. Use only sync /
+   compute-only extractors (Path, Query, Json, State, etc.) under `serveEvented`.
+4. **True streaming is threaded-only.** `resp.streamer` on the evented path buffers into the
+   write buffer up to its capacity; beyond that a 500 is synthesized and the connection is
+   closed. Unbuffered streaming (`SSE`, chunked flush) requires the threaded backend.
+
 ## Out of scope (v1)
 kqueue/macOS-native reactor, true (unbuffered) streaming on evented, TLS, HTTP/2. The
 threaded backend remains for non-Linux, streaming, and as the portable default. Phasing keeps

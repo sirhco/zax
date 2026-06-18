@@ -327,10 +327,26 @@ pub const Worker = struct {
                 continue;
             };
 
-            // Arm the read deadline via the timer wheel.
-            // deadline_ns defaults to maxInt(i96) (no deadline) at construction time;
-            // the read deadline is set by the first call to conn.step, not at init.
-            // So we skip timer insertion here and let the first step() arm it.
+            // Arm the read deadline at accept time — NOT deferred to the first
+            // conn.step call.  A peer that completes the TCP handshake but sends
+            // nothing never triggers EPOLLIN, so conn.step never runs, the deadline
+            // is never set, and the fd+slot would leak until process exit (idle-conn
+            // DoS / fd exhaustion).  Pre-arming here closes that window.
+            //
+            // We mirror exactly what conn.step does on reading_head entry:
+            //   if read_timeout_ms == 0 → no deadline (sentinel)
+            //   else                    → now + timeout_ms * 1_000_000 ns
+            //
+            // conn.step detects "deadline already set" via `if (deadline_ns ==
+            // no_deadline)` and skips re-arming on first readable event, so there
+            // is no double-arm.
+            if (self.opts.read_timeout_ms != 0) {
+                slot.conn.deadline_ns = monotonicNow() +
+                    @as(i96, self.opts.read_timeout_ms) * 1_000_000;
+                self.timer.insert(slot_idx, slot.conn.deadline_ns);
+            }
+            // If read_timeout_ms == 0, deadline_ns stays at no_deadline (maxInt(i96))
+            // and no timer entry is created — consistent with conn.step's own logic.
         }
     }
 
@@ -730,6 +746,164 @@ test "worker: integration — accept, keep-alive, shutdown" {
     try testing.expect(std.mem.indexOf(u8, resp2, "hello") != null);
 
     // --- Shutdown ---
+    shutdown.store(true, .release);
+    worker.wake();
+    thread.join();
+}
+
+test "worker: idle connection closed after read timeout (no bytes sent)" {
+    // Linux-only: epoll doesn't exist elsewhere.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    // Minimal dispatcher — never called for this test (client sends nothing).
+    const Bundle = struct { io: std.Io };
+    const DispCtx = struct {
+        fn dispatch(ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
+            _ = @as(*Bundle, @ptrCast(@alignCast(ctx))).io;
+            _ = req;
+            _ = arena;
+            return Response.text("ok");
+        }
+    };
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var bundle = Bundle{ .io = threaded.io() };
+
+    const disp = Dispatcher{
+        .ctx = @ptrCast(&bundle),
+        .dispatchFn = DispCtx.dispatch,
+    };
+
+    // Short read_timeout so the test completes quickly.
+    const opts = WorkerOpts{
+        .max_connections = 64,
+        .read_buffer_size = 4 * 1024,
+        .write_buffer_size = 4 * 1024,
+        .keep_alive = false,
+        .max_keep_alive_requests = 1,
+        .max_body_size = 0,
+        .read_timeout_ms = 200, // 200 ms — short enough for a unit test
+        .idle_timeout_ms = 200,
+        .tcp_nodelay = true,
+    };
+
+    var shutdown = std.atomic.Value(bool).init(false);
+    const listen_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+
+    var worker = try Worker.init(testing.allocator, disp, opts, listen_addr, &shutdown);
+    defer worker.deinit();
+
+    // Find out which port the kernel assigned.
+    var bound: std.posix.sockaddr = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    const grc = linux.getsockname(@intCast(worker.listen_fd), &bound, &bound_len);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(grc));
+    const bound_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&bound));
+    const port = std.mem.bigToNative(u16, bound_in.port);
+
+    // Start the worker.
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+
+    // Brief pause for the worker to enter epoll_wait.
+    {
+        const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+    }
+
+    // Connect a client but send ZERO bytes.
+    const cfd_rc = linux.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+        0,
+    );
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd_rc));
+    const cfd: i32 = @intCast(cfd_rc);
+    defer _ = linux.close(@intCast(cfd));
+
+    var sa_in = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+        .zero = [_]u8{0} ** 8,
+    };
+    const connect_rc = linux.connect(
+        @intCast(cfd),
+        @ptrCast(&sa_in),
+        @sizeOf(std.posix.sockaddr.in),
+    );
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(connect_rc));
+
+    // Wait up to 1 s for the worker to time-out and close the idle connection.
+    // On read timeout the worker sends a 408 Request Timeout and then closes.
+    // Drain all incoming bytes until we get EOF (read returns 0).
+    var got_eof = false;
+    var drain_buf: [4096]u8 = undefined;
+    var attempts: usize = 0;
+    while (attempts < 20) : (attempts += 1) {
+        const ts = linux.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+
+        const n = linux.read(@intCast(cfd), &drain_buf, drain_buf.len);
+        const e = linux.errno(n);
+        if (e == .SUCCESS and n == 0) {
+            got_eof = true; // clean EOF — worker closed the connection
+            break;
+        }
+        if (e == .CONNRESET or e == .PIPE) {
+            got_eof = true; // RST — also counts as closed
+            break;
+        }
+        // n > 0: we received the 408 response bytes — keep draining until EOF.
+        // EAGAIN: nothing yet, keep waiting.
+    }
+
+    try testing.expect(got_eof); // idle connection must be closed by the timeout
+
+    // Slot is reusable: the free-list length should have recovered.
+    // We can't easily inspect worker internals from outside the struct,
+    // but we verify by connecting *again* and doing a real request — if the
+    // slot was properly freed we get a 200; if not, the pool would be at
+    // capacity and the second connect would be shed.
+    const cfd2_rc = linux.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+        0,
+    );
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd2_rc));
+    const cfd2: i32 = @intCast(cfd2_rc);
+    defer _ = linux.close(@intCast(cfd2));
+
+    const con2_rc = linux.connect(
+        @intCast(cfd2),
+        @ptrCast(&sa_in),
+        @sizeOf(std.posix.sockaddr.in),
+    );
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(con2_rc));
+
+    // Send a valid request on the second connection.
+    const req_str = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    var sent: usize = 0;
+    while (sent < req_str.len) {
+        const n = linux.write(@intCast(cfd2), req_str[sent..].ptr, req_str.len - sent);
+        if (linux.errno(n) != .SUCCESS) break;
+        sent += @intCast(n);
+    }
+
+    var rbuf: [2048]u8 = undefined;
+    var total: usize = 0;
+    var attempts2: usize = 0;
+    while (total < rbuf.len and attempts2 < 40) : (attempts2 += 1) {
+        const n = linux.read(@intCast(cfd2), rbuf[total..].ptr, rbuf.len - total);
+        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        total += @intCast(n);
+        if (std.mem.indexOf(u8, rbuf[0..total], "\r\n\r\n") != null) break;
+    }
+
+    try testing.expect(std.mem.indexOf(u8, rbuf[0..total], "200") != null);
+
     shutdown.store(true, .release);
     worker.wake();
     thread.join();

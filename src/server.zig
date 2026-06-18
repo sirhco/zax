@@ -442,7 +442,27 @@ pub fn App(comptime AppState: type) type {
             const DispatchFn = struct {
                 fn dispatch(ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
                     const b: *AppIoBundle = @ptrCast(@alignCast(ctx));
-                    return b.app.dispatch(b.io, req, arena, "");
+                    // Time the dispatch for observers; skip the clock read when no
+                    // observers are registered (zero-overhead-when-none guard).
+                    const t0: i96 = if (b.app.observers.items.len > 0)
+                        conn_mod.monotonicNow()
+                    else
+                        0;
+                    const resp = b.app.dispatch(b.io, req, arena, "");
+                    if (b.app.observers.items.len > 0) {
+                        const dur: u64 = @intCast(@max(@as(i96, 0), conn_mod.monotonicNow() - t0));
+                        const rec = observe_mod.AccessRecord{
+                            .method = req.method,
+                            .path = req.path,
+                            .status = resp.status.code(),
+                            .duration_ns = dur,
+                            .bytes = resp.body.len,
+                            // request_id is not generated on the evented path (v1 limitation).
+                            .request_id = "",
+                        };
+                        for (b.app.observers.items) |obs| obs.func(obs.context, rec);
+                    }
+                    return resp;
                 }
             };
 
@@ -2503,6 +2523,138 @@ test "serveEvented: 2-worker integration — keep-alive requests across 3 routes
     defer shutdown_threaded.deinit();
     app.requestShutdown(shutdown_threaded.io());
 
+    srv_thread.join();
+    try testing.expect(serve_ctx.err == null);
+}
+
+test "serveEvented: observer fires for each request" {
+    // Linux-only: epoll doesn't exist elsewhere.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const linux = std.os.linux;
+
+    var db = Db{ .msg = "hello" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ping", pingHandler);
+
+    // Register an observer that counts and captures the last record.
+    var cap = ObsCapture{};
+    try app.observe(.{ .context = &cap, .func = obsCapture });
+
+    const port: u16 = 18201;
+    const addr = net.IpAddress{ .ip4 = .loopback(port) };
+
+    const ServeCtx = struct {
+        app: *TestApp,
+        io: Io,
+        addr: net.IpAddress,
+        err: ?anyerror = null,
+    };
+    var serve_ctx = ServeCtx{ .app = &app, .io = undefined, .addr = addr };
+    var srv_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer srv_threaded.deinit();
+    serve_ctx.io = srv_threaded.io();
+
+    const ServeThread = struct {
+        fn run(ctx: *ServeCtx) void {
+            ctx.app.serveEvented(ctx.io, ctx.addr, .{ .workers = 1 }) catch |e| {
+                ctx.err = e;
+            };
+        }
+    };
+    const srv_thread = try std.Thread.spawn(.{}, ServeThread.run, .{&serve_ctx});
+
+    // Wait for the worker to start listening.
+    {
+        var attempts: usize = 0;
+        while (attempts < 50) : (attempts += 1) {
+            const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&ts, null);
+            const tfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+            if (linux.errno(tfd_rc) != .SUCCESS) continue;
+            const tfd: i32 = @intCast(tfd_rc);
+            var sa_in = std.posix.sockaddr.in{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, port),
+                .addr = std.mem.nativeToBig(u32, 0x7F000001),
+                .zero = [_]u8{0} ** 8,
+            };
+            const rc = linux.connect(@intCast(tfd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
+            _ = linux.close(@intCast(tfd));
+            if (linux.errno(rc) == .SUCCESS) break;
+        }
+    }
+
+    // Connect and send two requests.
+    const cfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd_rc));
+    const cfd: i32 = @intCast(cfd_rc);
+    defer _ = linux.close(@intCast(cfd));
+
+    var sa_connect = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+        .zero = [_]u8{0} ** 8,
+    };
+    const con_rc = linux.connect(@intCast(cfd), @ptrCast(&sa_connect), @sizeOf(std.posix.sockaddr.in));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(con_rc));
+
+    const sendAll = struct {
+        fn f(fd: i32, data: []const u8) !void {
+            var sent: usize = 0;
+            while (sent < data.len) {
+                const n = linux.write(@intCast(fd), data[sent..].ptr, data.len - sent);
+                if (linux.errno(n) != .SUCCESS) return error.SendFailed;
+                sent += @intCast(n);
+            }
+        }
+    }.f;
+
+    const recvFull = struct {
+        fn f(fd: i32, buf: []u8) []u8 {
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = linux.read(@intCast(fd), buf[total..].ptr, buf.len - total);
+                if (linux.errno(n) != .SUCCESS or n == 0) break;
+                total += @intCast(n);
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |sep| {
+                    if (std.mem.indexOf(u8, buf[0 .. sep + 4], "content-length: ")) |cl_start| {
+                        const after = buf[cl_start + "content-length: ".len .. sep + 4];
+                        const end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
+                        const clen = std.fmt.parseInt(usize, after[0..end], 10) catch 0;
+                        if (total - (sep + 4) >= clen) break;
+                    } else break;
+                }
+            }
+            return buf[0..total];
+        }
+    }.f;
+
+    var buf1: [2048]u8 = undefined;
+    try sendAll(cfd, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+    _ = recvFull(cfd, &buf1);
+
+    var buf2: [2048]u8 = undefined;
+    try sendAll(cfd, "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    _ = recvFull(cfd, &buf2);
+
+    // Small pause: observer fires synchronously on the worker thread, but the
+    // second response might not have been fully flushed yet.
+    {
+        const ts = linux.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+    }
+
+    // Observer must have fired at least twice (once per request).
+    try testing.expect(cap.count >= 2);
+    // Last request was a 404 for /nope.
+    try testing.expectEqual(@as(u16, 404), cap.status);
+
+    var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer shutdown_threaded.deinit();
+    app.requestShutdown(shutdown_threaded.io());
     srv_thread.join();
     try testing.expect(serve_ctx.err == null);
 }
