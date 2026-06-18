@@ -67,15 +67,18 @@ For large or unbounded bodies, use the pull streamer (`streamPull`) — it strea
 chunks without buffering the whole body, with backpressure, on both backends:
 
 ```zig
-fn download(/* ... */) zax.Response {
-    return zax.Response.streamPull(ctx, struct {
-        fn next(c: *anyopaque, buf: []u8) zax.PullResult {
-            const self: *MyState = @ptrCast(@alignCast(c));
-            const n = self.read(buf);            // fill buf with the next chunk
-            if (n == 0) return .done;             // end of stream
-            return .{ .chunk = n };
-        }
-    }.next);
+const Body = struct {
+    // ...your producer state...
+    fn next(self: *Body, buf: []u8) zax.PullResult {
+        const n = self.read(buf);                 // fill buf with the next chunk
+        if (n == 0) return .done;                 // end of stream
+        return .{ .chunk = n };
+    }
+};
+
+fn download(body: *Body) zax.Response {
+    // streamPull(comptime Ctx, *Ctx, nextFn, content_type)
+    return zax.Response.streamPull(Body, body, Body.next, "application/octet-stream");
 }
 ```
 
