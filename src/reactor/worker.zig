@@ -472,12 +472,7 @@ pub const Worker = struct {
 
             // Initialise / reuse the slot.
             slot.conn = Conn.init(slot.read_buf, slot.write_buf, &slot.arena);
-            slot.conn.keep_alive = self.opts.keep_alive;
-            slot.conn.max_keep_alive_requests = self.opts.max_keep_alive_requests;
-            slot.conn.max_body_size = self.opts.max_body_size;
-            slot.conn.read_timeout_ms = self.opts.read_timeout_ms;
-            slot.conn.idle_timeout_ms = self.opts.idle_timeout_ms;
-            slot.conn.stream_repoll_ms = self.opts.stream_repoll_ms;
+            applyConnConfig(&slot.conn, self.opts);
             slot.fd = conn_fd;
             slot.active = true;
 
@@ -750,6 +745,19 @@ fn closeFd(fd: i32) void {
     } else {
         _ = std.c.close(fd);
     }
+}
+
+/// Copy per-connection configuration fields from WorkerOpts onto a freshly
+/// initialised Conn.  Called by acceptLoop; also used directly by tests so
+/// that a regression (dropped assignment) fails the test, not just the
+/// inline logic.
+fn applyConnConfig(conn: *Conn, opts: WorkerOpts) void {
+    conn.keep_alive = opts.keep_alive;
+    conn.max_keep_alive_requests = opts.max_keep_alive_requests;
+    conn.max_body_size = opts.max_body_size;
+    conn.read_timeout_ms = opts.read_timeout_ms;
+    conn.idle_timeout_ms = opts.idle_timeout_ms;
+    conn.stream_repoll_ms = opts.stream_repoll_ms;
 }
 
 /// Set O_NONBLOCK + O_CLOEXEC on `fd` via fcntl.  macOS/BSD only.
@@ -1219,9 +1227,9 @@ test "worker: write-stall deadline — server reaps a peer that stops reading" {
 }
 
 test "worker: stream_repoll_ms propagates from WorkerOpts to conn (default=5, custom=99)" {
-    // Pure unit test: verify the acceptLoop conn-init path carries stream_repoll_ms.
-    // No live sockets — simulates what acceptLoop does when it writes per-worker opts
-    // into the freshly-accepted conn's config fields.
+    // Drives applyConnConfig — the same helper acceptLoop uses — so a regression
+    // (dropped assignment inside applyConnConfig) will fail this test, not just
+    // the inline acceptLoop logic.
     const testing = std.testing;
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
@@ -1231,7 +1239,7 @@ test "worker: stream_repoll_ms propagates from WorkerOpts to conn (default=5, cu
     // Default path: WorkerOpts.stream_repoll_ms == 5 → conn gets 5.
     {
         var c = conn_mod.Conn.init(&rbuf, &wbuf, &arena);
-        const opts_default = WorkerOpts{
+        const opts = WorkerOpts{
             .read_buffer_size = 4096,
             .write_buffer_size = 4096,
             .keep_alive = false,
@@ -1242,7 +1250,7 @@ test "worker: stream_repoll_ms propagates from WorkerOpts to conn (default=5, cu
             .tcp_nodelay = false,
             // stream_repoll_ms left as default (5)
         };
-        c.stream_repoll_ms = opts_default.stream_repoll_ms;
+        applyConnConfig(&c, opts);
         try testing.expectEqual(@as(u32, 5), c.stream_repoll_ms);
     }
 
@@ -1250,7 +1258,7 @@ test "worker: stream_repoll_ms propagates from WorkerOpts to conn (default=5, cu
     {
         _ = arena.reset(.retain_capacity);
         var c = conn_mod.Conn.init(&rbuf, &wbuf, &arena);
-        const opts_custom = WorkerOpts{
+        const opts = WorkerOpts{
             .read_buffer_size = 4096,
             .write_buffer_size = 4096,
             .keep_alive = false,
@@ -1261,7 +1269,7 @@ test "worker: stream_repoll_ms propagates from WorkerOpts to conn (default=5, cu
             .stream_repoll_ms = 99,
             .tcp_nodelay = false,
         };
-        c.stream_repoll_ms = opts_custom.stream_repoll_ms;
+        applyConnConfig(&c, opts);
         try testing.expectEqual(@as(u32, 99), c.stream_repoll_ms);
     }
 }

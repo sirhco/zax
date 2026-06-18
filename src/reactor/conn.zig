@@ -1916,7 +1916,7 @@ test "conn: sparse stream — peer close while parked → done_close on re-drive
     // We need write to succeed for the head, so first step uses ft directly.
     var c = Conn.init(&rbuf, &wbuf, &arena);
     c.keep_alive = false;
-    c.stream_repoll_ms = 5;
+    // stream_repoll_ms defaults to 5 in Conn.init — no explicit assignment needed.
     const t_normal = ft.transport();
 
     // Drive: reads request, dispatches, writes head, calls next() → chunk(0) → park.
