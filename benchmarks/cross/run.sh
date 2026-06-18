@@ -66,15 +66,83 @@ ROWS=()               # accumulated "framework|scenario|reqs|p50|p99|p999|max" f
 # generator on the second half (disjoint) via taskset, so client CPU never
 # steals from the server. taskset is Linux-only; macOS has no shell core
 # pinning — run the load generator on a SEPARATE machine for a fair test.
+#
+# SMT-aware split: group logical CPUs by physical core (pkg:core key from
+# sysfs), split physical cores in half, give server all logical CPUs of the
+# first half and client all logical CPUs of the second half. No physical core
+# is shared, eliminating SMT cross-contention. Falls back to naive split if
+# sysfs topology is unavailable.
+
+# _build_pin_lists <nlogical>
+# Reads /sys/.../topology/{physical_package_id,core_id} for each logical CPU,
+# groups them by physical-core key (pkg:core), splits physical cores in half,
+# and prints two lines: "SRV_CPUS=<comma-list>" and "CLT_CPUS=<comma-list>".
+# Returns non-zero if sysfs is unavailable so the caller can fall back.
+# Uses awk for grouping — compatible with bash 3.x (macOS) and bash 4/5.
+_build_pin_lists() {
+  local ncpus="$1"
+  local cpu pkg core
+
+  # Collect "cpu pkg core" triples; bail immediately if any sysfs file is missing
+  local triples=""
+  for (( cpu=0; cpu<ncpus; cpu++ )); do
+    local topo="/sys/devices/system/cpu/cpu${cpu}/topology"
+    local pkg_f="${topo}/physical_package_id"
+    local core_f="${topo}/core_id"
+    [ -r "$pkg_f" ] && [ -r "$core_f" ] || return 1
+    pkg=$(cat "$pkg_f")
+    core=$(cat "$core_f")
+    triples="${triples}${cpu} ${pkg} ${core}"$'\n'
+  done
+
+  # Sort triples by pkg then core (numeric), pipe into awk.
+  # awk sees rows in physical-core order, groups consecutive rows with the same
+  # key, counts distinct keys, and splits in half — no asort needed (POSIX awk).
+  printf '%s' "$triples" | sort -k2,2n -k3,3n | awk '
+  {
+    cpu=$1; pkg=$2; core=$3
+    key = pkg ":" core
+    # accumulate cpus per key in encounter order
+    if (key != prev_key) {
+      if (prev_key != "") { keys[++nkeys]=prev_key; grp[prev_key]=acc }
+      prev_key=key; acc=cpu
+    } else {
+      acc = acc "," cpu
+    }
+  }
+  END {
+    if (prev_key != "") { keys[++nkeys]=prev_key; grp[prev_key]=acc }
+    half = int((nkeys+1)/2); if (half<1) half=1
+    srv=""; clt=""
+    for (i=1; i<=nkeys; i++) {
+      g = grp[keys[i]]
+      if (i <= half) srv = (srv=="" ? g : srv "," g)
+      else           clt = (clt=="" ? g : clt "," g)
+    }
+    print "SRV_CPUS=" srv
+    print "CLT_CPUS=" clt
+  }
+  '
+}
+
 SRV_PIN=""
 CLT_PIN=""
 if [ "$PIN" = 1 ]; then
   if command -v taskset >/dev/null 2>&1; then
-    NCORES="$(nproc)"
-    HALF=$(( NCORES / 2 )); [ "$HALF" -lt 1 ] && HALF=1
-    SRV_PIN="taskset -c 0-$((HALF - 1))"
-    CLT_PIN="taskset -c ${HALF}-$((NCORES - 1))"
-    echo "== core pinning: server [$SRV_PIN]  client [$CLT_PIN] =="
+    NCPUS="$(nproc)"
+    # Try SMT-aware grouping via sysfs
+    if pin_out=$(_build_pin_lists "$NCPUS" 2>/dev/null); then
+      eval "$pin_out"
+      SRV_PIN="taskset -c ${SRV_CPUS}"
+      CLT_PIN="taskset -c ${CLT_CPUS}"
+      echo "== core pinning (physical-core-aware): server [${SRV_PIN}]  client [${CLT_PIN}] =="
+    else
+      # Fallback: naive logical-cpu split (original behavior)
+      HALF=$(( NCPUS / 2 )); [ "$HALF" -lt 1 ] && HALF=1
+      SRV_PIN="taskset -c 0-$((HALF - 1))"
+      CLT_PIN="taskset -c ${HALF}-$((NCPUS - 1))"
+      echo "== core pinning (naive fallback — sysfs topology unavailable): server [${SRV_PIN}]  client [${CLT_PIN}] =="
+    fi
   else
     echo "PIN=1 but 'taskset' not found (Linux only)."
     echo "  macOS has no shell core pinning — run the load generator on a"
