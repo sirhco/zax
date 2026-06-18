@@ -366,8 +366,19 @@ a real x86_64 Linux server kernel, different vendor, different arch.
   thread-park model has a lower *unsaturated* median, the reactor a higher one (a touch more
   per-request bookkeeping). zax-ev wins where it counts under load (throughput + p99.9).
 - **Max (worst single request):** zax-ev max 17–30ms is higher than axum's ~7ms — axum edges
-  on the absolute worst-case outlier. Worth a follow-up look (accept/wakeup spike under the
-  SO_REUSEPORT fan-out), but p99.9 — the meaningful tail — is best-in-class.
+  the absolute worst-case outlier. **Investigated:** the dominant cause is a *benchmark
+  artifact* of `PIN=1` on an SMT host, not a zax defect. This EPYC is 8 physical cores × 2
+  SMT threads (cpus 0–7 = thread 0, 8–15 = the siblings); the old `PIN=1` put the server on
+  `0–7` and the client (oha) on `8–15` — i.e. **the client ran on the SMT siblings of the
+  server's physical cores**, so they fought for the same execution units → ~20ms spikes. Fixed
+  in `run.sh` (commit: SMT-aware `PIN=1` pins server/client to *disjoint physical cores*) — a
+  re-run on this box should bring the max down toward axum's. Two secondary factors: zax's
+  shared-nothing workers don't work-steal (a preempted worker's conns wait while tokio
+  migrates them — inherent to the SO_REUSEPORT-per-core model, nginx has it too), amplified by
+  KVM vCPU steal on a cloud VM. (A worker-oversubscription hypothesis was *refuted*:
+  `std.Thread.getCpuCount` already respects `sched_getaffinity`, so under `taskset -c 0-7` the
+  server correctly spawned 8 workers on 8 cpus, 1:1.) p99.9 — the meaningful tail — is
+  best-in-class regardless.
 
 **Bottom line:** the off-VM run confirms the headline. Evented zax is the throughput + p99.9
 leader on real x86_64 Linux, the threaded tail is a genuine `std.Io.Threaded` property (not an
