@@ -82,10 +82,15 @@ fn download(body: *Body) zax.Response {
 }
 ```
 
-`nextFn` should return `.chunk = n` (n>0) when data is ready, or `.done` at end. Streamed
-responses use connection-close framing (the connection closes after the body). For sparse,
-long-idle event streams (SSE waiting on external events), prefer the threaded backend in this
-version — a producer returning `.chunk = 0` to mean "nothing yet" busy-polls on the reactor.
+`nextFn` should return `.chunk = n` (n>0) when data is ready, `.chunk = 0` when no data is
+ready yet (sparse/long-idle streams, e.g. SSE waiting on external events), or `.done` at end.
+Streamed responses use connection-close framing (the connection closes after the body).
+
+On the evented backend a `.chunk = 0` parks the connection on the timer wheel and re-polls
+after `EventedOptions.stream_repoll_ms` (default 5 ms; `0` = the legacy busy behavior) — it
+does **not** busy-spin the reactor (since v0.3.0), so sparse SSE works on evented. Note the
+`sse()` helper and the push `stream` streamer are Writer-based and **threaded-only**; for SSE
+on the evented backend, drive `streamPull` directly.
 
 ## Limitations
 
