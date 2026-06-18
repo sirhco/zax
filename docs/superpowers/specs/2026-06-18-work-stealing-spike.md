@@ -47,8 +47,8 @@ DURATION=30s CONNS=64 BACKEND=evented ./run.sh 2>&1 | tee /tmp/steal-A-baseline.
 # Run B — cpuset oversubscription steal (the symptom):
 DURATION=30s CONNS=64 BACKEND=evented STEAL=cpuset STEAL_CORES=2 ./run.sh 2>&1 | tee /tmp/steal-B-cpuset.txt
 
-# Run C (sharper) — pinned hog on top:
-DURATION=30s CONNS=64 BACKEND=evented STEAL=cpuset STEAL_CORES=2 STEAL=hog ./run.sh 2>&1 | tee /tmp/steal-C-hog.txt
+# Run C (sharper) — pinned hog on top (STEAL=hog implies the cpuset oversubscription AND the hog):
+DURATION=30s CONNS=64 BACKEND=evented STEAL=hog STEAL_CORES=2 ./run.sh 2>&1 | tee /tmp/steal-C-hog.txt
 ```
 Run each ≥3× (tail is noisy — report median + spread of the **static `GET /` MAX**). Also capture
 host steal with `vmstat 1` (the `st` column) during a run, to confirm the induction is real.
