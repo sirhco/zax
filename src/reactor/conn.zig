@@ -452,6 +452,15 @@ pub const Conn = struct {
                 },
 
                 .writing => {
+                    // Arm write-stall deadline on first entry.  A peer that
+                    // advertises a zero/tiny receive window and never reads
+                    // would hold the fd+slot indefinitely without this guard.
+                    // We set it once (set-once: reuse read_timeout_ms — a
+                    // stalled write is a stalled peer); 0 → no deadline.
+                    if (self.deadline_ns == no_deadline and self.read_timeout_ms != 0) {
+                        self.deadline_ns = monotonicNow() +
+                            @as(i96, self.read_timeout_ms) * 1_000_000;
+                    }
                     switch (self.pumpWrite(t)) {
                         .want_write => return .want_write,
                         .closed => {
@@ -513,6 +522,9 @@ pub const Conn = struct {
     ///   `write_buf` best-effort and return `.want_write` so the worker can drain
     ///   it before closing. The caller must close after the write completes
     ///   (`close_after_write` is set to `true`).
+    /// - `writing`: the peer has stalled mid-write (zero/tiny receive window,
+    ///   not reading); we cannot send a 408 (the peer isn't reading), so silent
+    ///   close — returns `.done_close`.
     /// - `keep_alive_idle`: silent close — no bytes, returns `.done_close`.
     /// - Any other state: returns `.done_close` (shouldn't happen normally).
     pub fn onDeadline(self: *Conn) StepResult {
@@ -525,6 +537,12 @@ pub const Conn = struct {
                 _ = self.serializeResponse(r408) catch {};
                 self.state = .writing;
                 return .want_write;
+            },
+            .writing => {
+                // Peer stalled mid-write: can't send 408 (they aren't reading).
+                // Silently close the connection to free the fd+slot.
+                self.state = .closing;
+                return .done_close;
             },
             .keep_alive_idle => {
                 self.state = .closing;

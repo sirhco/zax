@@ -53,6 +53,10 @@ pub const WorkerOpts = struct {
     read_timeout_ms: u32,
     idle_timeout_ms: u32,
     tcp_nodelay: bool,
+    /// If nonzero, set SO_SNDBUF to this value on each accepted socket.
+    /// 0 = system default (no override).  Useful in tests to force write
+    /// stalls on loopback where the default send buffer is too large.
+    sndbuf_override: u32 = 0,
 };
 
 /// A self-contained epoll worker: one listen socket, one eventfd (wake), and a
@@ -297,6 +301,19 @@ pub const Worker = struct {
                     std.posix.IPPROTO.TCP,
                     @intCast(std.posix.TCP.NODELAY),
                     @ptrCast(&one),
+                    @sizeOf(c_int),
+                );
+            }
+
+            // Override SO_SNDBUF if requested (useful in tests to force write
+            // stalls on loopback where the default send buffer is very large).
+            if (self.opts.sndbuf_override != 0) {
+                const sndbuf: c_int = @intCast(self.opts.sndbuf_override);
+                _ = linux.setsockopt(
+                    conn_fd,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.SNDBUF,
+                    @ptrCast(&sndbuf),
                     @sizeOf(c_int),
                 );
             }
@@ -903,6 +920,181 @@ test "worker: idle connection closed after read timeout (no bytes sent)" {
     }
 
     try testing.expect(std.mem.indexOf(u8, rbuf[0..total], "200") != null);
+
+    shutdown.store(true, .release);
+    worker.wake();
+    thread.join();
+}
+
+test "worker: write-stall deadline — server reaps a peer that stops reading" {
+    // Linux-only: epoll + SO_RCVBUF behaviour tested here.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    // Response body must fit in write_buffer_size (4 KB) but exceed the
+    // combined SO_SNDBUF (2 KB override) + SO_RCVBUF (1 KB) so the server's
+    // send() hits EAGAIN and enters the want_write stall path.
+    // Body 3 KB + ~100 bytes headers = ~3.1 KB → fits in 4 KB write buffer
+    // but exceeds the 2 KB sndbuf_override + 1 KB rcvbuf = 3 KB total.
+    const BODY_SIZE: usize = 3 * 1024; // 3 KB
+
+    const Bundle = struct { io: std.Io };
+    const DispCtx = struct {
+        fn dispatch(ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
+            _ = @as(*Bundle, @ptrCast(@alignCast(ctx))).io;
+            _ = req;
+            _ = arena;
+            // Build a 3 KB body: all 'X' bytes.
+            var body_buf: [BODY_SIZE]u8 = undefined;
+            @memset(&body_buf, 'X');
+            return Response.text(&body_buf);
+        }
+    };
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var bundle = Bundle{ .io = threaded.io() };
+
+    const disp = Dispatcher{
+        .ctx = @ptrCast(&bundle),
+        .dispatchFn = DispCtx.dispatch,
+    };
+
+    // Short read_timeout_ms doubles as the write-stall deadline.
+    const opts = WorkerOpts{
+        .max_connections = 64,
+        .read_buffer_size = 16 * 1024,
+        .write_buffer_size = 4 * 1024, // fits the 3 KB body + headers
+        .keep_alive = false,
+        .max_keep_alive_requests = 1,
+        .max_body_size = 0,
+        .read_timeout_ms = 300, // 300 ms write-stall deadline
+        .idle_timeout_ms = 5000,
+        .tcp_nodelay = true,
+        // Force a tiny SO_SNDBUF on accepted fds so the server hits EAGAIN
+        // quickly on loopback (default loopback sndbuf is ~200 KB).
+        .sndbuf_override = 2048,
+    };
+
+    var shutdown = std.atomic.Value(bool).init(false);
+    const listen_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+
+    var worker = try Worker.init(testing.allocator, disp, opts, listen_addr, &shutdown);
+    defer worker.deinit();
+
+    var bound: std.posix.sockaddr = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    const grc = linux.getsockname(@intCast(worker.listen_fd), &bound, &bound_len);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(grc));
+    const bound_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&bound));
+    const port = std.mem.bigToNative(u16, bound_in.port);
+
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+
+    // Wait for worker to enter epoll_wait.
+    {
+        const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+    }
+
+    // Create client socket with a very small receive buffer (1 KB).
+    // This ensures the server's send() fills the client window quickly and
+    // blocks (EAGAIN / want_write) — the classic write-stall scenario.
+    const cfd_rc = linux.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+        0,
+    );
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd_rc));
+    const cfd: i32 = @intCast(cfd_rc);
+    defer _ = linux.close(@intCast(cfd));
+
+    // Set SO_RCVBUF to minimum so the kernel allocates a tiny receive buffer.
+    const rcvbuf: c_int = 128;
+    _ = linux.setsockopt(
+        @intCast(cfd),
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVBUF,
+        @ptrCast(&rcvbuf),
+        @sizeOf(c_int),
+    );
+    // TCP_WINDOW_CLAMP = 10: clamp the advertised receive window to 1 byte.
+    // Once 1 byte lands in the kernel receive buffer (and we never read),
+    // the client advertises window=0.  The server's send() then returns
+    // EAGAIN → want_write stall.  This is reliable even on loopback where
+    // the default send buffer would otherwise absorb the whole response.
+    const TCP_WINDOW_CLAMP: u32 = 10;
+    const wclamp: c_int = 1;
+    _ = linux.setsockopt(
+        @intCast(cfd),
+        std.posix.IPPROTO.TCP,
+        TCP_WINDOW_CLAMP,
+        @ptrCast(&wclamp),
+        @sizeOf(c_int),
+    );
+
+    var sa_in = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+        .zero = [_]u8{0} ** 8,
+    };
+    const connect_rc = linux.connect(
+        @intCast(cfd),
+        @ptrCast(&sa_in),
+        @sizeOf(std.posix.sockaddr.in),
+    );
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(connect_rc));
+
+    // Send a valid GET request.
+    const req_str = "GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    var sent: usize = 0;
+    while (sent < req_str.len) {
+        const n = linux.write(@intCast(cfd), req_str[sent..].ptr, req_str.len - sent);
+        if (linux.errno(n) != .SUCCESS) break;
+        sent += @intCast(n);
+    }
+
+    // Do NOT read the response — let the server's send fill the tiny receive
+    // window.  The server will hit EAGAIN → want_write → write-stall deadline.
+    // After ~300 ms the server should close the connection.
+
+    // Set the client socket non-blocking so we can drain + detect EOF without
+    // blocking the test thread indefinitely.
+    // linux.SOCK.NONBLOCK == O_NONBLOCK on Linux (same constant, 0o4000).
+    _ = linux.fcntl(@intCast(cfd), linux.F.SETFL, linux.SOCK.NONBLOCK);
+
+    // Poll for EOF/RST: drain all available data (consuming it), watching for
+    // rc==0 (EOF) or ECONNRESET (RST) which signals the server closed.
+    // We try up to ~1.5 s (30 × 50 ms) to allow the 300 ms deadline to fire.
+    var drain_buf: [4096]u8 = undefined;
+    var got_close = false;
+    var attempts: usize = 0;
+    while (attempts < 30) : (attempts += 1) {
+        const ts = linux.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+
+        // Drain all available bytes in a tight loop.
+        var inner: usize = 0;
+        while (inner < 256) : (inner += 1) {
+            const rc = linux.read(@intCast(cfd), &drain_buf, drain_buf.len);
+            const e = linux.errno(rc);
+            if (e == .SUCCESS and rc == 0) {
+                got_close = true; // clean EOF
+                break;
+            }
+            if (e == .CONNRESET or e == .PIPE) {
+                got_close = true; // RST
+                break;
+            }
+            if (e == .AGAIN) break; // no more data right now
+            // rc > 0: consumed bytes, keep draining
+        }
+        if (got_close) break;
+    }
+
+    try testing.expect(got_close); // server must reap the stalled connection
 
     shutdown.store(true, .release);
     worker.wake();
