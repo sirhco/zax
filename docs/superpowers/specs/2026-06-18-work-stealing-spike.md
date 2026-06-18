@@ -1,6 +1,6 @@
 # Work-Stealing Spike — Evented Reactor `max`-under-vCPU-steal
 
-**Status:** IN PROGRESS — harness built (commit d549dcc on `spike/work-stealing`), **gate run PENDING (Chris runs on a Linux VM).** Throwaway branch; deliverable = this doc + recorded numbers. Do NOT merge the prototype.
+**Status:** CONCLUDED 2026-06-18 — **verdict NOT-WORTH-IT** (see end). Gate run done (64-vCPU VM); no prototype built. Deliverable = this doc + the gate numbers. Branch `spike/work-stealing` = harness (`ZAX_WORKERS` + `STEAL` knobs) + this doc; no production code changed.
 
 ## Question
 Does *any* work-stealing scheme actually recover the evented reactor's worst-case `max` latency
@@ -125,8 +125,35 @@ best in class). The "weak spot" is a ~1-in-21M tail event ~2.3× the peers' wors
 work-stealing (live fd migration across pollers + cross-worker sync, breaking the zero-sync
 shared-nothing model) to shave that single sample is a marginal return.
 
-## Verdict
-_(pending Chris decision — build prototype for hard numbers vs document as NOT-WORTH-IT; see below)_
+## Verdict — NOT-WORTH-IT (2026-06-18)
+
+Work-stealing is **not justified** for the evented reactor. Decision after the gate run, without
+building the prototype, on this evidence:
+
+1. **The weak spot is a single worst sample, not a tail regime.** Baseline p99.9 is 0.438 ms — the
+   best of all four frameworks. The only deficit is MAX (~34 ms, ~2.3× axum/httpz ~15 ms), which over
+   ~21M requests is the 1-in-21M worst sample, caused by background hypervisor vCPU steal on a shared
+   cloud VM. There is no broad tail problem to fix.
+2. **The cost is disproportionate and architecture-breaking.** Production stealing needs live fd
+   migration across pollers + cross-worker synchronization on the slot/conn ownership, which destroys
+   the zero-sync shared-nothing model that gives the reactor its throughput lead (1.65–1.9× axum) and
+   best-in-class p99.9. Trading that invariant to shave one rare sample is a bad trade.
+3. **Even a best-case prototype could not prove much.** The target is a ~1-in-21M event; a clean
+   "recovers MAX" signal would require many trials to stabilize a single-sample metric, and the
+   prototype's documented cuts (no mid-request migration) make its MAX only a lower bound. Low
+   evidentiary value for high effort.
+4. **The faithful induction was never achievable cheaply.** cpuset/hog produce global oversubscription
+   (wrong signature); SIGSTOP can't freeze one thread; isolating one stalled worker needs reactor-side
+   per-worker affinity-pinning chaos code. Not worth building to chase (1).
+
+**Recommendation:** keep the shared-nothing model as-is. Document the MAX-under-vCPU-steal figure as a
+known, accepted characteristic of shared-nothing on overcommitted/virtualized hosts (p99.9 unaffected).
+Revisit ONLY if a real workload surfaces a p99.9-level (not MAX-only) regression attributable to steal.
+
+**Branch disposition:** `spike/work-stealing` is the record. It contains NO prototype — only this doc
+plus additive, harmless bench tooling (`ZAX_WORKERS` env + `STEAL=cpuset/hog` in run.sh), which is
+reusable for future oversubscription experiments. Safe to merge to main as the decision record, or keep
+branch-only. No production code changed.
 
 ## Verdict
 _(pending)_
