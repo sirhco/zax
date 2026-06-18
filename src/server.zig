@@ -16,10 +16,15 @@
 //! drains in-flight connections before returning.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
 
 const build_options = @import("build_options");
+
+// Reactor imports — used only by serveEvented (Linux only).
+const worker_mod = @import("reactor/worker.zig");
+const conn_mod = @import("reactor/conn.zig");
 
 const request = @import("http/request.zig");
 const Header = request.Header;
@@ -157,6 +162,15 @@ pub const Options = struct {
     max_in_flight: usize = 0,
 };
 
+/// Options for the epoll-based evented backend (`serveEvented`).
+/// Linux only; on other platforms `serveEvented` returns `error.EventedUnsupported`.
+pub const EventedOptions = struct {
+    /// Number of worker threads. 0 → auto-detect (`std.Thread.getCpuCount()`).
+    workers: usize = 0,
+    /// Per-worker connection pool size.
+    max_connections: usize = 1024,
+};
+
 /// `App(AppState)` — a server bound to one concrete, read-only app-state type.
 pub fn App(comptime AppState: type) type {
     return struct {
@@ -191,6 +205,9 @@ pub fn App(comptime AppState: type) type {
         server: ?net.Server = null,
         shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         rid_counter: std.atomic.Value(u64) = .init(0),
+        /// Pointers to live evented workers — set by `serveEvented` before threads
+        /// start, cleared before the frame returns. `requestShutdown` wakes them.
+        evented_workers: ?[]*worker_mod.Worker = null,
 
         pub fn init(gpa: std.mem.Allocator, state: AppState, opts: Options) std.mem.Allocator.Error!Self {
             return .{ .gpa = gpa, .state = state, .router = try R.init(gpa), .opts = opts };
@@ -389,13 +406,181 @@ pub fn App(comptime AppState: type) type {
             self.acceptLoop(io);
         }
 
+        /// Start the epoll-based evented backend. Linux only.
+        ///
+        /// Spawns `opts.workers` (0 → ncpu) worker threads each owning a
+        /// `SO_REUSEPORT` listen socket on `addr`. Blocks until all workers
+        /// exit (triggered by `requestShutdown`).
+        ///
+        /// The `io` parameter is passed to each handler's context (it is stored
+        /// in `Ctx.io`). Handlers that call blocking-IO extractors (e.g. `Files`)
+        /// will stall their worker's entire event loop — use only non-blocking
+        /// extractors (Path, Query, Json, State, …).
+        pub fn serveEvented(self: *Self, io: Io, addr: net.IpAddress, opts: EventedOptions) error{
+            EventedUnsupported,
+            SystemResources,
+            OutOfMemory,
+            Unexpected,
+        }!void {
+            if (comptime builtin.os.tag != .linux) return error.EventedUnsupported;
+
+            const n_workers = if (opts.workers != 0) opts.workers else std.Thread.getCpuCount() catch 1;
+
+            const WorkerOpts = worker_mod.WorkerOpts;
+            const Worker = worker_mod.Worker;
+            const Dispatcher = conn_mod.Dispatcher;
+
+            // Bundle: lives on this frame (outlives all workers).
+            // Each worker thread gets its own bundle so they can each hold
+            // a copy of `io` without contention.  All bundles point to the
+            // same `*App`.
+            const AppIoBundle = struct {
+                app: *Self,
+                io: Io,
+            };
+
+            const DispatchFn = struct {
+                fn dispatch(ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
+                    const b: *AppIoBundle = @ptrCast(@alignCast(ctx));
+                    // Time the dispatch for observers; skip the clock read when no
+                    // observers are registered (zero-overhead-when-none guard).
+                    const t0: i96 = if (b.app.observers.items.len > 0)
+                        conn_mod.monotonicNow()
+                    else
+                        0;
+                    const resp = b.app.dispatch(b.io, req, arena, "");
+                    if (b.app.observers.items.len > 0) {
+                        const dur: u64 = @intCast(@max(@as(i96, 0), conn_mod.monotonicNow() - t0));
+                        const rec = observe_mod.AccessRecord{
+                            .method = req.method,
+                            .path = req.path,
+                            .status = resp.status.code(),
+                            .duration_ns = dur,
+                            .bytes = resp.body.len,
+                            // request_id is not generated on the evented path (v1 limitation).
+                            .request_id = "",
+                        };
+                        for (b.app.observers.items) |obs| obs.func(obs.context, rec);
+                    }
+                    return resp;
+                }
+            };
+
+            // Allocate worker storage on this frame.
+            // We use a single heap allocation for the slice of Workers (they are
+            // too large for the stack) — freed before we return.
+            const workers_slice = try self.gpa.alloc(Worker, n_workers);
+            defer self.gpa.free(workers_slice);
+
+            const bundles = try self.gpa.alloc(AppIoBundle, n_workers);
+            defer self.gpa.free(bundles);
+
+            const worker_ptrs = try self.gpa.alloc(*Worker, n_workers);
+            defer self.gpa.free(worker_ptrs);
+
+            const threads = try self.gpa.alloc(std.Thread, n_workers);
+            defer self.gpa.free(threads);
+
+            const worker_opts = WorkerOpts{
+                .max_connections = opts.max_connections,
+                .read_buffer_size = self.opts.read_buffer_size,
+                .write_buffer_size = self.opts.write_buffer_size,
+                .keep_alive = self.opts.keep_alive,
+                .max_keep_alive_requests = self.opts.max_keep_alive_requests,
+                .max_body_size = self.opts.max_body_size,
+                .read_timeout_ms = self.opts.read_timeout_ms,
+                .idle_timeout_ms = self.opts.idle_timeout_ms,
+                .tcp_nodelay = self.opts.tcp_nodelay,
+            };
+
+            // Init workers.  Track counts separately so the single cleanup path
+            // below can handle both init and spawn failures without double-deinit.
+            var inited: usize = 0;
+            var spawned: usize = 0;
+            var spawn_err: ?anyerror = null;
+
+            for (0..n_workers) |i| {
+                bundles[i] = AppIoBundle{ .app = self, .io = io };
+                const disp = Dispatcher{
+                    .ctx = @ptrCast(&bundles[i]),
+                    .dispatchFn = DispatchFn.dispatch,
+                };
+                workers_slice[i] = Worker.init(
+                    self.gpa,
+                    disp,
+                    worker_opts,
+                    addr,
+                    &self.shutting_down,
+                ) catch |e| {
+                    spawn_err = e;
+                    break;
+                };
+                worker_ptrs[i] = &workers_slice[i];
+                inited += 1;
+            }
+
+            if (spawn_err == null) {
+                // Register worker pointers BEFORE spawning threads so
+                // requestShutdown can safely wake them.
+                self.evented_workers = worker_ptrs;
+
+                // Spawn threads.
+                for (0..n_workers) |i| {
+                    threads[i] = std.Thread.spawn(.{}, Worker.run, .{&workers_slice[i]}) catch |e| {
+                        spawn_err = e;
+                        break;
+                    };
+                    spawned += 1;
+                }
+            }
+
+            if (spawn_err) |e| {
+                // Single cleanup path for both init-failure and spawn-failure.
+                // Order: signal shutdown → wake+join live threads → deinit each
+                // initialised worker exactly once → clear evented_workers.
+                self.shutting_down.store(true, .release);
+                for (0..spawned) |j| {
+                    workers_slice[j].wake();
+                    threads[j].join();
+                }
+                for (0..inited) |j| workers_slice[j].deinit();
+                self.evented_workers = null;
+                return switch (@as(anyerror, e)) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.SystemResources,
+                };
+            }
+
+            // Join all threads.
+            for (0..n_workers) |i| threads[i].join();
+
+            // Clear evented_workers before frame returns (pointers become dangling).
+            self.evented_workers = null;
+
+            // Deinit workers exactly once on the normal path.
+            for (0..n_workers) |i| workers_slice[i].deinit();
+
+            if (comptime build_options.trace_latency) global_trace.dump();
+        }
+
         /// Request a graceful shutdown: stop accepting (by closing the listening
         /// socket, which unblocks `accept`) so `acceptLoop` exits and drains.
         /// Safe to call from another task. A SIGINT/SIGTERM handler would simply
         /// call this.
         pub fn requestShutdown(self: *Self, io: Io) void {
             self.shutting_down.store(true, .release);
-            if (self.server) |*s| s.socket.close(io);
+            if (self.server) |*s| {
+                // shutdown(SHUT_RDWR) before close so that any thread blocked
+                // in accept() returns EINVAL / SocketNotListening immediately
+                // on all platforms (on Linux, close() alone is not guaranteed
+                // to unblock a concurrent accept() in another thread).
+                io.vtable.netShutdown(io.userdata, s.socket.handle, .both) catch {};
+                s.socket.close(io);
+            }
+            // Wake all evented workers so they break out of epoll_wait.
+            if (self.evented_workers) |ws| {
+                for (ws) |w| w.wake();
+            }
             if (comptime build_options.trace_latency) global_trace.dump();
         }
 
@@ -1939,15 +2124,33 @@ test "validRid accepts safe tokens, rejects unsafe" {
 }
 
 test "setNoDelay enables TCP_NODELAY on a socket" {
-    const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    try testing.expect(fd >= 0);
-    defer _ = std.c.close(fd);
-    setNoDelay(fd);
-    var val: c_int = 0;
-    var len: std.posix.socklen_t = @sizeOf(c_int);
-    const rc = std.c.getsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &val, &len);
-    try testing.expect(rc == 0);
-    try testing.expect(val != 0);
+    if (builtin.os.tag == .linux) {
+        // Linux: use syscalls directly — no libc needed in the test binary.
+        const linux = std.os.linux;
+        const sfd = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        const se = linux.errno(sfd);
+        if (se != .SUCCESS) return std.posix.unexpectedErrno(se);
+        const fd: i32 = @intCast(sfd);
+        defer _ = linux.close(@intCast(fd));
+        setNoDelay(fd);
+        var val: c_int = 0;
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        const grc = linux.getsockopt(fd, std.posix.IPPROTO.TCP, @intCast(std.posix.TCP.NODELAY), @ptrCast(&val), &len);
+        const ge = linux.errno(grc);
+        try testing.expect(ge == .SUCCESS);
+        try testing.expect(val != 0);
+    } else {
+        // macOS: use libc.
+        const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        try testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        setNoDelay(fd);
+        var val: c_int = 0;
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        const rc = std.c.getsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &val, &len);
+        try testing.expect(rc == 0);
+        try testing.expect(val != 0);
+    }
 }
 
 test "Options: tcp_nodelay defaults on (opt-out)" {
@@ -2122,4 +2325,336 @@ test "max_in_flight: default (0) is unbounded — all requests succeed" {
 
     app.requestShutdown(io);
     loop_fut.await(io);
+}
+
+// ---------------------------------------------------------------------------
+// serveEvented tests
+// ---------------------------------------------------------------------------
+
+test "serveEvented: returns EventedUnsupported on non-Linux" {
+    // This test runs on every platform. On Linux it self-skips (the path would
+    // actually start the evented loop). On macOS/Windows/etc it asserts the error.
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
+
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+
+    const addr = net.IpAddress{ .ip4 = .loopback(19000) };
+    try testing.expectError(error.EventedUnsupported, app.serveEvented(io, addr, .{}));
+}
+
+test "serveEvented: 2-worker integration — keep-alive requests across 3 routes" {
+    // Linux-only integration test. Self-skips on macOS.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const linux = std.os.linux;
+
+    // Build the app with 3 routes.
+    var db = Db{ .msg = "hello" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/", pingHandler);
+    // /users/:id — reuse echoId (returns "forty-two" for id==42)
+    try app.get("/users/:id", echoId);
+    // /echo — echo back body
+    try app.post("/echo", pingHandler);
+
+    // Use port 0 so the kernel assigns; we read it back after Worker.init.
+    // But serveEvented doesn't expose the bound port. Work-around: use a fixed
+    // ephemeral port that is unlikely to be in use.
+    const port: u16 = 18200;
+    const addr = net.IpAddress{ .ip4 = .loopback(port) };
+
+    // Serve in a background thread.
+    const ServeCtx = struct {
+        app: *TestApp,
+        io: Io,
+        addr: net.IpAddress,
+        err: ?anyerror = null,
+    };
+    var serve_ctx = ServeCtx{ .app = &app, .io = undefined, .addr = addr };
+    // We need a fresh Io.Threaded here because Io.Threaded is not Send-safe to
+    // share across threads without going through a Future.  Use raw posix in the
+    // server thread instead; the app only needs io for the handler ctx.io which
+    // our test handlers never use.
+    var srv_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer srv_threaded.deinit();
+    serve_ctx.io = srv_threaded.io();
+
+    const ServeThread = struct {
+        fn run(ctx: *ServeCtx) void {
+            ctx.app.serveEvented(ctx.io, ctx.addr, .{ .workers = 2 }) catch |e| {
+                ctx.err = e;
+            };
+        }
+    };
+    const srv_thread = try std.Thread.spawn(.{}, ServeThread.run, .{&serve_ctx});
+
+    // Wait for workers to be ready (they listen on the port).
+    {
+        var attempts: usize = 0;
+        while (attempts < 50) : (attempts += 1) {
+            const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&ts, null);
+
+            // Try connecting to confirm the port is open.
+            const tfd_rc = linux.socket(
+                std.posix.AF.INET,
+                std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+                0,
+            );
+            if (linux.errno(tfd_rc) != .SUCCESS) continue;
+            const tfd: i32 = @intCast(tfd_rc);
+            var sa_in = std.posix.sockaddr.in{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, port),
+                .addr = std.mem.nativeToBig(u32, 0x7F000001),
+                .zero = [_]u8{0} ** 8,
+            };
+            const rc = linux.connect(@intCast(tfd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
+            _ = linux.close(@intCast(tfd));
+            if (linux.errno(rc) == .SUCCESS) break;
+        }
+    }
+
+    // Helper: raw send+recv on a blocking socket.
+    const sendAll = struct {
+        fn f(fd: i32, data: []const u8) !void {
+            var sent: usize = 0;
+            while (sent < data.len) {
+                const n = linux.write(@intCast(fd), data[sent..].ptr, data.len - sent);
+                if (linux.errno(n) != .SUCCESS) return error.SendFailed;
+                sent += @intCast(n);
+            }
+        }
+    }.f;
+
+    const recvResponse = struct {
+        fn f(fd: i32, buf: []u8) ![]u8 {
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = linux.read(@intCast(fd), buf[total..].ptr, buf.len - total);
+                if (linux.errno(n) != .SUCCESS) return buf[0..total];
+                if (n == 0) return buf[0..total];
+                total += @intCast(n);
+                const so_far = buf[0..total];
+                if (std.mem.indexOf(u8, so_far, "\r\n\r\n")) |sep| {
+                    const headers = so_far[0 .. sep + 4];
+                    if (std.mem.indexOf(u8, headers, "content-length: ")) |cl_start| {
+                        const after = headers[cl_start + "content-length: ".len ..];
+                        const end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
+                        const clen = std.fmt.parseInt(usize, after[0..end], 10) catch 0;
+                        if (total - (sep + 4) >= clen) return buf[0..total];
+                    } else {
+                        return buf[0..total];
+                    }
+                }
+            }
+            return buf[0..total];
+        }
+    }.f;
+
+    // Spawn a handful of client threads each doing multiple keep-alive requests.
+    const N_THREADS = 5;
+    const N_REQS_PER_THREAD = 10;
+    const Total = N_THREADS * N_REQS_PER_THREAD;
+
+    var correct = std.atomic.Value(usize).init(0);
+
+    const ClientCtx = struct {
+        port: u16,
+        correct: *std.atomic.Value(usize),
+    };
+
+    const ClientThread = struct {
+        fn run(ctx: *ClientCtx) void {
+            const cfd_rc = linux.socket(
+                std.posix.AF.INET,
+                std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+                0,
+            );
+            if (linux.errno(cfd_rc) != .SUCCESS) return;
+            const cfd: i32 = @intCast(cfd_rc);
+            defer _ = linux.close(@intCast(cfd));
+
+            var sa_in = std.posix.sockaddr.in{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, ctx.port),
+                .addr = std.mem.nativeToBig(u32, 0x7F000001),
+                .zero = [_]u8{0} ** 8,
+            };
+            const con_rc = linux.connect(@intCast(cfd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
+            if (linux.errno(con_rc) != .SUCCESS) return;
+
+            var buf: [8192]u8 = undefined;
+
+            var i: usize = 0;
+            while (i < N_REQS_PER_THREAD) : (i += 1) {
+                const req = "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+                sendAll(cfd, req) catch return;
+                const resp = recvResponse(cfd, &buf) catch return;
+                if (std.mem.indexOf(u8, resp, "200") != null and
+                    std.mem.indexOf(u8, resp, "hello") != null)
+                {
+                    _ = ctx.correct.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+
+    var client_threads: [N_THREADS]std.Thread = undefined;
+    var client_ctxs: [N_THREADS]ClientCtx = undefined;
+    for (0..N_THREADS) |i| {
+        client_ctxs[i] = .{ .port = port, .correct = &correct };
+        client_threads[i] = try std.Thread.spawn(.{}, ClientThread.run, .{&client_ctxs[i]});
+    }
+    for (0..N_THREADS) |i| client_threads[i].join();
+
+    // All requests must have been served correctly.
+    try testing.expectEqual(Total, correct.load(.acquire));
+
+    // Request shutdown and wait for serveEvented to return.
+    var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer shutdown_threaded.deinit();
+    app.requestShutdown(shutdown_threaded.io());
+
+    srv_thread.join();
+    try testing.expect(serve_ctx.err == null);
+}
+
+test "serveEvented: observer fires for each request" {
+    // Linux-only: epoll doesn't exist elsewhere.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const linux = std.os.linux;
+
+    var db = Db{ .msg = "hello" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ping", pingHandler);
+
+    // Register an observer that counts and captures the last record.
+    var cap = ObsCapture{};
+    try app.observe(.{ .context = &cap, .func = obsCapture });
+
+    const port: u16 = 18201;
+    const addr = net.IpAddress{ .ip4 = .loopback(port) };
+
+    const ServeCtx = struct {
+        app: *TestApp,
+        io: Io,
+        addr: net.IpAddress,
+        err: ?anyerror = null,
+    };
+    var serve_ctx = ServeCtx{ .app = &app, .io = undefined, .addr = addr };
+    var srv_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer srv_threaded.deinit();
+    serve_ctx.io = srv_threaded.io();
+
+    const ServeThread = struct {
+        fn run(ctx: *ServeCtx) void {
+            ctx.app.serveEvented(ctx.io, ctx.addr, .{ .workers = 1 }) catch |e| {
+                ctx.err = e;
+            };
+        }
+    };
+    const srv_thread = try std.Thread.spawn(.{}, ServeThread.run, .{&serve_ctx});
+
+    // Wait for the worker to start listening.
+    {
+        var attempts: usize = 0;
+        while (attempts < 50) : (attempts += 1) {
+            const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&ts, null);
+            const tfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+            if (linux.errno(tfd_rc) != .SUCCESS) continue;
+            const tfd: i32 = @intCast(tfd_rc);
+            var sa_in = std.posix.sockaddr.in{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, port),
+                .addr = std.mem.nativeToBig(u32, 0x7F000001),
+                .zero = [_]u8{0} ** 8,
+            };
+            const rc = linux.connect(@intCast(tfd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
+            _ = linux.close(@intCast(tfd));
+            if (linux.errno(rc) == .SUCCESS) break;
+        }
+    }
+
+    // Connect and send two requests.
+    const cfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd_rc));
+    const cfd: i32 = @intCast(cfd_rc);
+    defer _ = linux.close(@intCast(cfd));
+
+    var sa_connect = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+        .zero = [_]u8{0} ** 8,
+    };
+    const con_rc = linux.connect(@intCast(cfd), @ptrCast(&sa_connect), @sizeOf(std.posix.sockaddr.in));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(con_rc));
+
+    const sendAll = struct {
+        fn f(fd: i32, data: []const u8) !void {
+            var sent: usize = 0;
+            while (sent < data.len) {
+                const n = linux.write(@intCast(fd), data[sent..].ptr, data.len - sent);
+                if (linux.errno(n) != .SUCCESS) return error.SendFailed;
+                sent += @intCast(n);
+            }
+        }
+    }.f;
+
+    const recvFull = struct {
+        fn f(fd: i32, buf: []u8) []u8 {
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = linux.read(@intCast(fd), buf[total..].ptr, buf.len - total);
+                if (linux.errno(n) != .SUCCESS or n == 0) break;
+                total += @intCast(n);
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |sep| {
+                    if (std.mem.indexOf(u8, buf[0 .. sep + 4], "content-length: ")) |cl_start| {
+                        const after = buf[cl_start + "content-length: ".len .. sep + 4];
+                        const end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
+                        const clen = std.fmt.parseInt(usize, after[0..end], 10) catch 0;
+                        if (total - (sep + 4) >= clen) break;
+                    } else break;
+                }
+            }
+            return buf[0..total];
+        }
+    }.f;
+
+    var buf1: [2048]u8 = undefined;
+    try sendAll(cfd, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+    _ = recvFull(cfd, &buf1);
+
+    var buf2: [2048]u8 = undefined;
+    try sendAll(cfd, "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    _ = recvFull(cfd, &buf2);
+
+    // Small pause: observer fires synchronously on the worker thread, but the
+    // second response might not have been fully flushed yet.
+    {
+        const ts = linux.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+    }
+
+    // Observer must have fired at least twice (once per request).
+    try testing.expect(cap.count >= 2);
+    // Last request was a 404 for /nope.
+    try testing.expectEqual(@as(u16, 404), cap.status);
+
+    var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer shutdown_threaded.deinit();
+    app.requestShutdown(shutdown_threaded.io());
+    srv_thread.join();
+    try testing.expect(serve_ctx.err == null);
 }

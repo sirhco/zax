@@ -75,6 +75,11 @@ pub fn main(init: std.process.Init) !void {
     // Anything else (incl. unset) -> init.io (std.Io.Threaded, one thread per connection).
     const use_evented = if (init.environ_map.get("ZAX_IO")) |v| std.mem.eql(u8, v, "evented") else false;
 
+    // Backend selector: ZAX_BACKEND=evented -> App.serveEvented (Linux epoll reactor, SO_REUSEPORT,
+    // shared-nothing workers). Default (unset / "threaded") -> the existing std.Io.Threaded path.
+    // On macOS serveEvented returns error.EventedUnsupported — we print a clear message and exit 1.
+    const backend_evented = if (init.environ_map.get("ZAX_BACKEND")) |v| std.mem.eql(u8, v, "evented") else false;
+
     // Self-shutdown timer: ZAX_RUN_SECS=N → stop after N seconds (dumps trace).
     // 0 or unset → run forever (unchanged behavior).
     const run_secs: u64 = if (init.environ_map.get("ZAX_RUN_SECS")) |v|
@@ -96,8 +101,26 @@ pub fn main(init: std.process.Init) !void {
 
     const port: u16 = 8081;
 
-    if (use_evented) {
-        // SPIKE RESULT — std.Io.Evented cannot serve TCP in Zig 0.16, so we
+    if (backend_evented) {
+        // ZAX_BACKEND=evented: use App.serveEvented (Linux epoll reactor, SO_REUSEPORT,
+        // shared-nothing workers, 0 = ncpu workers). Linux-only; macOS exits non-zero.
+        std.debug.print(
+            "zax bench server on http://127.0.0.1:{d} (backend=evented, tcp_nodelay={}, keep_alive={}, workers=ncpu)\n",
+            .{ port, nodelay, keep_alive },
+        );
+        app.serveEvented(init.io, .{ .ip4 = .loopback(port) }, .{ .workers = 0 }) catch |e| {
+            if (e == error.EventedUnsupported) {
+                std.debug.print(
+                    "ZAX_BACKEND=evented unsupported on this platform (Linux epoll only). " ++
+                        "Run inside the Docker image (zax-linux-bench) for Linux.\n",
+                    .{},
+                );
+                std.process.exit(1);
+            }
+            return e;
+        };
+    } else if (use_evented) {
+        // ZAX_IO=evented (legacy knob) — std.Io.Evented cannot serve TCP in Zig 0.16, so we
         // refuse up front instead of attempting it.
         //
         // What was tried (preserved in git history at the first spike commit):

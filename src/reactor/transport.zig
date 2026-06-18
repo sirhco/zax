@@ -1,0 +1,272 @@
+//! Transport interface and fake in-memory test double.
+//!
+//! `Transport` is a vtable-based abstraction over a readable/writable byte
+//! stream. The real implementation (Task 8) will wrap a non-blocking POSIX
+//! socket; here we expose only the interface plus `FakeTransport` so that the
+//! connection state-machine can be unit-tested on any platform without sockets.
+
+const std = @import("std");
+const testing = std.testing;
+
+// ---------------------------------------------------------------------------
+// IoResult
+// ---------------------------------------------------------------------------
+
+/// The result of a single non-blocking read or write.
+pub const IoResult = union(enum) {
+    /// Bytes transferred; value is the count.
+    ok: usize,
+    /// The operation would block — caller should arm the event loop and retry.
+    would_block,
+    /// The peer closed the connection (EOF on read, broken pipe on write).
+    closed,
+};
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
+/// A tiny vtable wrapping a non-blocking byte stream.
+///
+/// Both `readFn` and `writeFn` must be non-blocking: they return immediately
+/// with `.would_block` rather than blocking the calling thread.
+pub const Transport = struct {
+    context: *anyopaque,
+    readFn: *const fn (ctx: *anyopaque, buf: []u8) IoResult,
+    writeFn: *const fn (ctx: *anyopaque, buf: []const u8) IoResult,
+
+    pub fn read(self: Transport, buf: []u8) IoResult {
+        return self.readFn(self.context, buf);
+    }
+
+    pub fn write(self: Transport, buf: []const u8) IoResult {
+        return self.writeFn(self.context, buf);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// FakeTransport — test double
+// ---------------------------------------------------------------------------
+
+/// An in-memory `Transport` driven by scripted data.
+///
+/// Reads return successive slices from `reads`. Once all chunks are consumed
+/// the next read returns `.closed` (unless `closed_after_reads` is set to an
+/// earlier index). A one-shot `.would_block` is injected after `block_after`
+/// successful reads; the read that would have blocked is retried normally on
+/// the subsequent call. Writes append bytes to the `written` list.
+pub const FakeTransport = struct {
+    /// Scripted read chunks.
+    reads: []const []const u8,
+    /// Index of the next scripted chunk to return.
+    read_idx: usize = 0,
+    /// Byte offset within the current chunk (for partial reads across small buffers).
+    chunk_offset: usize = 0,
+    /// After this many successful reads, return `.would_block` once then resume.
+    /// Defaults to `maxInt(usize)` (never block).
+    block_after: usize = std.math.maxInt(usize),
+    /// Set to `true` internally when the one-shot block has been fired.
+    blocked_once: bool = false,
+    /// Bytes accumulated by `writeFn`.
+    written: std.ArrayListUnmanaged(u8),
+    /// Allocator used for `written`; stored so vtable fns can append without
+    /// the caller threading an allocator through every write call.
+    gpa: std.mem.Allocator,
+    /// If set, return `.closed` after this many successful reads instead of
+    /// waiting until `reads` is exhausted.
+    closed_after_reads: ?usize = null,
+    /// If set, return `.would_block` once after this many total bytes have been
+    /// written via `writeFn`. One-shot: after firing, clears itself so writes
+    /// proceed normally. This lets tests simulate backpressure mid-response.
+    write_block_after_bytes: ?usize = null,
+    /// Total bytes written so far (used for `write_block_after_bytes`).
+    write_bytes_total: usize = 0,
+    /// Set to `true` internally when the one-shot write block has been fired.
+    write_blocked_once: bool = false,
+
+    pub fn init(gpa: std.mem.Allocator, reads: []const []const u8) FakeTransport {
+        return .{
+            .reads = reads,
+            .written = .empty,
+            .gpa = gpa,
+        };
+    }
+
+    pub fn deinit(self: *FakeTransport) void {
+        self.written.deinit(self.gpa);
+    }
+
+    pub fn transport(self: *FakeTransport) Transport {
+        return .{
+            .context = self,
+            .readFn = readFn,
+            .writeFn = writeFn,
+        };
+    }
+
+    // -- vtable implementations --
+
+    fn readFn(ctx: *anyopaque, buf: []u8) IoResult {
+        const self: *FakeTransport = @ptrCast(@alignCast(ctx));
+
+        // Check explicit early-close threshold.
+        if (self.closed_after_reads) |limit| {
+            if (self.read_idx >= limit) return .closed;
+        }
+
+        // One-shot would_block injection. Does NOT consume the current chunk:
+        // the same bytes will be returned on the next call.
+        if (!self.blocked_once and self.read_idx >= self.block_after) {
+            self.blocked_once = true;
+            return .would_block;
+        }
+
+        // Scripts exhausted → closed.
+        if (self.read_idx >= self.reads.len) return .closed;
+
+        const chunk = self.reads[self.read_idx];
+        const remaining = chunk[self.chunk_offset..];
+        const n = @min(remaining.len, buf.len);
+        @memcpy(buf[0..n], remaining[0..n]);
+        self.chunk_offset += n;
+        if (self.chunk_offset == chunk.len) {
+            // Chunk fully consumed; advance to the next one.
+            self.read_idx += 1;
+            self.chunk_offset = 0;
+        }
+        return .{ .ok = n };
+    }
+
+    fn writeFn(ctx: *anyopaque, buf: []const u8) IoResult {
+        const self: *FakeTransport = @ptrCast(@alignCast(ctx));
+        // One-shot write-block: after `write_block_after_bytes` cumulative bytes
+        // have been written, return `.would_block` once then resume.
+        if (!self.write_blocked_once) {
+            if (self.write_block_after_bytes) |threshold| {
+                if (self.write_bytes_total >= threshold) {
+                    // Threshold already crossed — block this call (one-shot).
+                    self.write_blocked_once = true;
+                    self.write_block_after_bytes = null; // disarm
+                    return .would_block;
+                }
+                // Current write might cross the threshold — do a partial write
+                // up to the threshold so the NEXT call fires the block.
+                if (self.write_bytes_total + buf.len > threshold) {
+                    const partial = threshold - self.write_bytes_total;
+                    self.written.appendSlice(self.gpa, buf[0..partial]) catch return .closed;
+                    self.write_bytes_total += partial;
+                    return .{ .ok = partial };
+                }
+            }
+        }
+        self.written.appendSlice(self.gpa, buf) catch return .closed;
+        self.write_bytes_total += buf.len;
+        return .{ .ok = buf.len };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+test "FakeTransport: returns scripted read chunks then closed" {
+    var ft = FakeTransport.init(testing.allocator, &.{ "GET / HTTP/1.1\r\n", "\r\n" });
+    defer ft.deinit();
+    const t = ft.transport();
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 16), (t.read(&buf)).ok); // first chunk
+    try testing.expectEqualStrings("GET / HTTP/1.1\r\n", buf[0..16]);
+    try testing.expectEqual(@as(usize, 2), (t.read(&buf)).ok); // "\r\n"
+    try testing.expect((t.read(&buf)) == .closed); // scripts exhausted
+}
+
+test "FakeTransport: write() accumulates into `written`" {
+    var ft = FakeTransport.init(testing.allocator, &.{});
+    defer ft.deinit();
+    const t = ft.transport();
+    _ = t.write("HTTP/1.1 200 OK\r\n");
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", ft.written.items);
+}
+
+test "FakeTransport: would_block injected once at block_after" {
+    var ft = FakeTransport.init(testing.allocator, &.{ "a", "b" });
+    defer ft.deinit();
+    ft.block_after = 1;
+    const t = ft.transport();
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), (t.read(&buf)).ok);
+    try testing.expect((t.read(&buf)) == .would_block); // injected
+    try testing.expectEqual(@as(usize, 1), (t.read(&buf)).ok); // resumes
+}
+
+test "FakeTransport: partial read across small buffer reassembles full chunk" {
+    // One 18-byte chunk, read into an 8-byte buffer. Must return every byte
+    // without loss and then signal closed.
+    const full = "GET / HTTP/1.1\r\n\r\n"; // 18 bytes
+    var ft = FakeTransport.init(testing.allocator, &.{full});
+    defer ft.deinit();
+    const t = ft.transport();
+    var buf: [8]u8 = undefined;
+    var assembled: std.ArrayListUnmanaged(u8) = .empty;
+    defer assembled.deinit(testing.allocator);
+
+    while (true) {
+        const result = t.read(&buf);
+        switch (result) {
+            .ok => |n| try assembled.appendSlice(testing.allocator, buf[0..n]),
+            .closed => break,
+            .would_block => return error.UnexpectedWouldBlock,
+        }
+    }
+
+    // All 18 bytes arrived, in order, with none dropped.
+    try testing.expectEqualStrings(full, assembled.items);
+}
+
+test "FakeTransport: closed_after_reads fires after exact count" {
+    var ft = FakeTransport.init(testing.allocator, &.{ "a", "b", "c" });
+    defer ft.deinit();
+    ft.closed_after_reads = 2; // close after 2 chunks
+    const t = ft.transport();
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), (t.read(&buf)).ok); // read 0
+    try testing.expectEqual(@as(usize, 1), (t.read(&buf)).ok); // read 1
+    try testing.expect((t.read(&buf)) == .closed); // threshold hit
+}
+
+test "FakeTransport: write_block_after_bytes fires once then resumes" {
+    var ft = FakeTransport.init(testing.allocator, &.{});
+    defer ft.deinit();
+    // Block immediately: first write call should hit the threshold (0 bytes written).
+    ft.write_block_after_bytes = 0;
+    const t = ft.transport();
+
+    // First write: threshold already hit → would_block (one-shot).
+    try testing.expect(t.write("hello") == .would_block);
+    // Second write: block disarmed → writes normally.
+    try testing.expectEqual(IoResult{ .ok = 5 }, t.write("hello"));
+    // Third write: no re-block → also succeeds.
+    try testing.expectEqual(IoResult{ .ok = 6 }, t.write(" world"));
+    // All successful writes accumulated (the blocked call wrote nothing).
+    try testing.expectEqualStrings("hello world", ft.written.items);
+}
+
+test "FakeTransport: block_after fires only once, next read returns data" {
+    const full = "hello"; // 5 bytes
+    var ft = FakeTransport.init(testing.allocator, &.{full});
+    defer ft.deinit();
+    ft.block_after = 0; // block before the very first read
+    const t = ft.transport();
+    var buf: [8]u8 = undefined;
+
+    // First call: injected would_block; chunk NOT consumed.
+    try testing.expect((t.read(&buf)) == .would_block);
+
+    // Second call: returns the chunk normally.
+    const r = t.read(&buf);
+    try testing.expectEqual(@as(usize, full.len), r.ok);
+    try testing.expectEqualStrings(full, buf[0..r.ok]);
+
+    // Third call: no re-block, scripts exhausted → closed.
+    try testing.expect((t.read(&buf)) == .closed);
+}
