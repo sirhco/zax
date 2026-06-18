@@ -5,6 +5,24 @@
 //! so it participates in comptime analysis on every platform.  The one `test`
 //! block self-skips off-Linux via `return error.SkipZigTest`.
 //!
+//! Cross-platform shape
+//! --------------------
+//! OS-specific bits are isolated so a kqueue backend (V2b) can be added without
+//! touching this file:
+//!
+//!   • Socket syscalls: `std.posix.setsockopt` where available; `linux.*` raw
+//!     calls for functions (socket, bind, listen, accept4, close, getsockname)
+//!     that `std.posix` does not yet expose in Zig 0.16.
+//!
+//!   • Wake mechanism: a self-pipe (`linux.pipe2` on Linux) replaces the former
+//!     Linux-only `eventfd`.  `wake()` writes 1 byte to the write end; the loop
+//!     drains the read end.  Both fds are stored on `Worker` and closed in
+//!     `deinit`.
+//!
+//!   • Event buffer: typed as `[MAX_EVENTS]poller_mod.Poller.NativeEvent`.
+//!     The kqueue backend will define `NativeEvent = std.posix.Kevent`; the
+//!     worker declaration is unchanged.
+//!
 //! Dispatcher ctx contract (Task 8 → Task 9)
 //! ------------------------------------------
 //! `App(S).dispatch` takes a `std.Io` as its first argument (it is forwarded to
@@ -59,8 +77,8 @@ pub const WorkerOpts = struct {
     sndbuf_override: u32 = 0,
 };
 
-/// A self-contained epoll worker: one listen socket, one eventfd (wake), and a
-/// preallocated pool of connection slots each owning its own buffers + arena.
+/// A self-contained epoll worker: one listen socket, one self-pipe (wake), and
+/// a preallocated pool of connection slots each owning its own buffers + arena.
 pub const Worker = struct {
     gpa: std.mem.Allocator,
     dispatcher: Dispatcher,
@@ -77,7 +95,10 @@ pub const Worker = struct {
     poller: Poller,
     timer: TimerWheel,
     listen_fd: i32,
-    wake_fd: i32, // eventfd used by wake()
+    /// Self-pipe wake: write 1 byte to wake_wr to break epoll_wait;
+    /// the loop drains wake_rd.  Both are CLOEXEC | NONBLOCK.
+    wake_rd: i32,
+    wake_wr: i32,
     /// Set when accept4 returns EMFILE/ENFILE (fd exhaustion).  The listen fd
     /// is removed from epoll to stop busy-spinning; it is re-added in closeSlot
     /// once a slot + fd frees up.
@@ -134,9 +155,11 @@ pub const Worker = struct {
         const lfd: i32 = @intCast(lfd_rc);
         errdefer _ = linux.close(@intCast(lfd));
 
+        // SO_REUSEADDR and SO_REUSEPORT via std.posix.setsockopt (available on
+        // both Linux and macOS in Zig 0.16).
         const one: c_int = 1;
-        _ = linux.setsockopt(lfd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));
-        _ = linux.setsockopt(lfd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, @ptrCast(&one), @sizeOf(c_int));
+        try std.posix.setsockopt(lfd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one));
+        try std.posix.setsockopt(lfd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&one));
 
         // Bind.
         var sa: std.posix.sockaddr = undefined;
@@ -148,15 +171,19 @@ pub const Worker = struct {
         const listen_rc = linux.listen(lfd, BACKLOG);
         if (linux.errno(listen_rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(listen_rc));
 
-        // eventfd for wake().
-        const efd_rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
-        if (linux.errno(efd_rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(efd_rc));
-        const efd: i32 = @intCast(efd_rc);
-        errdefer _ = linux.close(@intCast(efd));
+        // Self-pipe for wake(): CLOEXEC | NONBLOCK on both ends.
+        // pipe2 returns [read_end, write_end].
+        var pipe_fds: [2]i32 = undefined;
+        const pipe_rc = linux.pipe2(&pipe_fds, linux.O{ .CLOEXEC = true, .NONBLOCK = true });
+        if (linux.errno(pipe_rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(pipe_rc));
+        const wake_rd: i32 = pipe_fds[0];
+        const wake_wr: i32 = pipe_fds[1];
+        errdefer _ = linux.close(@intCast(wake_rd));
+        errdefer _ = linux.close(@intCast(wake_wr));
 
         var p = poller;
         try p.add(lfd, LISTEN_TOKEN, true, false);
-        try p.add(efd, WAKE_TOKEN, true, false);
+        try p.add(wake_rd, WAKE_TOKEN, true, false);
 
         return .{
             .gpa = gpa,
@@ -170,14 +197,16 @@ pub const Worker = struct {
             .poller = p,
             .timer = timer,
             .listen_fd = lfd,
-            .wake_fd = efd,
+            .wake_rd = wake_rd,
+            .wake_wr = wake_wr,
         };
     }
 
     pub fn deinit(self: *Worker) void {
         if (builtin.os.tag != .linux) unreachable;
         _ = linux.close(@intCast(self.listen_fd));
-        _ = linux.close(@intCast(self.wake_fd));
+        _ = linux.close(@intCast(self.wake_rd));
+        _ = linux.close(@intCast(self.wake_wr));
         self.poller.deinit();
         self.timer.deinit();
         for (self.slots) |*s| s.deinit(self.gpa);
@@ -186,12 +215,12 @@ pub const Worker = struct {
         self.* = undefined;
     }
 
-    /// Write to the eventfd to break a blocked `epoll_wait`.  Safe to call
-    /// from any thread.
+    /// Write 1 byte to the self-pipe write end to break a blocked `epoll_wait`.
+    /// Safe to call from any thread.
     pub fn wake(self: *Worker) void {
         if (builtin.os.tag != .linux) unreachable;
-        const val: u64 = 1;
-        _ = linux.write(@intCast(self.wake_fd), @ptrCast(&val), 8);
+        const byte: u8 = 1;
+        _ = linux.write(@intCast(self.wake_wr), @ptrCast(&byte), 1);
     }
 
     /// Main event loop.  Runs until `shutdown.load(.acquire)` is true and a
@@ -204,7 +233,10 @@ pub const Worker = struct {
         // reach it without needing a closure.
         g_worker = self;
 
-        var events: [MAX_EVENTS]linux.epoll_event = undefined;
+        // Event buffer typed via the poller's native event type — when a
+        // kqueue backend defines NativeEvent = std.posix.Kevent, this line
+        // is the only worker declaration that changes.
+        var events: [MAX_EVENTS]poller_mod.Poller.NativeEvent = undefined;
 
         while (true) {
             const now = monotonicNow();
@@ -226,9 +258,14 @@ pub const Worker = struct {
                     // Accept new connections (loop until WouldBlock).
                     self.acceptLoop();
                 } else if (ev.data == WAKE_TOKEN) {
-                    // Drain the eventfd counter.
-                    var buf: u64 = 0;
-                    _ = linux.read(@intCast(self.wake_fd), @ptrCast(&buf), 8);
+                    // Drain the self-pipe read end (discard bytes; purpose is
+                    // only to unblock epoll_wait).
+                    var drain: [64]u8 = undefined;
+                    while (true) {
+                        const rc = linux.read(@intCast(self.wake_rd), &drain, drain.len);
+                        if (linux.errno(rc) == .AGAIN) break;
+                        if (linux.errno(rc) != .SUCCESS or rc == 0) break;
+                    }
                     // Shutdown check happens after the event loop below.
                 } else {
                     // Connection event.
@@ -494,23 +531,23 @@ fn sockTransport(fd: i32) Transport {
 
 fn sockReadFn(ctx: *anyopaque, buf: []u8) IoResult {
     const fd: i32 = @intCast(@intFromPtr(ctx));
-    const rc = linux.read(@intCast(fd), buf.ptr, buf.len);
-    const e = linux.errno(rc);
-    return switch (e) {
-        .SUCCESS => {
-            if (rc == 0) return .closed; // EOF
-            return .{ .ok = @intCast(rc) };
-        },
-        .AGAIN => .would_block, // EAGAIN == EWOULDBLOCK on Linux
-        .CONNRESET, .CONNABORTED, .PIPE => .closed,
-        .INTR => .would_block, // treat signal interrupts as transient
-        else => .closed,
+    // std.posix.read handles EINTR internally (retries) and maps EAGAIN →
+    // error.WouldBlock.  Works on both Linux and macOS.
+    const n = std.posix.read(fd, buf) catch |err| switch (err) {
+        error.WouldBlock => return .would_block,
+        error.ConnectionResetByPeer => return .closed,
+        else => return .closed,
     };
+    if (n == 0) return .closed; // EOF
+    return .{ .ok = n };
 }
 
 fn sockWriteFn(ctx: *anyopaque, buf: []const u8) IoResult {
     const fd: i32 = @intCast(@intFromPtr(ctx));
-    // MSG_NOSIGNAL prevents SIGPIPE when writing to a closed peer.
+    // MSG_NOSIGNAL suppresses SIGPIPE on Linux when writing to a closed peer.
+    // On macOS there is no MSG_NOSIGNAL; SO_NOSIGPIPE is set on the socket
+    // instead (V2b will handle that at accept time).  For now the guard
+    // ensures this compiles on macOS while Linux behaviour is unchanged.
     const MSG_NOSIGNAL: u32 = if (builtin.os.tag == .linux) linux.MSG.NOSIGNAL else 0;
     const rc = linux.sendto(@intCast(fd), buf.ptr, buf.len, MSG_NOSIGNAL, null, 0);
     const e = linux.errno(rc);
@@ -1100,4 +1137,3 @@ test "worker: write-stall deadline — server reaps a peer that stops reading" {
     worker.wake();
     thread.join();
 }
-

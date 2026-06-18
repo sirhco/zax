@@ -8,11 +8,16 @@
 //! Syscall path: all epoll calls go through `std.os.linux` (raw syscall
 //! wrappers) because `std.posix` does not expose epoll in Zig 0.16.
 //!
+//! The worker owns an event buffer typed as `[N]Poller.NativeEvent`; decode
+//! each raw event with `eventFromRaw`.  When a kqueue backend is added, it
+//! will define `NativeEvent = std.posix.Kevent` and the worker buffer type
+//! is unchanged.
+//!
 //! Usage (Linux only):
 //!   var p = try Poller.init();
 //!   defer p.deinit();
 //!   try p.add(fd, slot_index, true, false);
-//!   var evs: [64]std.os.linux.epoll_event = undefined;
+//!   var evs: [64]Poller.NativeEvent = undefined;
 //!   const n = p.wait(evs[0..], 100);
 //!   for (evs[0..n]) |raw| {
 //!       const ev = eventFromRaw(raw);
@@ -41,9 +46,9 @@ pub const Event = struct {
 // Helper: translate a raw epoll_event to Event
 // ---------------------------------------------------------------------------
 
-/// Decode a raw `epoll_event` into an `Event`.
+/// Decode a raw `NativeEvent` into an `Event`.
 /// Only meaningful on Linux; bodies guarded — calling off-Linux is `unreachable`.
-pub fn eventFromRaw(raw: linux.epoll_event) Event {
+pub fn eventFromRaw(raw: Poller.NativeEvent) Event {
     if (builtin.os.tag != .linux) unreachable;
     return .{
         .data = raw.data.u64,
@@ -59,6 +64,11 @@ pub fn eventFromRaw(raw: linux.epoll_event) Event {
 
 pub const Poller = struct {
     epfd: i32,
+
+    /// The native event type for this backend.  The worker allocates its event
+    /// buffer as `[N]Poller.NativeEvent` so a future kqueue backend can swap
+    /// this to `std.posix.Kevent` without touching the worker.
+    pub const NativeEvent = linux.epoll_event;
 
     /// Create an epoll instance via `epoll_create1(0)`.  Level-triggered for v1
     /// (no `EPOLLET`).
@@ -107,7 +117,7 @@ pub const Poller = struct {
     /// Returns the number of events written into `events` (0..events.len).
     /// Never returns a sentinel: EINTR and other errors are mapped to 0 so the
     /// caller's `for (events[0..n])` loop is always in-bounds.
-    pub fn wait(self: *Poller, events: []linux.epoll_event, timeout_ms: i32) usize {
+    pub fn wait(self: *Poller, events: []NativeEvent, timeout_ms: i32) usize {
         if (builtin.os.tag != .linux) unreachable;
         const rc = linux.epoll_wait(self.epfd, events.ptr, @intCast(events.len), timeout_ms);
         const e = linux.errno(rc);
@@ -165,7 +175,7 @@ test "poller: eventfd smoke" {
     try std.testing.expectEqual(@as(usize, 8), wrc);
 
     // wait — expect exactly 1 event.
-    var evs: [8]linux.epoll_event = undefined;
+    var evs: [8]Poller.NativeEvent = undefined;
     const n = p.wait(evs[0..], 200);
     try std.testing.expectEqual(@as(usize, 1), n);
 
