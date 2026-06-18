@@ -90,7 +90,32 @@ On the evented backend a `.chunk = 0` parks the connection on the timer wheel an
 after `EventedOptions.stream_repoll_ms` (default 5 ms; `0` = the legacy busy behavior) — it
 does **not** busy-spin the reactor (since v0.3.0), so sparse SSE works on evented. Note the
 `sse()` helper and the push `stream` streamer are Writer-based and **threaded-only**; for SSE
-on the evented backend, drive `streamPull` directly.
+on the evented backend, drive `streamPull` directly or use `ssePull` (below).
+
+### Server-Sent Events on the evented backend
+
+The push `sse()` helper is threaded-only (it writes to a blocking writer). For SSE on the
+evented backend, use the pull-model `ssePull` — `nextFn` returns one `SsePull` step at a time
+and zax frames it:
+
+```zig
+const Feed = struct {
+    fn next(self: *Feed) zax.SsePull {
+        if (self.poll()) |ev| return .{ .event = .{ .data = ev } };
+        if (self.ended) return .done;
+        return .not_ready;   // nothing yet — parks on the timer wheel (no busy-spin)
+    }
+};
+
+fn events(feed: *Feed) zax.Response {
+    return zax.Response.ssePull(Feed, feed, Feed.next);
+}
+```
+
+`not_ready` emits a 0-byte chunk: on evented it parks the connection and re-polls after
+`stream_repoll_ms`; on threaded it loops, so for sparse streams on the threaded backend prefer
+the push `sse()` helper. A single event larger than the write buffer yields an error and closes
+the connection.
 
 ## Limitations
 
