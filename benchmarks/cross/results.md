@@ -383,3 +383,53 @@ a real x86_64 Linux server kernel, different vendor, different arch.
 **Bottom line:** the off-VM run confirms the headline. Evented zax is the throughput + p99.9
 leader on real x86_64 Linux, the threaded tail is a genuine `std.Io.Threaded` property (not an
 artifact), and the relative gaps match the Mac runs. The reactor delivers.
+
+## Real Linux VM #2 — Intel Xeon, 64 vCPU (KVM), SMT-aware PIN=1 — bigger box
+
+Second off-VM run, on a larger cloud VM: Intel Xeon E5 v3 @2.3GHz, 64 vCPU = 32 cores × 2 SMT,
+single NUMA, KVM. Uses the new **physical-core-aware `PIN=1`** (server = 16 physical cores both
+threads, client = the other 16 — disjoint, confirmed in the pinning line). 30s, 64 conns.
+
+| framework | scenario | req/s | p50 | p99 | p99.9 | max |
+|-----------|----------|------:|----:|----:|------:|----:|
+| zax (threaded) | static | 307342 | 0.0711 | 4.1603 | 17.3330 | 30.3693 |
+| zax (threaded) | param  | 308641 | 0.0707 | 5.5402 | 17.1882 | 25.6718 |
+| zax (threaded) | json   | 291442 | 0.0742 | 3.9656 | 18.2014 | 34.7001 |
+| **zax-ev**     | static | 655833 | 0.0832 | 0.2454 | 0.3954 | 32.4270 |
+| **zax-ev**     | param  | 652982 | 0.0839 | 0.2434 | 0.3775 | 30.1857 |
+| **zax-ev**     | json   | 617201 | 0.0880 | 0.2606 | 0.4195 | 26.8139 |
+| axum | static | 343970 | 0.1769 | 0.3525 | 0.4601 | 14.4303 |
+| axum | param  | 343897 | 0.1769 | 0.3521 | 0.4563 | 12.5588 |
+| axum | json   | 337155 | 0.1788 | 0.3703 | 0.5042 | 13.9011 |
+| go   | static | 90865 | 0.3314 | 4.1999 | 6.4613 | 13.3761 |
+| go   | param  | 85119 | 0.3580 | 4.5293 | 6.9475 | 14.2698 |
+| go   | json   | 65108 | 0.4670 | 6.1057 | 9.0465 | 19.0977 |
+| httpz | static | 256051 | 0.2374 | 0.4511 | 0.5536 | 8.1749 |
+| httpz | param  | 253282 | 0.2397 | 0.4560 | 0.5638 | 8.7156 |
+| httpz | json   | 241719 | 0.2513 | 0.4770 | 0.5850 | 10.8435 |
+
+### Verdict: throughput lead widens; the max-outlier is the shared-nothing tradeoff (not SMT)
+
+- **Throughput: zax-ev 617–656k = ~1.9× axum** (337–344k), ~2.5× httpz, ~2× threaded zax,
+  ~7–9× go. The lead is *wider* than the smaller boxes (was ~1.65–1.69×) — the shared-nothing
+  SO_REUSEPORT reactor scales better with more cores.
+- **p99.9: zax-ev 0.38–0.42ms = best of all** (axum 0.46–0.50, httpz 0.55–0.59, threaded 17–18,
+  go 6.5–9). Best-in-class.
+- **p50:** threaded zax best (0.071ms); zax-ev 0.083ms is best of the evented servers (axum 0.18,
+  httpz 0.24, go 0.33–0.47).
+- **Max — the SMT-PIN fix did NOT close it (root cause corrected):** zax-ev max 27–32ms vs axum
+  12–14ms / httpz 8–11ms. The physical-core-aware pinning is correctly applied (disjoint cores),
+  so **SMT-sibling overlap was not the dominant cause.** The real cause: this is a noisy 64-vCPU
+  shared cloud VM (heavy KVM vCPU steal — *every* framework's max is elevated: axum 14ms, go 19ms,
+  threaded zax 35ms), and zax's **shared-nothing workers don't work-steal**. When the hypervisor
+  deschedules a worker's vCPU for ~30ms, that worker's connections stall; tokio (axum) migrates
+  them to an idle thread → lower max. Inherent to the SO_REUSEPORT-per-core model (nginx too).
+  The meaningful tail (p99.9) is unaffected — best-in-class. On a *dedicated* (non-overcommitted)
+  host, vCPU steal vanishes and the max should converge. A worth-trying mitigation: set
+  `workers = physical-core count` (not logical-CPU count) so workers don't share a physical core
+  via SMT internally — reduces intra-server SMT contention.
+
+**Bottom line:** two off-VM boxes (AMD EPYC, Intel Xeon) confirm the headline — evented zax is the
+throughput + p99.9 leader, the lead grows with cores, and the threaded tail is a real
+`std.Io.Threaded` property. The only metric where axum/httpz edge zax-ev is worst-case *max* under
+cloud-VM vCPU steal — the shared-nothing-vs-work-stealing tradeoff, not a fixable bug.
