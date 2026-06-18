@@ -525,18 +525,21 @@ pub const Conn = struct {
                         if (self.pull_streamer) |ps| {
                             switch (ps.next(self.write_buf)) {
                                 .chunk => |n| {
-                                    self.w_off = 0;
-                                    self.w_len = n;
-                                    self.deadline_ns = no_deadline; // re-arm per-chunk stall deadline
                                     if (n == 0) {
                                         // Producer not ready yet (sparse stream, e.g. SSE).
-                                        if (self.stream_repoll_ms == 0) return .want_write; // escape hatch: old behavior
+                                        if (self.stream_repoll_ms == 0) {
+                                            self.deadline_ns = no_deadline; // escape hatch: preserve old behavior
+                                            return .want_write;
+                                        }
                                         self.w_off = 0;
                                         self.w_len = 0;
                                         self.state = .streaming; // parked marker: re-drive on timer fire
                                         self.deadline_ns = monotonicNow() + @as(i96, self.stream_repoll_ms) * 1_000_000;
                                         return .want_stream_repoll;
                                     }
+                                    self.w_off = 0;
+                                    self.w_len = n;
+                                    self.deadline_ns = no_deadline; // re-arm per-chunk stall deadline
                                 },
                                 .done => {
                                     self.pull_streamer = null;
