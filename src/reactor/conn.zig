@@ -1940,3 +1940,69 @@ test "conn: sparse stream — peer close while parked → done_close on re-drive
     const r3 = c.step(t_closed, d);
     try testing.expectEqual(StepResult.done_close, r3);
 }
+
+test "conn: ssePull producer — events flush, not_ready parks (want_stream_repoll), done closes" {
+    const SseCtx = struct {
+        step: usize = 0,
+        fn next(c: *@This()) response_mod.SsePull {
+            defer c.step += 1;
+            return switch (c.step) {
+                0 => .{ .event = .{ .data = "one" } },
+                1 => .not_ready,
+                2 => .{ .event = .{ .data = "two" } },
+                else => .done,
+            };
+        }
+    };
+
+    const raw = "GET /events HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = SseCtx{};
+
+    const SseDispatch = struct {
+        p: *SseCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req;
+            _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.ssePull(SseCtx, s.p, SseCtx.next);
+        }
+    };
+    var sd = SseDispatch{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = SseDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    const t = ft.transport();
+
+    // Drive the conn to completion. A not-ready producer parks
+    // (want_stream_repoll); simulate the readiness timer firing via onDeadline.
+    var parked_once = false;
+    var guard: usize = 0;
+    var result = c.step(t, d);
+    while (result != .done_close) : (guard += 1) {
+        if (guard > 50) return error.TestUnexpectedResult;
+        if (result == .want_stream_repoll) {
+            parked_once = true;
+            _ = c.onDeadline();
+        }
+        result = c.step(t, d);
+    }
+
+    try testing.expect(parked_once);
+
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, written, "text/event-stream") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "connection: close") != null);
+    const p1 = std.mem.indexOf(u8, written, "data: one") orelse return error.TestUnexpectedResult;
+    const p2 = std.mem.indexOf(u8, written, "data: two") orelse return error.TestUnexpectedResult;
+    try testing.expect(p1 < p2);
+}
