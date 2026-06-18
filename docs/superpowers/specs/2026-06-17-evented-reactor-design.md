@@ -135,26 +135,43 @@ pub fn serveEvented(self: *App, addr: net.IpAddress, opts: EventedOptions) !void
 - **Perf (Docker cross-bench):** add an evented zax variant; compare vs httpz/axum/go,
   targeting httpz-class throughput/tail while keeping zax's best-in-class p50.
 
-## Evented backend v1 limitations
+## Evented backend status (updated after v2)
 
-These are deliberate v1 scope decisions, not bugs. They diverge from the threaded backend in
-known, documented ways:
+Most original v1 limitations have since been resolved. Current state:
 
-1. **No `request_id` on the evented path.** `Options.request_id = true` has no effect under
-   `serveEvented`: no `x-request-id` response header is emitted, and the `AccessRecord`
-   passed to observers always carries `request_id = ""`. Generating a request ID requires a
-   monotonic counter per-connection that is not yet threaded through the `Dispatcher` vtable.
-2. **No write-stall deadline.** A peer that stalls mid-write — advertises zero TCP window and
-   never RSTs — holds a slot indefinitely (the write-side has no timeout). A peer that
-   closes or RSTs *is* caught via `EPOLLHUP`/`EPOLLRDHUP` and the slot is freed promptly.
-   True write-stall eviction requires an `EPOLLOUT`-armed deadline, deferred to v2.
-3. **Handlers must not use `ctx.io` for blocking IO.** Any handler that calls a blocking-IO
-   extractor (e.g. `Files`, async DB queries over `io`) stalls the entire worker event loop:
-   no new accepts, no timer sweeps, no other connections make progress. Use only sync /
-   compute-only extractors (Path, Query, Json, State, etc.) under `serveEvented`.
-4. **True streaming is threaded-only.** `resp.streamer` on the evented path buffers into the
-   write buffer up to its capacity; beyond that a 500 is synthesized and the connection is
-   closed. Unbuffered streaming (`SSE`, chunked flush) requires the threaded backend.
+**Resolved in v2:**
+- **macOS / BSD support** — the reactor is no longer Linux-only. A `kqueue` backend
+  (`src/reactor/kqueue.zig`) runs the evented reactor natively on macOS and the BSDs;
+  `poller.zig` selects `epoll` (Linux) vs `kqueue` (Darwin/BSD) by `builtin.os.tag`. The
+  reactor's integration tests run natively in `zig build test` on macOS.
+- **`request_id` on the evented path** — `Options.request_id` now works under `serveEvented`
+  (validated/generated rid, `x-request-id` response header, observer `AccessRecord`), sharing
+  the threaded backend's `computeRid`.
+- **Write-stall deadline** — a peer that stalls mid-write is now reaped after `read_timeout_ms`
+  (the `writing` state arms a deadline; `onDeadline` closes it). Peer close/RST was already caught.
+- **True streaming** — `Response.streamPull()` + `PullStreamer` stream a body in bounded
+  chunks without buffering the whole thing (connection-close framing), backpressure-aware, on
+  both backends. (The legacy push `Response.streamer` on the evented path still buffers up to
+  the write buffer / 500-on-overflow; prefer `streamPull` for large/unbounded bodies.)
+
+**Remaining limitations (by design):**
+1. **Handlers must not use `ctx.io` for blocking IO.** A handler that does blocking IO (e.g.
+   the `Files` extractor) stalls the whole worker event loop — no accepts, timers, or other
+   connections progress. Use sync/compute-only extractors (Path, Query, Json, State, …) under
+   `serveEvented`. (Same constraint every single-threaded reactor has.)
+2. **`PullStreamer` is produce-on-demand.** `nextFn` should return `chunk>0` (data ready) or
+   `done`. A producer that returns `chunk=0` ("nothing yet, retry") busy-polls — fine for
+   files/generators, but **sparse/long-idle SSE** (waiting on external events) is a v2 item
+   (needs a producer-driven readiness signal). The provided SSE helper produces on demand.
+3. **No keep-alive on streamed responses.** Streaming uses connection-close framing (no chunked
+   transfer-encoding), matching the existing push-streamer model — a streamed connection closes
+   after the body.
+4. **Worst-case `max` under cloud-VM overcommit.** Shared-nothing workers don't work-steal, so
+   a hypervisor-stolen worker's connections wait (tokio migrates them). p99.9 stays best-in-class;
+   only the rare `max` is affected, and only on overcommitted VMs (not dedicated hosts).
+
+Backend default: **`serve` (threaded) remains the default and portable path; `serveEvented` is
+opt-in** (Linux + macOS/BSD). See `docs/evented-backend.md`.
 
 ## Out of scope (v1)
 kqueue/macOS-native reactor, true (unbuffered) streaming on evented, TLS, HTTP/2. The
