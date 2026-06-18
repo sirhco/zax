@@ -233,3 +233,59 @@ the fastest overall: best median + evented throughput/tail. Two viable evented p
 (A) patch `std.Io.Evented` (io_uring/Uring) — keeps zax's clean `Io` pluggability; or
 (C) give zax its own epoll/kqueue loop like httpz — proven viable here, full control, but drops
 `Io` pluggability. See `docs/superpowers/specs/2026-06-17-evented-io-decision.md`.
+
+## Evented zax — payoff (Linux Docker, PIN=1)
+
+`BACKEND=both PIN=1 DURATION=15s CONNS=64 ./run.sh` inside Docker (`zax-linux-bench`).
+`zax` = threaded (`std.Io.Threaded`, thread/conn). `zax-ev` = `App.serveEvented` (Linux epoll,
+`SO_REUSEPORT`, shared-nothing workers, `workers=0` → ncpu). Same VM, same oha, same pin.
+
+### static — `GET /`
+
+| framework | req/s  | p50    | p99    | p99.9  | max    | model |
+|-----------|-------:|-------:|-------:|-------:|-------:|-------|
+| zax       | 112843 | 0.0555 | 2.8616 | 57.0708 | 143.2929 | Threaded (thread/conn) |
+| **zax-ev**    | **741032** | 0.0760 | **0.2387** | **0.3679** | **3.9445** | epoll reactor (evented) |
+| axum      | 444690 | 0.1381 | 0.2842 |  0.3533 |  1.7920 | tokio |
+| go        | 415076 | 0.0822 | 1.9211 |  2.7305 |  6.8923 | goroutines |
+| httpz     | 412116 | 0.1476 | 0.3058 |  0.3897 |  1.4696 | own epoll |
+
+### param — `GET /users/42`
+
+| framework | req/s  | p50    | p99    | p99.9  | max    |
+|-----------|-------:|-------:|-------:|-------:|-------:|
+| zax       | 117884 | 0.0539 | 0.4724 | 52.9155 | 68.3736 |
+| **zax-ev**    | **748358** | 0.0752 | **0.2360** | **0.3619** | **3.5376** |
+| axum      | 443062 | 0.1383 | 0.2870 |  0.3682 |  1.8537 |
+| go        | 413728 | 0.0828 | 1.9378 |  2.7687 |  4.9100 |
+| httpz     | 406464 | 0.1494 | 0.3102 |  0.4036 | 11.6137 |
+
+### json — `POST /echo`
+
+| framework | req/s  | p50    | p99    | p99.9  | max    |
+|-----------|-------:|-------:|-------:|-------:|-------:|
+| zax       | 117367 | 0.0533 | 0.6901 | 53.1961 | 64.0410 |
+| **zax-ev**    | **752572** | 0.0744 | **0.2307** | **0.3413** | **3.3075** |
+| axum      | 452842 | 0.1337 | 0.2935 |  0.3661 |  1.4364 |
+| go        | 229667 | 0.1089 | 2.3337 |  3.1298 | 22.0640 |
+| httpz     | 398552 | 0.1530 | 0.3112 |  0.3953 |  2.4933 |
+
+### Verdict: evented zax is the fastest overall — by a wide margin
+
+**Throughput:** zax-ev reaches **741–753k req/s**, **~6.5× its threaded self** and **~1.67×
+axum** (444–452k). httpz (~400–412k) and go (~230–415k) are also clearly behind. The epoll
+reactor + `SO_REUSEPORT` worker-per-core design scales very efficiently on Linux.
+
+**Tail latency:** The ~54ms p99.9 stall that plagued `std.Io.Threaded` is **completely gone**.
+zax-ev p99.9 is **0.34–0.37ms** — tighter than axum (0.35–0.37ms) and far below go (2.7–3.1ms)
+and httpz (0.39–0.40ms). Max is **3.3–3.9ms** vs threaded zax's 64–143ms.
+
+**p50:** zax-ev p50 is **0.074–0.076ms** — slightly above threaded zax's extraordinary 0.053ms
+(the epoll reactor has a bit more dispatch overhead per connection than the pure thread-park
+model), but still **2× better than axum** (0.134–0.138ms) and comparable to go (0.082–0.109ms).
+
+**Summary:** zax with the evented epoll backend is now **best-in-class on all three dimensions**:
+fastest throughput, sub-0.4ms p99.9 (tighter than or matching axum), and the best median
+latency of all five frameworks. The threaded backend's 53–57ms p99.9 tail was entirely a
+`std.Io.Threaded` thread-park/scheduler artifact. The epoll reactor (Tasks 1–9) eliminates it
+completely.

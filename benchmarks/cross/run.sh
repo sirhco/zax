@@ -57,6 +57,9 @@ INFLIGHT="${INFLIGHT:-0}"  # N>0 = run zax twice (ZAX_MAX_INFLIGHT=0 then =N) to
                       # worker-pool cap. Adds a "zax-cap" row alongside the default "zax".
                       # NOTE: AB=1 and INFLIGHT are mutually exclusive for the zax passes —
                       # AB=1 takes precedence (INFLIGHT is silently ignored when AB=1 is set).
+BACKEND="${BACKEND:-threaded}"  # "both" = run zax twice (threaded then evented epoll reactor).
+                      # "evented" = evented only. Default "threaded" = classic std.Io.Threaded.
+                      # Evented is Linux-only (ZAX_BACKEND=evented calls App.serveEvented).
 ROWS=()               # accumulated "framework|scenario|reqs|p50|p99|p999|max" for the table
 
 # When PIN=1, run the server on the first half of the cores and the load
@@ -145,8 +148,10 @@ drive() {
 # runs twice — Nagle off (ZAX_NODELAY=0) then on (=1) — so the same-box tail can
 # be A/B'd; the other frameworks run once. INFLIGHT=N (when AB=0): zax runs twice
 # (ZAX_MAX_INFLIGHT=0 then =N) to A/B the worker-pool cap.
+# BACKEND=both: zax runs twice — threaded then evented (ZAX_BACKEND=evented).
 # AB=1 and INFLIGHT are mutually exclusive for zax — AB=1 takes precedence.
-# axum/go always run once.
+# BACKEND takes effect when AB=0 and INFLIGHT=0.
+# axum/go/httpz always run once.
 [ "$AB" = 1 ] && [ "${INFLIGHT:-0}" != 0 ] && echo "WARNING: AB=1 takes precedence for zax; INFLIGHT ignored this run." >&2 || true
 PASSES=()
 for entry in "${FRAMEWORKS[@]}"; do
@@ -157,6 +162,11 @@ for entry in "${FRAMEWORKS[@]}"; do
   elif [ "$name" = zax ] && [ "${INFLIGHT:-0}" != 0 ]; then
     PASSES+=("zax|$port|ZAX_MAX_INFLIGHT=0|$cmd")
     PASSES+=("zax-cap|$port|ZAX_MAX_INFLIGHT=$INFLIGHT|$cmd")
+  elif [ "$name" = zax ] && [ "$BACKEND" = both ]; then
+    PASSES+=("zax|$port|ZAX_BACKEND=threaded|$cmd")
+    PASSES+=("zax-ev|$port|ZAX_BACKEND=evented|$cmd")
+  elif [ "$name" = zax ] && [ "$BACKEND" = evented ]; then
+    PASSES+=("zax-ev|$port|ZAX_BACKEND=evented|$cmd")
   else
     PASSES+=("$name|$port||$cmd")
   fi
@@ -198,3 +208,5 @@ echo
 echo "(p50/p99/p99.9/max parsed from oha; copy into results.md. RAW=1 for full output.)"
 [ "$AB" = 1 ] && echo "(A/B: compare zax-on vs zax-off on P99.9/MAX — the delta isolates Nagle.)"
 [ "${INFLIGHT:-0}" != 0 ] && echo "(INFLIGHT=$INFLIGHT: compare zax vs zax-cap on P99.9/MAX — cap flattens the thread-per-conn tail.)"
+[ "$BACKEND" = both ] && echo "(BACKEND=both: compare zax (threaded) vs zax-ev (evented epoll reactor) — throughput + tail.)"
+[ "$BACKEND" = evented ] && echo "(BACKEND=evented: evented epoll reactor only.)"
