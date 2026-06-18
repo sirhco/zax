@@ -101,6 +101,18 @@ pub const PullStreamer = struct {
     }
 };
 
+/// One step of a pull-model SSE producer (see `Response.ssePull`).
+pub const SsePull = union(enum) {
+    /// A full SSE event (event/data/id/retry) — framed via `sse.formatEvent`.
+    event: sse_mod.Event,
+    /// An SSE comment line (`: text`) — keepalive heartbeat, via `sse.formatComment`.
+    comment: []const u8,
+    /// No event ready yet — emits a 0-byte chunk (parks on the evented backend).
+    not_ready,
+    /// End of stream.
+    done,
+};
+
 pub const Response = struct {
     status: Status = .ok,
     content_type: []const u8 = "text/plain; charset=utf-8",
@@ -200,6 +212,45 @@ pub const Response = struct {
         };
         return .{
             .content_type = content_type,
+            .pull_streamer = .{ .context = context, .nextFn = &Erased.call },
+            .keep_alive = false,
+        };
+    }
+
+    /// Build a pull-model SSE (`text/event-stream`) response. `nextFn` is called
+    /// repeatedly; zax frames each returned event/comment into the driver's write
+    /// buffer via the SSE wire formatter. Connection-close framing. Works on both
+    /// backends — on the evented backend `not_ready` parks the connection on the
+    /// timer wheel (no busy-spin); on threaded it loops, so for sparse streams on
+    /// the threaded backend prefer the push `sse()` helper. A single event larger
+    /// than the driver buffer yields `.err` (the connection closes).
+    /// `context` must outlive the request (use the request arena).
+    pub fn ssePull(
+        comptime Ctx: type,
+        context: *Ctx,
+        comptime nextFn: fn (*Ctx) SsePull,
+    ) Response {
+        const Erased = struct {
+            fn call(c: *anyopaque, buf: []u8) PullResult {
+                const ctx: *Ctx = @ptrCast(@alignCast(c));
+                switch (nextFn(ctx)) {
+                    .event => |e| {
+                        var w = Writer.fixed(buf);
+                        sse_mod.formatEvent(&w, e) catch return .err;
+                        return .{ .chunk = w.buffered().len };
+                    },
+                    .comment => |txt| {
+                        var w = Writer.fixed(buf);
+                        sse_mod.formatComment(&w, txt) catch return .err;
+                        return .{ .chunk = w.buffered().len };
+                    },
+                    .not_ready => return .{ .chunk = 0 },
+                    .done => return .done,
+                }
+            }
+        };
+        return .{
+            .content_type = "text/event-stream",
             .pull_streamer = .{ .context = context, .nextFn = &Erased.call },
             .keep_alive = false,
         };
@@ -509,4 +560,85 @@ test "streamPull: builds a Response with pull_streamer set, keep_alive false, no
     try testing.expect(r.keep_alive == false);
     try testing.expectEqualStrings("", r.body);
     try testing.expect(r.streamer == null); // does NOT set push streamer
+}
+
+test "ssePull: builds text/event-stream Response, connection-close, pull_streamer set, no body" {
+    const Ctx = struct {
+        fn next(_: *@This()) SsePull {
+            return .done;
+        }
+    };
+    var ctx = Ctx{};
+    const r = Response.ssePull(Ctx, &ctx, Ctx.next);
+    try testing.expectEqualStrings("text/event-stream", r.content_type);
+    try testing.expect(r.pull_streamer != null);
+    try testing.expect(!r.keep_alive);
+    try testing.expectEqual(@as(usize, 0), r.body.len);
+}
+
+test "ssePull: event is framed via formatEvent into the buffer, then done" {
+    const Ctx = struct {
+        sent: bool = false,
+        fn next(c: *@This()) SsePull {
+            if (c.sent) return .done;
+            c.sent = true;
+            return .{ .event = .{ .event = "tick", .data = "hi" } };
+        }
+    };
+    var ctx = Ctx{};
+    const r = Response.ssePull(Ctx, &ctx, Ctx.next);
+    const ps = r.pull_streamer.?;
+
+    var buf: [256]u8 = undefined;
+    const res = ps.next(&buf);
+
+    // Reference: what formatEvent would write for the same event.
+    var rbuf: [256]u8 = undefined;
+    var rw = Writer.fixed(&rbuf);
+    try sse_mod.formatEvent(&rw, .{ .event = "tick", .data = "hi" });
+    const expected = rw.buffered();
+
+    switch (res) {
+        .chunk => |n| try testing.expectEqualStrings(expected, buf[0..n]),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(PullResult.done, ps.next(&buf));
+}
+
+test "ssePull: comment framed; not_ready → chunk 0; done" {
+    const Ctx = struct {
+        step: usize = 0,
+        fn next(c: *@This()) SsePull {
+            defer c.step += 1;
+            return switch (c.step) {
+                0 => .{ .comment = "ping" },
+                1 => .not_ready,
+                else => .done,
+            };
+        }
+    };
+    var ctx = Ctx{};
+    const r = Response.ssePull(Ctx, &ctx, Ctx.next);
+    const ps = r.pull_streamer.?;
+    var buf: [64]u8 = undefined;
+
+    switch (ps.next(&buf)) {
+        .chunk => |n| try testing.expectEqualStrings(": ping\n", buf[0..n]),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(PullResult{ .chunk = 0 }, ps.next(&buf));
+    try testing.expectEqual(PullResult.done, ps.next(&buf));
+}
+
+test "ssePull: event larger than the buffer → err" {
+    const Ctx = struct {
+        fn next(_: *@This()) SsePull {
+            return .{ .event = .{ .data = "x" ** 200 } };
+        }
+    };
+    var ctx = Ctx{};
+    const r = Response.ssePull(Ctx, &ctx, Ctx.next);
+    const ps = r.pull_streamer.?;
+    var buf: [16]u8 = undefined; // far smaller than the 200-byte payload
+    try testing.expectEqual(PullResult.err, ps.next(&buf));
 }
