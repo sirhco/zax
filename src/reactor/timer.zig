@@ -40,6 +40,15 @@ pub const TimerWheel = struct {
     /// Initialised to 0; updated in `advance`.
     last_tick: i96,
 
+    /// Cached minimum deadline across all tracked slots.
+    /// Valid only when `min_dirty == false`.
+    min_deadline_ns: i96,
+
+    /// True when `min_deadline_ns` may be stale (the slot that held the min
+    /// was removed or expired).  A rescan is deferred until the next
+    /// `nextDeadlineMs` call so the common insert-only path stays O(1).
+    min_dirty: bool,
+
     pub fn init(gpa: std.mem.Allocator, tick_ms: u32, wheel_size: usize) !TimerWheel {
         const buckets = try gpa.alloc(std.ArrayListUnmanaged(usize), wheel_size);
         for (buckets) |*b| b.* = .empty;
@@ -50,6 +59,8 @@ pub const TimerWheel = struct {
             .buckets = buckets,
             .map = .{},
             .last_tick = 0,
+            .min_deadline_ns = std.math.maxInt(i96),
+            .min_dirty = false,
         };
     }
 
@@ -68,18 +79,33 @@ pub const TimerWheel = struct {
         // Remove from old bucket if already present.
         if (self.map.get(slot)) |old| {
             removeSingleFromBucket(&self.buckets[old.bucket], slot);
+            // If this slot held the cached min, the cache is now stale.
+            if (old.deadline_ns == self.min_deadline_ns) self.min_dirty = true;
         }
 
         const bucket = self.bucketFor(deadline_ns);
         self.buckets[bucket].append(self.gpa, slot) catch @panic("OOM in TimerWheel.insert");
         self.map.put(self.gpa, slot, .{ .bucket = bucket, .deadline_ns = deadline_ns }) catch
             @panic("OOM in TimerWheel.insert");
+
+        // Update cached min — O(1): no rescan needed when the new deadline is
+        // smaller than the current cached min (or the cache is clean/valid).
+        if (!self.min_dirty and deadline_ns < self.min_deadline_ns) {
+            self.min_deadline_ns = deadline_ns;
+        } else if (self.min_dirty) {
+            // Cache already dirty; a new insert with a smaller value can
+            // eagerly refresh the min without a full rescan.
+            if (deadline_ns < self.min_deadline_ns) self.min_deadline_ns = deadline_ns;
+            // Leave min_dirty = true; rescan deferred to nextDeadlineMs.
+        }
     }
 
     /// Remove `slot` from the wheel. No-op if the slot is not tracked.
     pub fn remove(self: *TimerWheel, slot: usize) void {
         const entry = self.map.fetchRemove(slot) orelse return;
         removeSingleFromBucket(&self.buckets[entry.value.bucket], slot);
+        // If this slot held the cached min, mark dirty — rescan deferred.
+        if (entry.value.deadline_ns == self.min_deadline_ns) self.min_dirty = true;
     }
 
     /// Advance the wheel to `now_ns`, calling `expired(slot)` for every tracked
@@ -113,6 +139,8 @@ pub const TimerWheel = struct {
                 const entry = self.map.get(s) orelse unreachable;
                 if (entry.deadline_ns <= now_ns) {
                     to_expire.append(self.gpa, s) catch @panic("OOM in TimerWheel.advance");
+                    // If this slot held the cached min, mark it dirty.
+                    if (entry.deadline_ns == self.min_deadline_ns) self.min_dirty = true;
                     // Remove from bucket (swap-remove for O(1)).
                     _ = bucket.swapRemove(i);
                     _ = self.map.remove(s);
@@ -131,15 +159,31 @@ pub const TimerWheel = struct {
 
     /// Returns milliseconds until the soonest deadline, or -1 if no timers are
     /// registered. Intended for use as the `epoll_wait` timeout.
+    ///
+    /// O(1) common path: when the cached minimum is clean the map is not
+    /// scanned.  A full rescan (O(n)) only occurs after the previous minimum
+    /// was removed or expired (`min_dirty == true`), amortising the cost.
     pub fn nextDeadlineMs(self: *TimerWheel, now_ns: i96) i32 {
-        var it = self.map.valueIterator();
-        var soonest: ?i96 = null;
-        while (it.next()) |e| {
-            if (soonest == null or e.deadline_ns < soonest.?) {
-                soonest = e.deadline_ns;
-            }
+        if (self.map.count() == 0) {
+            // Reset cache to a clean state for the next insert.
+            self.min_deadline_ns = std.math.maxInt(i96);
+            self.min_dirty = false;
+            return -1;
         }
-        const d = soonest orelse return -1;
+
+        if (self.min_dirty) {
+            // Rescan: O(n), amortised — only happens after a removal/expiry of
+            // the current minimum, not on every call.
+            var it = self.map.valueIterator();
+            var soonest: i96 = std.math.maxInt(i96);
+            while (it.next()) |e| {
+                if (e.deadline_ns < soonest) soonest = e.deadline_ns;
+            }
+            self.min_deadline_ns = soonest;
+            self.min_dirty = false;
+        }
+
+        const d = self.min_deadline_ns;
         const remaining_ns = d - now_ns;
         if (remaining_ns <= 0) return 0;
         // Convert ns → ms, rounding up so we don't return 0 when slightly > 0 ns remain.
@@ -278,4 +322,88 @@ test "re-insert updates deadline (old time not fired, new time fires)" {
     tw.advance(450, captureExpired);
     try testing.expectEqual(@as(usize, 1), g_captured.items.len);
     try testing.expectEqual(@as(usize, 7), g_captured.items[0]);
+}
+
+// =============================================================================
+// Cached-min correctness tests
+// =============================================================================
+
+test "cached min: insert several, nextDeadlineMs returns the minimum" {
+    var tw = try TimerWheel.init(testing.allocator, 10, 64);
+    defer tw.deinit();
+
+    // Insert three slots; soonest is slot 1 at 1_000_000 ns (1 ms).
+    tw.insert(0, 5_000_000);
+    tw.insert(1, 1_000_000);
+    tw.insert(2, 3_000_000);
+
+    try testing.expectEqual(@as(i32, 1), tw.nextDeadlineMs(0));
+}
+
+test "cached min: remove current-min slot forces rescan, returns next soonest" {
+    var tw = try TimerWheel.init(testing.allocator, 10, 64);
+    defer tw.deinit();
+
+    tw.insert(0, 1_000_000); // current min
+    tw.insert(1, 3_000_000);
+    tw.insert(2, 5_000_000);
+
+    // Confirm min is 1 ms.
+    try testing.expectEqual(@as(i32, 1), tw.nextDeadlineMs(0));
+
+    // Remove the min-holder; cache must become dirty and rescan on next call.
+    tw.remove(0);
+    // Next soonest is slot 1 at 3_000_000 ns = 3 ms.
+    try testing.expectEqual(@as(i32, 3), tw.nextDeadlineMs(0));
+}
+
+test "cached min: advance past min, nextDeadlineMs returns next soonest" {
+    var tw = try TimerWheel.init(testing.allocator, 10, 64);
+    defer tw.deinit();
+    g_captured = .empty;
+    defer g_captured.deinit(testing.allocator);
+
+    tw.insert(0, 1_000_000); // expires at 1 ms
+    tw.insert(1, 5_000_000); // expires at 5 ms
+
+    // Advance past slot 0's deadline; it is expired and removed.
+    tw.advance(2_000_000, captureExpired);
+    try testing.expectEqual(@as(usize, 1), g_captured.items.len);
+    try testing.expectEqual(@as(usize, 0), g_captured.items[0]);
+
+    // Cached min was slot 0 (now gone); rescan must find slot 1 at 5 ms.
+    // now = 2_000_000 ns → 3 ms remaining until 5_000_000.
+    try testing.expectEqual(@as(i32, 3), tw.nextDeadlineMs(2_000_000));
+}
+
+test "cached min: re-insert smaller deadline updates min without rescan" {
+    var tw = try TimerWheel.init(testing.allocator, 10, 64);
+    defer tw.deinit();
+
+    tw.insert(0, 5_000_000);
+    tw.insert(1, 3_000_000);
+
+    // Min should be 3 ms.
+    try testing.expectEqual(@as(i32, 3), tw.nextDeadlineMs(0));
+
+    // Re-insert slot 0 with a closer deadline: should become new min.
+    tw.insert(0, 1_000_000);
+    try testing.expectEqual(@as(i32, 1), tw.nextDeadlineMs(0));
+}
+
+test "cached min: empty wheel returns -1 and cache resets" {
+    var tw = try TimerWheel.init(testing.allocator, 10, 64);
+    defer tw.deinit();
+
+    try testing.expectEqual(@as(i32, -1), tw.nextDeadlineMs(0));
+
+    tw.insert(0, 2_000_000);
+    tw.remove(0);
+
+    // After removing the only slot the wheel is empty → -1.
+    try testing.expectEqual(@as(i32, -1), tw.nextDeadlineMs(0));
+
+    // A fresh insert after empty must work correctly.
+    tw.insert(1, 4_000_000);
+    try testing.expectEqual(@as(i32, 4), tw.nextDeadlineMs(0));
 }
