@@ -78,6 +78,29 @@ pub const Streamer = struct {
     func: *const fn (context: *const anyopaque, w: *Writer) anyerror!void,
 };
 
+/// Result of a single `PullStreamer.next` call.
+pub const PullResult = union(enum) {
+    /// `n` bytes were written into the caller-supplied buffer; `n` may be 0
+    /// (the caller should call `next` again immediately).
+    chunk: usize,
+    /// The stream is finished; no more bytes will be produced.
+    done,
+    /// An unrecoverable error occurred; the connection should be closed.
+    err,
+};
+
+/// A type-erased PULL streamer: the caller supplies a buffer; `nextFn` fills it
+/// and returns how many bytes were written, or signals done/error.
+/// `context` must outlive the request (allocate in the request arena).
+pub const PullStreamer = struct {
+    context: *anyopaque,
+    nextFn: *const fn (context: *anyopaque, buf: []u8) PullResult,
+
+    pub fn next(self: PullStreamer, buf: []u8) PullResult {
+        return self.nextFn(self.context, buf);
+    }
+};
+
 pub const Response = struct {
     status: Status = .ok,
     content_type: []const u8 = "text/plain; charset=utf-8",
@@ -94,6 +117,11 @@ pub const Response = struct {
     /// When set, the body is produced by `streamer.func` (connection-close
     /// framing); `body`/`content-length` are not used.
     streamer: ?Streamer = null,
+    /// When set, the body is produced by calling `pull_streamer.next(buf)` repeatedly
+    /// (connection-close framing). The evented reactor uses this for true non-blocking
+    /// streaming; the threaded backend loops next()+write(). `body`/`content-length`
+    /// are not used. Mutually exclusive with `streamer` (set one or the other).
+    pull_streamer: ?PullStreamer = null,
 
     pub fn text(body: []const u8) Response {
         return .{ .body = body };
@@ -149,6 +177,30 @@ pub const Response = struct {
         return .{
             .content_type = content_type,
             .streamer = .{ .context = context, .func = &Erased.call },
+            .keep_alive = false,
+        };
+    }
+
+    /// Build a pull-streamed (connection-close) response. `nextFn` is called
+    /// repeatedly with a caller-owned buffer; it fills the buffer and returns
+    /// `.chunk(n)` (n bytes written), `.done` when finished, or `.err` on failure.
+    /// `context` must outlive the request (use the request arena).
+    ///
+    /// True non-blocking streaming on the evented backend; blocking loop on threaded.
+    pub fn streamPull(
+        comptime Ctx: type,
+        context: *Ctx,
+        comptime nextFn: fn (*Ctx, []u8) PullResult,
+        content_type: []const u8,
+    ) Response {
+        const Erased = struct {
+            fn call(c: *anyopaque, buf: []u8) PullResult {
+                return nextFn(@ptrCast(@alignCast(c)), buf);
+            }
+        };
+        return .{
+            .content_type = content_type,
+            .pull_streamer = .{ .context = context, .nextFn = &Erased.call },
             .keep_alive = false,
         };
     }
@@ -414,4 +466,47 @@ test "stream builder round-trips the typed context" {
     var w = Writer.fixed(&buf);
     try r.streamer.?.func(r.streamer.?.context, &w);
     try testing.expectEqualStrings("hello", w.buffered());
+}
+
+test "PullStreamer: next() calls nextFn with the buffer" {
+    const Ctx = struct { calls: usize = 0 };
+    const Impl = struct {
+        fn next(c: *Ctx, buf: []u8) PullResult {
+            if (c.calls == 0) {
+                c.calls += 1;
+                buf[0] = 'h';
+                buf[1] = 'i';
+                return .{ .chunk = 2 };
+            }
+            return .done;
+        }
+    };
+    var ctx = Ctx{};
+    const ps = PullStreamer{
+        .context = &ctx,
+        .nextFn = @ptrCast(&Impl.next),
+    };
+    var buf: [8]u8 = undefined;
+    const r1 = ps.next(&buf);
+    try testing.expectEqual(PullResult{ .chunk = 2 }, r1);
+    try testing.expectEqualStrings("hi", buf[0..2]);
+    try testing.expectEqual(PullResult.done, ps.next(&buf));
+}
+
+test "streamPull: builds a Response with pull_streamer set, keep_alive false, no body" {
+    const Ctx = struct { done: bool = false };
+    const Impl = struct {
+        fn next(c: *Ctx, buf: []u8) PullResult {
+            _ = buf;
+            if (!c.done) { c.done = true; return .{ .chunk = 0 }; }
+            return .done;
+        }
+    };
+    var ctx = Ctx{};
+    const r = Response.streamPull(Ctx, &ctx, Impl.next, "text/plain");
+    try testing.expect(r.pull_streamer != null);
+    try testing.expectEqualStrings("text/plain", r.content_type);
+    try testing.expect(r.keep_alive == false);
+    try testing.expectEqualStrings("", r.body);
+    try testing.expect(r.streamer == null); // does NOT set push streamer
 }

@@ -47,6 +47,7 @@ pub const State = enum {
     reading_body,
     dispatching,
     writing,
+    streaming,         // mid-stream: head pumped, iterating pull_streamer.next()
     keep_alive_idle,
     closing,
 };
@@ -162,6 +163,17 @@ pub const Conn = struct {
     /// When true, `step` must close after the current write completes
     /// (used when a response overflowed the write buffer or was a stream).
     close_after_write: bool = false,
+
+    /// When non-null, the conn is serving a pull-streamed response.
+    /// Set by step() when dispatch returns a pull_streamer response; cleared on done/err.
+    /// NOTE: the legacy push `streamer` on the evented path keeps the buffer-or-500
+    /// behavior; only `pull_streamer` gets true non-blocking streaming.
+    pull_streamer: ?response_mod.PullStreamer = null,
+
+    /// Byte count of the current pull-stream chunk loaded into write_buf.
+    /// Together with w_off (offset within the chunk), tracks partial writes mid-chunk.
+    /// reserved — not yet wired to any read site; w_off/w_len serve this role currently.
+    stream_chunk_len: usize = 0,
 
     /// Observer hook: called after each response is serialized, before writing.
     /// Null = zero-cost no-op. Task 8 will wire this up; the seam is here.
@@ -323,6 +335,21 @@ pub const Conn = struct {
         return self.w_len;
     }
 
+    /// Serialize only the response HEAD (no body, no content-length) into `write_buf`.
+    /// Used for pull-streamed responses. Returns `error.ResponseTooLarge` if the
+    /// head does not fit in `write_buf`.
+    pub fn serializeHead(self: *Conn, resp: Response) error{ResponseTooLarge}!usize {
+        var w = std.Io.Writer.fixed(self.write_buf);
+        resp.writeHead(&w) catch {
+            self.w_len = w.end;
+            self.w_off = 0;
+            return error.ResponseTooLarge;
+        };
+        self.w_len = w.end;
+        self.w_off = 0;
+        return self.w_len;
+    }
+
     /// Drive a non-blocking write of `write_buf[w_off..w_len]` through `t`.
     ///
     /// - `.ok n` → advance `w_off` by `n`; if `w_off == w_len` → `.wrote_all`.
@@ -419,8 +446,30 @@ pub const Conn = struct {
                             // Dispatch → Response.
                             var resp = d.dispatch(&p.request, self.arena);
 
-                            // Handle streamed responses: no true streaming in v1,
-                            // render into write_buf up to capacity.
+                            // Handle pull-streamed responses: true non-blocking streaming.
+                            // The legacy push `streamer` keeps buffer-or-500 behavior on
+                            // the evented path (see comment below).
+                            if (resp.pull_streamer) |ps| {
+                                // Serialize HEAD only (no content-length); connection-close.
+                                resp.keep_alive = false;
+                                if (self.on_response) |hook| hook(&p.request, &resp);
+                                if (self.serializeHead(resp)) |_| {} else |_| {
+                                    // Head won't fit (extremely small write_buf) — 500 + close.
+                                    var e500 = Response.fromStatus(.internal_server_error);
+                                    e500.keep_alive = false;
+                                    _ = self.serializeResponse(e500) catch {};
+                                    self.close_after_write = true;
+                                    self.state = .writing;
+                                    continue;
+                                }
+                                self.pull_streamer = ps;
+                                self.close_after_write = true; // always close after stream
+                                self.state = .writing; // pump the head first
+                                continue;
+                            }
+
+                            // Handle push-streamed responses: no true streaming on the
+                            // evented path (v1 rule) — render into write_buf up to capacity.
                             const is_streamed = resp.streamer != null;
 
                             // Set keep_alive on the response header.
@@ -461,6 +510,37 @@ pub const Conn = struct {
                         self.deadline_ns = monotonicNow() +
                             @as(i96, self.read_timeout_ms) * 1_000_000;
                     }
+                    // Guard: if w_len == 0 and we have a pull streamer, call next()
+                    // immediately (empty chunk — producer signalled 0 bytes this call).
+                    if (self.w_len == 0) {
+                        if (self.pull_streamer) |ps| {
+                            switch (ps.next(self.write_buf)) {
+                                .chunk => |n| {
+                                    self.w_off = 0;
+                                    self.w_len = n;
+                                    self.deadline_ns = no_deadline; // re-arm per-chunk stall deadline
+                                    if (n == 0) return .want_write; // empty chunk — yield to event loop
+                                },
+                                .done => {
+                                    self.pull_streamer = null;
+                                    self.served += 1;
+                                    self.state = .closing;
+                                    return .done_close;
+                                },
+                                .err => {
+                                    self.pull_streamer = null;
+                                    self.state = .closing;
+                                    return .done_close;
+                                },
+                            }
+                        } else {
+                            // No pull streamer and w_len == 0: nothing to write.
+                            // This shouldn't happen in normal flow; treat as done.
+                            self.served += 1;
+                            self.state = .closing;
+                            return .done_close;
+                        }
+                    }
                     switch (self.pumpWrite(t)) {
                         .want_write => return .want_write,
                         .closed => {
@@ -468,6 +548,40 @@ pub const Conn = struct {
                             return .done_close;
                         },
                         .wrote_all => {
+                            // Pull-streaming: head (or last chunk) fully written.
+                            // Load the next chunk into write_buf and keep pumping.
+                            if (self.pull_streamer) |ps| {
+                                switch (ps.next(self.write_buf)) {
+                                    .chunk => |n| {
+                                        if (n == 0) {
+                                            // Empty chunk — yield to event loop; producer not ready yet.
+                                            self.w_off = 0;
+                                            self.w_len = 0;
+                                            return .want_write;
+                                        }
+                                        self.w_off = 0;
+                                        self.w_len = n;
+                                        self.deadline_ns = no_deadline; // re-arm per-chunk stall deadline
+                                        // Stay in .writing; loop calls pumpWrite for this chunk.
+                                        continue;
+                                    },
+                                    .done => {
+                                        // Stream finished — close.
+                                        self.pull_streamer = null;
+                                        self.served += 1;
+                                        self.state = .closing;
+                                        return .done_close;
+                                    },
+                                    .err => {
+                                        // Stream error — close without incrementing served.
+                                        self.pull_streamer = null;
+                                        self.state = .closing;
+                                        return .done_close;
+                                    },
+                                }
+                            }
+
+                            // Normal (non-streaming) path.
                             // Count this request regardless of keep-alive disposition.
                             self.served += 1;
                             if (self.close_after_write) {
@@ -503,6 +617,14 @@ pub const Conn = struct {
                     self.state = .reading_head;
                     // Loop: fillAndParse will call t.read; on would_block it
                     // returns .need_more → want_read. On data it proceeds.
+                },
+
+                .streaming => {
+                    // Streaming is driven via .writing; this arm is unreachable in normal operation.
+                    // If somehow entered, treat as close.
+                    self.pull_streamer = null;
+                    self.state = .closing;
+                    return .done_close;
                 },
 
                 .dispatching => {
@@ -541,6 +663,12 @@ pub const Conn = struct {
             .writing => {
                 // Peer stalled mid-write: can't send 408 (they aren't reading).
                 // Silently close the connection to free the fd+slot.
+                self.state = .closing;
+                return .done_close;
+            },
+            .streaming => {
+                // Peer stalled mid-stream: silently close.
+                self.pull_streamer = null;
                 self.state = .closing;
                 return .done_close;
             },
@@ -1095,4 +1223,267 @@ test "conn: step — truncated response → 500 via real overflow signal" {
     const written = ft.written.items;
     try testing.expect(written.len > 0);
     try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 5"));
+}
+
+// ---------------------------------------------------------------------------
+// Task 6 (reactor-v2) tests — pull-streamer true streaming
+// ---------------------------------------------------------------------------
+
+/// A pull streamer context that yields fixed chunks then done.
+const ThreeChunkCtx = struct {
+    chunks: [3][]const u8,
+    idx: usize = 0,
+
+    fn next(c: *ThreeChunkCtx, buf: []u8) response_mod.PullResult {
+        if (c.idx >= c.chunks.len) return .done;
+        const chunk = c.chunks[c.idx];
+        c.idx += 1;
+        const n = @min(chunk.len, buf.len);
+        @memcpy(buf[0..n], chunk[0..n]);
+        return .{ .chunk = n };
+    }
+};
+
+test "conn: pull streamer — 3 chunks then done → head + chunks written, done_close" {
+    const raw = "GET /stream HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = ThreeChunkCtx{ .chunks = .{ "aaa", "bbb", "ccc" } };
+
+    const StreamDispatch = struct {
+        pull_ctx: *ThreeChunkCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(ThreeChunkCtx, s.pull_ctx, ThreeChunkCtx.next, "text/plain");
+        }
+    };
+    var sd = StreamDispatch{ .pull_ctx = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = StreamDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    const t = ft.transport();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    // Head must be present (no content-length, connection: close).
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, written, "connection: close") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "content-length:") == null);
+    // All three chunk payloads appear in order.
+    const pos_a = std.mem.indexOf(u8, written, "aaa") orelse return error.TestUnexpectedResult;
+    const pos_b = std.mem.indexOf(u8, written, "bbb") orelse return error.TestUnexpectedResult;
+    const pos_c = std.mem.indexOf(u8, written, "ccc") orelse return error.TestUnexpectedResult;
+    try testing.expect(pos_a < pos_b);
+    try testing.expect(pos_b < pos_c);
+}
+
+test "conn: pull streamer — mid-chunk backpressure resume, no bytes lost or duplicated" {
+    // A streamer that produces one chunk: "hello world" (11 bytes).
+    const SingleChunkCtx = struct {
+        done: bool = false,
+        fn next(c: *@This(), buf: []u8) response_mod.PullResult {
+            if (c.done) return .done;
+            c.done = true;
+            const payload = "hello world";
+            @memcpy(buf[0..payload.len], payload);
+            return .{ .chunk = payload.len };
+        }
+    };
+
+    const raw = "GET /s HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+    // Block the very first write call (threshold 0 = block immediately, one-shot).
+    // After the block fires, step 2 resumes and writes everything to completion.
+    ft.write_block_after_bytes = 0;
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var pull_ctx = SingleChunkCtx{};
+    const SingleDispatch = struct {
+        p: *SingleChunkCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(SingleChunkCtx, s.p, SingleChunkCtx.next, "text/plain");
+        }
+    };
+    var sd = SingleDispatch{ .p = &pull_ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = SingleDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    const t = ft.transport();
+
+    // First step: write will block mid-stream → want_write.
+    const r1 = c.step(t, d);
+    try testing.expectEqual(StepResult.want_write, r1);
+
+    // Second step: block lifted, stream completes.
+    const r2 = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, r2);
+
+    // "hello world" must appear exactly once in the written bytes.
+    const written = ft.written.items;
+    try testing.expect(std.mem.indexOf(u8, written, "hello world") != null);
+    // Count occurrences to catch duplication.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "hello world"));
+}
+
+test "conn: pull streamer — stream larger than write_buf proves true streaming (not buffering)" {
+    // write_buf is 64 bytes; the stream produces 4 × 32-byte chunks = 128 bytes total.
+    // If the reactor were buffering, it would overflow write_buf and send a 500.
+    // True streaming calls next() multiple times, filling write_buf each time.
+    const BigStreamCtx = struct {
+        remaining: usize = 4,
+        fn next(c: *@This(), buf: []u8) response_mod.PullResult {
+            if (c.remaining == 0) return .done;
+            c.remaining -= 1;
+            // Fill 32 bytes with 'X'.
+            const n = @min(32, buf.len);
+            @memset(buf[0..n], 'X');
+            return .{ .chunk = n };
+        }
+    };
+
+    const raw = "GET /big HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [64]u8 = undefined; // smaller than the total stream (128 bytes)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var pull_ctx = BigStreamCtx{};
+    const BigDispatch = struct {
+        p: *BigStreamCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(BigStreamCtx, s.p, BigStreamCtx.next, "text/plain");
+        }
+    };
+    var bd = BigDispatch{ .p = &pull_ctx };
+    const d = Dispatcher{ .ctx = &bd, .dispatchFn = BigDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    const t = ft.transport();
+
+    // Drive until done (no write backpressure here — FakeTransport always accepts).
+    var result: StepResult = undefined;
+    for (0..20) |_| {
+        result = c.step(t, d);
+        if (result == .done_close) break;
+    }
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    // Must have a 200, not a 500.
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200"));
+    // Must contain 128 bytes of 'X' (4 × 32).
+    var x_count: usize = 0;
+    for (written) |b| if (b == 'X') { x_count += 1; };
+    try testing.expectEqual(@as(usize, 128), x_count);
+}
+
+test "conn: pull streamer — partial write mid-chunk advances w_off, no bytes lost" {
+    // This test proves the partial-write path: w_off is advanced correctly after a
+    // partial write so bytes are not lost or duplicated when the event loop resumes.
+    //
+    // Strategy: serialize the head into a scratch conn to learn its exact size, then
+    // set write_block_after_bytes = head_size + 4, which lands 4 bytes into the
+    // "hello world" (11-byte) chunk.  The sequence is:
+    //   step 1: head written fully, 4 bytes of chunk written (partial), w_off = 4 → want_write
+    //   step 2: would_block fires (one-shot), nothing written → want_write
+    //   step 3: remaining 7 bytes of chunk written, next() → done → done_close
+    // Assert "hello world" appears exactly once.
+
+    const MidChunkCtx = struct {
+        done: bool = false,
+        fn next(c: *@This(), buf: []u8) response_mod.PullResult {
+            if (c.done) return .done;
+            c.done = true;
+            const payload = "hello world";
+            @memcpy(buf[0..payload.len], payload);
+            return .{ .chunk = payload.len };
+        }
+    };
+
+    // Determine head size for a text/plain streaming response (no content-length).
+    // Must use the same content-type as the dispatcher below ("text/plain") so
+    // the computed head_size matches the actual bytes written during the test.
+    const head_size: usize = blk: {
+        var sz_rbuf: [4096]u8 = undefined;
+        var sz_wbuf: [256]u8 = undefined;
+        var sz_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer sz_arena.deinit();
+        var sz_c = Conn.init(&sz_rbuf, &sz_wbuf, &sz_arena);
+        const head_resp = Response{ .content_type = "text/plain", .keep_alive = false };
+        break :blk try sz_c.serializeHead(head_resp);
+    };
+    // Threshold: write head fully, then 4 bytes into the 11-byte chunk.
+    // Requires: head_size + 4 < head_size + 11.  Always true since 4 < 11.
+    const threshold = head_size + 4;
+
+    const raw = "GET /midchunk HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+    ft.write_block_after_bytes = threshold;
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var pull_ctx = MidChunkCtx{};
+    const MidDispatch = struct {
+        p: *MidChunkCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(MidChunkCtx, s.p, MidChunkCtx.next, "text/plain");
+        }
+    };
+    var md = MidDispatch{ .p = &pull_ctx };
+    const d = Dispatcher{ .ctx = &md, .dispatchFn = MidDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    const t = ft.transport();
+
+    // Step 1: head written fully + 4 bytes of chunk (partial) → want_write.
+    const r1 = c.step(t, d);
+    try testing.expectEqual(StepResult.want_write, r1);
+    // We wrote head_size + 4 bytes so far.
+    try testing.expectEqual(threshold, ft.written.items.len);
+
+    // Step 2: one-shot would_block fires immediately → want_write, nothing more written.
+    const r2 = c.step(t, d);
+    try testing.expectEqual(StepResult.want_write, r2);
+
+    // Step 3: remaining 7 bytes of chunk written, next() → done → done_close.
+    const r3 = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, r3);
+
+    // "hello world" must appear exactly once — no bytes lost or duplicated.
+    const written = ft.written.items;
+    try testing.expect(std.mem.indexOf(u8, written, "hello world") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "hello world"));
+    // Total written = head + full 11-byte chunk.
+    try testing.expectEqual(head_size + 11, written.len);
 }

@@ -673,7 +673,7 @@ pub fn App(comptime AppState: type) type {
                 if (self.opts.request_id) {
                     resp = resp.withHeader(arena.allocator(), "x-request-id", rid) catch resp;
                 }
-                const streamed = resp.streamer != null;
+                const streamed = resp.streamer != null or resp.pull_streamer != null;
                 resp.keep_alive = persistent and !streamed;
                 if (!writeResponse(w, resp)) break;
 
@@ -769,6 +769,24 @@ pub fn App(comptime AppState: type) type {
 
 /// Write and flush a response; returns false on a write error (caller closes).
 fn writeResponse(w: *Io.Writer, resp: Response) bool {
+    // Pull-streamed response: loop next(buf) writing chunks to the blocking writer.
+    if (resp.pull_streamer) |ps| {
+        resp.writeHead(w) catch return false;
+        var chunk_buf: [4096]u8 = undefined;
+        while (true) {
+            switch (ps.next(&chunk_buf)) {
+                .chunk => |n| {
+                    if (n == 0) continue; // empty chunk: call next again
+                    w.writeAll(chunk_buf[0..n]) catch return false;
+                },
+                .done => break,
+                .err => return false,
+            }
+        }
+        w.flush() catch return false;
+        return true;
+    }
+    // Push-streamed response: func writes directly to the connection writer.
     if (resp.streamer) |s| {
         resp.writeHead(w) catch return false;
         s.func(s.context, w) catch return false;
