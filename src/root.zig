@@ -18,6 +18,8 @@ pub const Sse = sse.Sse;
 pub const SseEvent = sse.Event;
 pub const Writer = std.Io.Writer;
 pub const Streamer = response.Streamer;
+pub const SsePull = response.SsePull;
+pub const PullResult = response.PullResult;
 pub const Status = response.Status;
 pub const intoResponse = response.intoResponse;
 
@@ -79,6 +81,11 @@ pub const reactor_worker = @import("reactor/worker.zig");
 // Expose the build-time trace flag so downstream binaries (e.g. the cross-bench
 // server) can print it in their boot line without importing build_options directly.
 pub const trace_latency: bool = @import("build_options").trace_latency;
+
+test "root re-exports streaming types" {
+    _ = SsePull;
+    _ = PullResult;
+}
 
 test {
     // Pull every module into analysis so their `test` blocks run under
