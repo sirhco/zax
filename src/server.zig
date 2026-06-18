@@ -165,7 +165,9 @@ pub const Options = struct {
 /// Options for the epoll-based evented backend (`serveEvented`).
 /// Linux only; on other platforms `serveEvented` returns `error.EventedUnsupported`.
 pub const EventedOptions = struct {
-    /// Number of worker threads. 0 → auto-detect (`std.Thread.getCpuCount()`).
+    /// Number of worker threads. 0 → auto-detect via `std.Thread.getCpuCount()`.
+    /// On Linux, `getCpuCount` calls `sched_getaffinity(0)` and counts set bits,
+    /// so it already respects `taskset`/cgroup CPU masks (no oversubscription).
     workers: usize = 0,
     /// Per-worker connection pool size.
     max_connections: usize = 1024,
@@ -408,7 +410,7 @@ pub fn App(comptime AppState: type) type {
 
         /// Start the epoll-based evented backend. Linux only.
         ///
-        /// Spawns `opts.workers` (0 → ncpu) worker threads each owning a
+        /// Spawns `opts.workers` (0 → affinity-mask CPU count) worker threads each owning a
         /// `SO_REUSEPORT` listen socket on `addr`. Blocks until all workers
         /// exit (triggered by `requestShutdown`).
         ///
@@ -424,6 +426,8 @@ pub fn App(comptime AppState: type) type {
         }!void {
             if (comptime builtin.os.tag != .linux) return error.EventedUnsupported;
 
+            // getCpuCount() on Linux calls sched_getaffinity(0) — already respects
+            // taskset / cgroup cpuset masks, so this is never oversubscribed.
             const n_workers = if (opts.workers != 0) opts.workers else std.Thread.getCpuCount() catch 1;
 
             const WorkerOpts = worker_mod.WorkerOpts;
