@@ -172,6 +172,9 @@ pub const EventedOptions = struct {
     workers: usize = 0,
     /// Per-worker connection pool size.
     max_connections: usize = 1024,
+    /// Backoff (ms) before re-polling a not-ready streaming producer;
+    /// 0 disables (legacy want_write busy behavior).
+    stream_repoll_ms: u32 = 5,
 };
 
 /// `App(AppState)` — a server bound to one concrete, read-only app-state type.
@@ -511,6 +514,7 @@ pub fn App(comptime AppState: type) type {
                 .read_timeout_ms = self.opts.read_timeout_ms,
                 .idle_timeout_ms = self.opts.idle_timeout_ms,
                 .tcp_nodelay = self.opts.tcp_nodelay,
+                .stream_repoll_ms = opts.stream_repoll_ms,
             };
 
             // Init workers.  Track counts separately so the single cleanup path

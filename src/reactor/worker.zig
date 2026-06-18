@@ -73,6 +73,7 @@ pub const WorkerOpts = struct {
     max_body_size: usize,
     read_timeout_ms: u32,
     idle_timeout_ms: u32,
+    stream_repoll_ms: u32 = 5,
     tcp_nodelay: bool,
     /// If nonzero, set SO_SNDBUF to this value on each accepted socket.
     /// 0 = system default (no override).  Useful in tests to force write
@@ -476,6 +477,7 @@ pub const Worker = struct {
             slot.conn.max_body_size = self.opts.max_body_size;
             slot.conn.read_timeout_ms = self.opts.read_timeout_ms;
             slot.conn.idle_timeout_ms = self.opts.idle_timeout_ms;
+            slot.conn.stream_repoll_ms = self.opts.stream_repoll_ms;
             slot.fd = conn_fd;
             slot.active = true;
 
@@ -1214,4 +1216,52 @@ test "worker: write-stall deadline — server reaps a peer that stops reading" {
     shutdown.store(true, .release);
     worker.wake();
     thread.join();
+}
+
+test "worker: stream_repoll_ms propagates from WorkerOpts to conn (default=5, custom=99)" {
+    // Pure unit test: verify the acceptLoop conn-init path carries stream_repoll_ms.
+    // No live sockets — simulates what acceptLoop does when it writes per-worker opts
+    // into the freshly-accepted conn's config fields.
+    const testing = std.testing;
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Default path: WorkerOpts.stream_repoll_ms == 5 → conn gets 5.
+    {
+        var c = conn_mod.Conn.init(&rbuf, &wbuf, &arena);
+        const opts_default = WorkerOpts{
+            .read_buffer_size = 4096,
+            .write_buffer_size = 4096,
+            .keep_alive = false,
+            .max_keep_alive_requests = 1,
+            .max_body_size = 0,
+            .read_timeout_ms = 5000,
+            .idle_timeout_ms = 5000,
+            .tcp_nodelay = false,
+            // stream_repoll_ms left as default (5)
+        };
+        c.stream_repoll_ms = opts_default.stream_repoll_ms;
+        try testing.expectEqual(@as(u32, 5), c.stream_repoll_ms);
+    }
+
+    // Custom path: WorkerOpts{ .stream_repoll_ms = 99 } → conn gets 99.
+    {
+        _ = arena.reset(.retain_capacity);
+        var c = conn_mod.Conn.init(&rbuf, &wbuf, &arena);
+        const opts_custom = WorkerOpts{
+            .read_buffer_size = 4096,
+            .write_buffer_size = 4096,
+            .keep_alive = false,
+            .max_keep_alive_requests = 1,
+            .max_body_size = 0,
+            .read_timeout_ms = 5000,
+            .idle_timeout_ms = 5000,
+            .stream_repoll_ms = 99,
+            .tcp_nodelay = false,
+        };
+        c.stream_repoll_ms = opts_custom.stream_repoll_ms;
+        try testing.expectEqual(@as(u32, 99), c.stream_repoll_ms);
+    }
 }

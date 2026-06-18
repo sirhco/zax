@@ -1868,3 +1868,75 @@ test "conn: sparse stream — both park sites fire want_stream_repoll" {
         try testing.expectEqual(State.streaming, c.state);
     }
 }
+
+test "conn: sparse stream — peer close while parked → done_close on re-drive" {
+    // Scenario: a sparse stream parks the conn (.want_stream_repoll).  While
+    // parked, the client disconnects.  On re-drive (timer fires → onDeadline +
+    // step), the conn ends in .done_close rather than hanging.
+    //
+    // We simulate peer-close via a custom transport whose write() always returns
+    // .closed (broken pipe after the head has already been sent in a prior step).
+
+    // A transport whose write() always returns .closed — representing a peer
+    // that disconnected (broken pipe) after the head was already sent.
+    const ClosedWriteTransport = struct {
+        fn write(_: *anyopaque, _: []const u8) transport_mod.IoResult {
+            return .closed;
+        }
+        // read is never called while in .writing state.
+        fn read(_: *anyopaque, _: []u8) transport_mod.IoResult {
+            return .closed;
+        }
+    };
+
+    const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Sparse streamer: chunk(0) first (parks), then "payload" + done.
+    var ctx = SparseCtx{ .zeros_before = 1, .payload = "payload" };
+
+    const D = struct {
+        p: *SparseCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(SparseCtx, s.p, SparseCtx.next, "text/event-stream");
+        }
+    };
+    var sd = D{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = D.dispatch };
+
+    // Step 1 uses the normal FakeTransport (reads the request, writes head).
+    // We need write to succeed for the head, so first step uses ft directly.
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    c.stream_repoll_ms = 5;
+    const t_normal = ft.transport();
+
+    // Drive: reads request, dispatches, writes head, calls next() → chunk(0) → park.
+    const r1 = c.step(t_normal, d);
+    try testing.expectEqual(StepResult.want_stream_repoll, r1);
+    try testing.expectEqual(State.streaming, c.state);
+
+    // Simulate timer fire: onDeadline() re-arms the conn for writing.
+    const r2 = c.onDeadline();
+    try testing.expectEqual(StepResult.want_write, r2);
+    try testing.expectEqual(State.writing, c.state);
+
+    // Now re-drive with a closed-write transport — represents peer disconnect.
+    // The conn tries to write the next chunk and gets .closed → .done_close.
+    var dummy: u8 = 0;
+    const t_closed = transport_mod.Transport{
+        .context = &dummy,
+        .readFn = ClosedWriteTransport.read,
+        .writeFn = ClosedWriteTransport.write,
+    };
+    const r3 = c.step(t_closed, d);
+    try testing.expectEqual(StepResult.done_close, r3);
+}
