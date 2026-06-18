@@ -442,13 +442,22 @@ pub fn App(comptime AppState: type) type {
             const DispatchFn = struct {
                 fn dispatch(ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
                     const b: *AppIoBundle = @ptrCast(@alignCast(ctx));
+                    // Compute request-id (zero overhead when disabled).
+                    const rid: []const u8 = if (b.app.opts.request_id)
+                        b.app.computeRid(req, arena.allocator())
+                    else
+                        "";
                     // Time the dispatch for observers; skip the clock read when no
                     // observers are registered (zero-overhead-when-none guard).
                     const t0: i96 = if (b.app.observers.items.len > 0)
                         conn_mod.monotonicNow()
                     else
                         0;
-                    const resp = b.app.dispatch(b.io, req, arena, "");
+                    var resp = b.app.dispatch(b.io, req, arena, rid);
+                    // Echo request-id on the response header (mirrors threaded backend).
+                    if (b.app.opts.request_id) {
+                        resp = resp.withHeader(arena.allocator(), "x-request-id", rid) catch resp;
+                    }
                     if (b.app.observers.items.len > 0) {
                         const dur: u64 = @intCast(@max(@as(i96, 0), conn_mod.monotonicNow() - t0));
                         const rec = observe_mod.AccessRecord{
@@ -457,8 +466,7 @@ pub fn App(comptime AppState: type) type {
                             .status = resp.status.code(),
                             .duration_ns = dur,
                             .bytes = resp.body.len,
-                            // request_id is not generated on the evented path (v1 limitation).
-                            .request_id = "",
+                            .request_id = rid,
                         };
                         for (b.app.observers.items) |obs| obs.func(obs.context, rec);
                     }
@@ -703,7 +711,7 @@ pub fn App(comptime AppState: type) type {
         /// Resolve the request id: reuse a valid incoming `X-Request-Id`, else
         /// generate a monotonic 16-hex-digit id into `arena`. Falls back to "" if
         /// allocation fails (the header echo simply omits a value).
-        fn computeRid(self: *Self, req: *const request.Request, arena: std.mem.Allocator) []const u8 {
+        pub fn computeRid(self: *Self, req: *const request.Request, arena: std.mem.Allocator) []const u8 {
             if (req.header("x-request-id")) |h| {
                 if (validRid(h)) return h;
             }
@@ -2651,6 +2659,133 @@ test "serveEvented: observer fires for each request" {
     try testing.expect(cap.count >= 2);
     // Last request was a 404 for /nope.
     try testing.expectEqual(@as(u16, 404), cap.status);
+
+    var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer shutdown_threaded.deinit();
+    app.requestShutdown(shutdown_threaded.io());
+    srv_thread.join();
+    try testing.expect(serve_ctx.err == null);
+}
+
+test "serveEvented: request_id generated and echoed" {
+    // Linux-only: mirrors the threaded "request id: generated, echoed, and exposed to handler" test.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const linux = std.os.linux;
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{ .request_id = true });
+    defer app.deinit();
+    try app.get("/rid", ridHandler);
+
+    const port: u16 = 18202;
+    const addr = net.IpAddress{ .ip4 = .loopback(port) };
+
+    const ServeCtx = struct {
+        app: *TestApp,
+        io: Io,
+        addr: net.IpAddress,
+        err: ?anyerror = null,
+    };
+    var serve_ctx = ServeCtx{ .app = &app, .io = undefined, .addr = addr };
+    var srv_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer srv_threaded.deinit();
+    serve_ctx.io = srv_threaded.io();
+
+    const ServeThread = struct {
+        fn run(ctx: *ServeCtx) void {
+            ctx.app.serveEvented(ctx.io, ctx.addr, .{ .workers = 1 }) catch |e| {
+                ctx.err = e;
+            };
+        }
+    };
+    const srv_thread = try std.Thread.spawn(.{}, ServeThread.run, .{&serve_ctx});
+
+    // Wait for the worker to start listening.
+    {
+        var attempts: usize = 0;
+        while (attempts < 50) : (attempts += 1) {
+            const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&ts, null);
+            const tfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+            if (linux.errno(tfd_rc) != .SUCCESS) continue;
+            const tfd: i32 = @intCast(tfd_rc);
+            var sa_in = std.posix.sockaddr.in{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, port),
+                .addr = std.mem.nativeToBig(u32, 0x7F000001),
+                .zero = [_]u8{0} ** 8,
+            };
+            const rc = linux.connect(@intCast(tfd), @ptrCast(&sa_in), @sizeOf(std.posix.sockaddr.in));
+            _ = linux.close(@intCast(tfd));
+            if (linux.errno(rc) == .SUCCESS) break;
+        }
+    }
+
+    const sendAll = struct {
+        fn f(fd: i32, data: []const u8) !void {
+            var sent: usize = 0;
+            while (sent < data.len) {
+                const n = linux.write(@intCast(fd), data[sent..].ptr, data.len - sent);
+                if (linux.errno(n) != .SUCCESS) return error.SendFailed;
+                sent += @intCast(n);
+            }
+        }
+    }.f;
+
+    const recvFull = struct {
+        fn f(fd: i32, buf: []u8) []u8 {
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = linux.read(@intCast(fd), buf[total..].ptr, buf.len - total);
+                if (linux.errno(n) != .SUCCESS or n == 0) break;
+                total += @intCast(n);
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |sep| {
+                    if (std.mem.indexOf(u8, buf[0 .. sep + 4], "content-length: ")) |cl_start| {
+                        const after = buf[cl_start + "content-length: ".len .. sep + 4];
+                        const end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
+                        const clen = std.fmt.parseInt(usize, after[0..end], 10) catch 0;
+                        if (total - (sep + 4) >= clen) break;
+                    } else break;
+                }
+            }
+            return buf[0..total];
+        }
+    }.f;
+
+    // Connect once (keep-alive).
+    const cfd_rc = linux.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(cfd_rc));
+    const cfd: i32 = @intCast(cfd_rc);
+    defer _ = linux.close(@intCast(cfd));
+    var sa_connect = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+        .zero = [_]u8{0} ** 8,
+    };
+    const con_rc = linux.connect(@intCast(cfd), @ptrCast(&sa_connect), @sizeOf(std.posix.sockaddr.in));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(con_rc));
+
+    // 1. No incoming x-request-id → server generates one and echoes it.
+    var buf1: [2048]u8 = undefined;
+    try sendAll(cfd, "GET /rid HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+    const r1 = recvFull(cfd, &buf1);
+    try testing.expect(std.mem.indexOf(u8, r1, "x-request-id: ") != null);
+
+    // 2. Valid incoming x-request-id → server echoes it unchanged, handler sees it.
+    var buf2: [2048]u8 = undefined;
+    try sendAll(cfd, "GET /rid HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nX-Request-Id: abc-123\r\n\r\n");
+    const r2 = recvFull(cfd, &buf2);
+    try testing.expect(std.mem.indexOf(u8, r2, "x-request-id: abc-123\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, r2, "abc-123"));
+
+    // 3. Invalid incoming x-request-id (space) → server replaces with generated id, invalid not echoed.
+    var buf3: [2048]u8 = undefined;
+    try sendAll(cfd, "GET /rid HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Request-Id: bad id!\r\n\r\n");
+    const r3 = recvFull(cfd, &buf3);
+    try testing.expect(std.mem.indexOf(u8, r3, "bad id!") == null);
+    try testing.expect(std.mem.indexOf(u8, r3, "x-request-id: ") != null);
 
     var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
     defer shutdown_threaded.deinit();
