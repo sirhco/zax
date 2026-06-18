@@ -60,6 +60,19 @@ INFLIGHT="${INFLIGHT:-0}"  # N>0 = run zax twice (ZAX_MAX_INFLIGHT=0 then =N) to
 BACKEND="${BACKEND:-threaded}"  # "both" = run zax twice (threaded then evented epoll reactor).
                       # "evented" = evented only. Default "threaded" = classic std.Io.Threaded.
                       # Evented is Linux-only (ZAX_BACKEND=evented calls App.serveEvented).
+# ── Work-stealing spike (spike/work-stealing branch) ────────────────────────
+# STEAL induces vCPU-steal-like worker starvation on the evented reactor so the
+# spike can measure worst-case MAX with/without it (Linux/taskset only).
+#   STEAL=none     (default) no induction.
+#   STEAL=cpuset   pin the server to STEAL_CORES cores and run ZAX_WORKERS=2*cores
+#                  workers on them — oversubscription forces the OS to deschedule
+#                  runnable workers (the steal analogue). Client gets disjoint cores.
+#   STEAL=hog      additionally pin a busy-loop to ONE server core during each load
+#                  window, freeing it after — a sharper, single-core starvation.
+# Use with BACKEND=evented (or both). STEAL implies its own server/client pinning,
+# independent of PIN.
+STEAL="${STEAL:-none}"
+STEAL_CORES="${STEAL_CORES:-2}"
 ROWS=()               # accumulated "framework|scenario|reqs|p50|p99|p999|max" for the table
 
 # When PIN=1, run the server on the first half of the cores and the load
@@ -149,6 +162,45 @@ if [ "$PIN" = 1 ]; then
     echo "  SEPARATE machine for a fair test. Proceeding UNPINNED."
   fi
 fi
+
+# Work-stealing steal-induction pinning (independent of PIN). Pins the server to
+# the first STEAL_CORES cores and forces 2*STEAL_CORES evented workers onto them
+# (oversubscription → descheduling); client runs on the remaining cores.
+STEAL_ENV=""
+STEAL_SRV_PIN=""
+STEAL_HOG_CORE=""
+if [ "$STEAL" != none ]; then
+  if command -v taskset >/dev/null 2>&1; then
+    NCPUS="$(nproc)"
+    if [ "$STEAL_CORES" -ge "$NCPUS" ]; then
+      echo "STEAL: STEAL_CORES=$STEAL_CORES >= nproc=$NCPUS — need cores left for the client. Aborting." >&2
+      exit 1
+    fi
+    STEAL_WORKERS=$(( STEAL_CORES * 2 ))
+    STEAL_SRV_PIN="taskset -c 0-$((STEAL_CORES - 1))"
+    CLT_PIN="taskset -c ${STEAL_CORES}-$((NCPUS - 1))"   # client on the disjoint remainder
+    STEAL_ENV="ZAX_WORKERS=${STEAL_WORKERS}"
+    STEAL_HOG_CORE=0
+    echo "== STEAL=$STEAL: server [${STEAL_SRV_PIN}] workers=${STEAL_WORKERS} on ${STEAL_CORES} cores; client [${CLT_PIN}] =="
+  else
+    echo "STEAL set but 'taskset' not found (Linux only). Proceeding WITHOUT steal induction." >&2
+    STEAL=none
+  fi
+fi
+
+# CPU-hog helpers (STEAL=hog): a busy-loop pinned to one server core during a load window.
+HOG_PID=""
+start_hog() {
+  [ "$STEAL" = hog ] || return 0
+  taskset -c "$STEAL_HOG_CORE" sh -c 'while :; do :; done' &
+  HOG_PID=$!
+}
+stop_hog() {
+  [ -n "$HOG_PID" ] || return 0
+  kill "$HOG_PID" 2>/dev/null || true
+  wait "$HOG_PID" 2>/dev/null || true
+  HOG_PID=""
+}
 
 if ! command -v "$LOAD" >/dev/null 2>&1; then
   echo "load generator '$LOAD' not found."
@@ -244,18 +296,27 @@ for pass in "${PASSES[@]}"; do
   IFS='|' read -r name port kv cmd <<<"$pass"
   echo
   echo "######################## $name (:$port) ########################"
-  env ${kv:+"$kv"} $SRV_PIN $cmd >/dev/null 2>&1 &
+  # STEAL applies to the zax server passes only (the reactor under test); its
+  # pin/worker-count override the generic PIN pin for those passes.
+  srv_pin="$SRV_PIN"; steal_kv=""
+  case "$name" in
+    zax|zax-ev|zax-on|zax-off|zax-cap)
+      [ "$STEAL" != none ] && { srv_pin="$STEAL_SRV_PIN"; steal_kv="$STEAL_ENV"; } ;;
+  esac
+  env ${kv:+"$kv"} ${steal_kv:+"$steal_kv"} $srv_pin $cmd >/dev/null 2>&1 &
   pid=$!
-  trap 'kill "$pid" 2>/dev/null || true' EXIT
+  trap 'kill "$pid" 2>/dev/null || true; stop_hog' EXIT
   # wait for readiness
   for _ in $(seq 1 50); do
     curl -fs "http://127.0.0.1:$port/" >/dev/null 2>&1 && break
     sleep 0.1
   done
 
+  start_hog
   drive "$name" static "http://127.0.0.1:$port/"
   drive "$name" param  "http://127.0.0.1:$port/users/42"
   drive "$name" json   "http://127.0.0.1:$port/echo" POST '{"msg":"hi"}'
+  stop_hog
 
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true

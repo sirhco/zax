@@ -80,6 +80,15 @@ pub fn main(init: std.process.Init) !void {
     // On macOS serveEvented returns error.EventedUnsupported — we print a clear message and exit 1.
     const backend_evented = if (init.environ_map.get("ZAX_BACKEND")) |v| std.mem.eql(u8, v, "evented") else false;
 
+    // Worker-count override (work-stealing spike): ZAX_WORKERS=N forces N evented workers
+    // instead of the ncpu default. Set N > available cores (combined with run.sh STEAL=cpuset)
+    // to oversubscribe workers onto fewer cores and induce vCPU-steal-like descheduling.
+    // 0 or unset -> ncpu default (unchanged behavior).
+    const workers_n: usize = if (init.environ_map.get("ZAX_WORKERS")) |v|
+        std.fmt.parseUnsigned(usize, v, 10) catch 0
+    else
+        0;
+
     // Self-shutdown timer: ZAX_RUN_SECS=N → stop after N seconds (dumps trace).
     // 0 or unset → run forever (unchanged behavior).
     const run_secs: u64 = if (init.environ_map.get("ZAX_RUN_SECS")) |v|
@@ -105,10 +114,10 @@ pub fn main(init: std.process.Init) !void {
         // ZAX_BACKEND=evented: use App.serveEvented (Linux epoll reactor, SO_REUSEPORT,
         // shared-nothing workers, 0 = ncpu workers). Linux-only; macOS exits non-zero.
         std.debug.print(
-            "zax bench server on http://127.0.0.1:{d} (backend=evented, tcp_nodelay={}, keep_alive={}, workers=ncpu)\n",
-            .{ port, nodelay, keep_alive },
+            "zax bench server on http://127.0.0.1:{d} (backend=evented, tcp_nodelay={}, keep_alive={}, workers={d} [0=ncpu])\n",
+            .{ port, nodelay, keep_alive, workers_n },
         );
-        app.serveEvented(init.io, .{ .ip4 = .loopback(port) }, .{ .workers = 0 }) catch |e| {
+        app.serveEvented(init.io, .{ .ip4 = .loopback(port) }, .{ .workers = workers_n }) catch |e| {
             if (e == error.EventedUnsupported) {
                 std.debug.print(
                     "ZAX_BACKEND=evented unsupported on this platform (Linux epoll only). " ++
