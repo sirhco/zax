@@ -2558,6 +2558,57 @@ test "streaming: persistent pull-stream uses chunked framing and keeps connectio
     loop_fut.await(io);
 }
 
+test "streaming: persistent push-stream uses chunked framing and keeps connection alive" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/push", streamHandler);
+    try app.get("/ping", pingHandler);
+
+    const port: u16 = 18220;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    // First request: persistent HTTP/1.1 to the PUSH-stream route (Response.stream).
+    cw.interface.writeAll("GET /push HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+
+    var out1: [2048]u8 = undefined;
+    const r1 = readChunkedResp(&cr.interface, &out1);
+
+    // Head must advertise chunked + keep-alive (push streamer on a persistent client).
+    try testing.expect(std.mem.indexOf(u8, r1, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "transfer-encoding: chunked") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "connection: keep-alive") != null);
+
+    // Body must contain the streamed lines (chunk-framed) and the terminator.
+    try testing.expect(std.mem.indexOf(u8, r1, "line0") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "line2") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "0\r\n\r\n") != null);
+
+    // Second request on the SAME connection — proves keep-alive after a push stream.
+    cw.interface.writeAll("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var out2: [1024]u8 = undefined;
+    const r2 = readResp(&cr.interface, &out2);
+    try testing.expect(std.mem.indexOf(u8, r2, "200 OK") != null);
+    try testing.expect(std.mem.endsWith(u8, r2, "pong"));
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
 // ---------------------------------------------------------------------------
 // Cross-platform socket helpers for serveEvented tests
 // (std.posix lacks socket/connect/close in Zig 0.16; use linux.* or std.c.*)
