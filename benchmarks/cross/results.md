@@ -433,3 +433,14 @@ threads, client = the other 16 — disjoint, confirmed in the pinning line). 30s
 throughput + p99.9 leader, the lead grows with cores, and the threaded tail is a real
 `std.Io.Threaded` property. The only metric where axum/httpz edge zax-ev is worst-case *max* under
 cloud-VM vCPU steal — the shared-nothing-vs-work-stealing tradeoff, not a fixable bug.
+
+## Memory (RSS)
+
+| Framework | idle (MB) | peak (MB) |
+|-----------|----------:|----------:|
+| zax       |           |           |
+| axum      |           |           |
+| go        |           |           |
+| httpz     |           |           |
+
+(Filled from a real run: `cd benchmarks/cross && ./run.sh`. RSS via `ps`; idle = at rest, peak = under load.)
