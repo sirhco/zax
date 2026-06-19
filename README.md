@@ -284,7 +284,9 @@ try app.get("/assets/*path", serveAsset);
   owns its arena, there is no cross-thread arena sharing.
 - **Per-connection keep-alive.** Persistent HTTP/1.1 connections (Content-Length
   framing); the arena is reset between requests and the read buffer reused via
-  `toss`/`rebase`. Honors `Connection`; rejects chunked request bodies with 411.
+  `toss`/`rebase`. Honors `Connection`. Inbound `Transfer-Encoding: chunked`
+  request bodies are decoded (bounded by `max_body_size`); streamed responses use
+  chunked framing to keep the connection alive on HTTP/1.1 persistent clients.
 - **`TCP_NODELAY` on every connection.** Nagle's algorithm is disabled so small
   responses are sent immediately instead of being held for the peer's delayed
   ACK (~40 ms) — standard for low-latency HTTP servers.
@@ -356,15 +358,20 @@ Build responses with the `Response` constructors:
 | `Response.html(s)` | `text/html` body |
 | `Response.json(arena, value)` | JSON-serialized body (`application/json`) |
 | `Response.jsonRaw(s)` | pre-serialized JSON string |
-| `Response.stream(Ctx, ctx, fn, ct)` | streamed body (connection-close) written by `fn` |
+| `Response.stream(Ctx, ctx, fn, ct)` | push-streamed body written by `fn` |
+| `Response.sse(Ctx, ctx, fn)` | push-streamed Server-Sent Events |
+| `Response.streamPull(Ctx, ctx, nextFn)` | pull-streamed body (backpressure-aware; both backends) |
+| `Response.ssePull(Ctx, ctx, nextFn)` | pull-streamed Server-Sent Events (both backends) |
 | `Response.redirect(status, loc)` | redirect with a `Location` header |
 | `Response.seeOther/temporaryRedirect/permanentRedirect(loc)` | 303 / 307 / 308 redirects |
 | `Response.fromStatus(s)` | bare status |
 | `r.withHeader(arena, name, value)` | add a response header |
 
-A streamed response writes its body incrementally to the connection (no
-`Content-Length`, `connection: close`); the `ctx` must be arena-allocated. Useful
-for large or generated bodies:
+A streamed response writes its body incrementally to the connection; the `ctx`
+must be arena-allocated. Useful for large or generated bodies. On HTTP/1.1
+persistent clients the body is framed with **`Transfer-Encoding: chunked`** and
+the connection is kept alive; HTTP/1.0, `Connection: close`, or a keep-alive-
+disabled server fall back to connection-close framing.
 
 ```zig
 const Lines = struct { n: usize };
@@ -394,6 +401,37 @@ fn handler(a: zax.Alloc) !zax.Response {
     return zax.Response.sse(Feed, f, feed);
 }
 ```
+
+`stream` and `sse` are **push** streamers — the handler drives a `Writer` and
+blocks the worker while producing. For non-blocking, backpressure-aware streaming
+that runs on **both backends** (threaded and the evented reactor), use the
+**pull** model: `Response.streamPull(Ctx, ctx, nextFn)` and
+`Response.ssePull(Ctx, ctx, nextFn)`. `nextFn` is called whenever the connection
+can accept more bytes and returns the next chunk, `not_ready` (no data yet), or
+`done`:
+
+```zig
+const Feed = struct { i: usize, n: usize };
+fn next(f: *Feed, buf: []u8) zax.PullResult {
+    if (f.i >= f.n) return .done;
+    if (!ready()) return .{ .chunk = 0 }; // not ready yet — no busy-spin
+    const w = std.fmt.bufPrint(buf, "row {d}\n", .{f.i}) catch return .err;
+    f.i += 1;
+    return .{ .chunk = w.len };
+}
+fn handler(a: zax.Alloc) !zax.Response {
+    const f = try a.value.create(Feed);
+    f.* = .{ .i = 0, .n = 100 };
+    return zax.Response.streamPull(Feed, f, next);
+}
+```
+
+A `chunk = 0` (`not_ready`) producer does **not** busy-spin: the evented backend
+parks the connection on its timer wheel and the threaded backend sleeps, both
+re-polling every `stream_repoll_ms` (default 5 ms; `0` = legacy busy behavior).
+Set `stream_idle_timeout_ms` (default `0` = off) to hard-close a stream that
+produces no data for that long (truncated — no chunked terminator). These knobs
+live on `Options` (threaded) and `EventedOptions` (evented).
 
 Serve static files with the `Files` extractor — `files.file("static/index.html")`
 for an explicit path, or `files.dir("static", requested)` to safely serve a
@@ -491,10 +529,15 @@ A focused HTTP/1.1 framework. **Shipped:** routing, comptime extractors,
 keep-alive, middleware, graceful drain, HTTPS via reverse-proxy termination
 (forwarded-header trust), request size limits, and read/idle timeouts.
 
-**Not yet built:** in-process TLS (blocked on std — use a proxy), `Headers`/
-`Form`/`Cookie` extractors, chunked request
-bodies (rejected with 411), HTTP/2, and the experimental `Io.Evented` backend
-(its std networking is incomplete in 0.16.0, so Zax runs on `Io.Threaded`).
+Streaming is full-featured: push (`stream`/`sse`) and pull
+(`streamPull`/`ssePull`) bodies, `Transfer-Encoding: chunked` with keep-alive,
+inbound chunked request-body decoding, and a not-ready backoff + idle cap — on
+both the threaded and evented backends.
+
+**Not yet built:** in-process TLS (blocked on std — use a proxy), `Headers`
+extractor, and HTTP/2. The evented reactor (`App.serveEvented`, epoll/kqueue) is
+shipped and opt-in; the default backend remains `Io.Threaded`. (Zax's reactor is
+its own epoll/kqueue loop — std's `Io.Evented` still can't serve TCP in 0.16.0.)
 
 A `SIGINT`/`SIGTERM` handler is not auto-installed (`Io.Threaded` uses signals
 for cancellation) — wire one to call `app.requestShutdown(io)`.
