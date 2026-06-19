@@ -4,6 +4,12 @@ All notable changes to zax are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Evented reactor: `EventedOptions.stream_idle_timeout_ms` — opt-in whole-stream idle cap that hard-closes a pull stream (`streamPull`/`ssePull`) producing no data for N ms (default 0 = disabled).
+
 ## [0.5.0] - 2026-06-18
 
 ### Added

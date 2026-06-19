@@ -202,6 +202,12 @@ pub const Conn = struct {
     /// 0 = disabled — fall back to old `.want_write` behavior (busy-spin).
     /// Default 5 ms is a constant backoff; future: exponential backoff capped at idle_timeout.
     stream_repoll_ms: u32 = 5,
+    /// Whole-stream idle cap (ms): close a pull stream that has produced no
+    /// data for this long. 0 disables (default — no cap, legacy behavior).
+    stream_idle_timeout_ms: u32 = 0,
+    /// Monotonic stamp (ns) of the last real chunk produced; also set at
+    /// stream start. Only read when `stream_idle_timeout_ms != 0`.
+    last_produce_ns: i96 = 0,
     /// When true, the active pull stream is framed as chunked transfer-encoding
     /// and the connection is kept alive after the terminator. Set at dispatch
     /// from `persistent`; cleared on each keep-alive reset.
@@ -515,6 +521,7 @@ pub const Conn = struct {
                                     continue;
                                 }
                                 self.pull_streamer = ps;
+                                self.last_produce_ns = monotonicNow();
                                 self.close_after_write = !self.stream_chunked; // chunked → keep-alive after terminator
                                 self.state = .writing; // pump the head first
                                 continue;
@@ -569,6 +576,17 @@ pub const Conn = struct {
                             switch (ps.next(self.pullDst())) {
                                 .chunk => |n| {
                                     if (n == 0) {
+                                        // Whole-stream idle cap: no data for too long → hard close (truncate).
+                                        if (self.stream_idle_timeout_ms != 0) {
+                                            const now = monotonicNow();
+                                            if (now - self.last_produce_ns >
+                                                @as(i96, self.stream_idle_timeout_ms) * 1_000_000)
+                                            {
+                                                self.pull_streamer = null;
+                                                self.state = .closing;
+                                                return .done_close;
+                                            }
+                                        }
                                         // Producer not ready yet (sparse stream, e.g. SSE).
                                         if (self.stream_repoll_ms == 0) {
                                             self.deadline_ns = no_deadline; // escape hatch: preserve old behavior
@@ -580,6 +598,7 @@ pub const Conn = struct {
                                         self.deadline_ns = monotonicNow() + @as(i96, self.stream_repoll_ms) * 1_000_000;
                                         return .want_stream_repoll;
                                     }
+                                    self.last_produce_ns = monotonicNow();
                                     if (self.stream_chunked) {
                                         self.frameChunk(n);
                                     } else {
@@ -628,6 +647,16 @@ pub const Conn = struct {
                                 switch (ps.next(self.pullDst())) {
                                     .chunk => |n| {
                                         if (n == 0) {
+                                            if (self.stream_idle_timeout_ms != 0) {
+                                                const now = monotonicNow();
+                                                if (now - self.last_produce_ns >
+                                                    @as(i96, self.stream_idle_timeout_ms) * 1_000_000)
+                                                {
+                                                    self.pull_streamer = null;
+                                                    self.state = .closing;
+                                                    return .done_close;
+                                                }
+                                            }
                                             // Producer not ready yet (sparse stream, e.g. SSE).
                                             if (self.stream_repoll_ms == 0) {
                                                 // Escape hatch: old busy-spin behavior.
@@ -641,6 +670,7 @@ pub const Conn = struct {
                                             self.deadline_ns = monotonicNow() + @as(i96, self.stream_repoll_ms) * 1_000_000;
                                             return .want_stream_repoll;
                                         }
+                                        self.last_produce_ns = monotonicNow();
                                         if (self.stream_chunked) {
                                             self.frameChunk(n);
                                         } else {
@@ -2176,4 +2206,247 @@ test "conn: streamPull on a Connection: close request stays connection-close (no
     try testing.expect(std.mem.indexOf(u8, out, "transfer-encoding") == null);
     try testing.expect(std.mem.indexOf(u8, out, "abc") != null); // raw body, not framed
     try testing.expectEqual(StepResult.done_close, result);
+}
+
+// ---------------------------------------------------------------------------
+// Task 2 tests — stream_idle_timeout_ms / idle cap
+// ---------------------------------------------------------------------------
+
+/// A pull streamer that always returns chunk(0) — never produces data.
+const AlwaysZeroCtx = struct {
+    calls: usize = 0,
+    fn next(c: *@This(), buf: []u8) response_mod.PullResult {
+        _ = buf;
+        c.calls += 1;
+        return .{ .chunk = 0 };
+    }
+};
+
+/// A pull streamer: returns chunk(0) once, then a real chunk of `payload`, then done.
+const ZeroThenRealCtx = struct {
+    payload: []const u8,
+    calls: usize = 0,
+    real_served: bool = false,
+    done: bool = false,
+    fn next(c: *@This(), buf: []u8) response_mod.PullResult {
+        c.calls += 1;
+        if (!c.real_served) {
+            if (c.calls == 1) return .{ .chunk = 0 };
+            c.real_served = true;
+            const n = @min(c.payload.len, buf.len);
+            @memcpy(buf[0..n], c.payload[0..n]);
+            return .{ .chunk = n };
+        }
+        if (!c.done) {
+            c.done = true;
+            return .done;
+        }
+        return .{ .chunk = 0 };
+    }
+};
+
+/// A pull streamer: returns a real chunk first, then always chunk(0).
+const RealThenZeroCtx = struct {
+    payload: []const u8,
+    calls: usize = 0,
+    real_served: bool = false,
+    fn next(c: *@This(), buf: []u8) response_mod.PullResult {
+        c.calls += 1;
+        if (!c.real_served) {
+            c.real_served = true;
+            const n = @min(c.payload.len, buf.len);
+            @memcpy(buf[0..n], c.payload[0..n]);
+            return .{ .chunk = n };
+        }
+        return .{ .chunk = 0 };
+    }
+};
+
+test "stream idle cap: chunk(0) past window hard-closes (no terminator)" {
+    // cap fires at the first-site (w_len==0 guard): park, back-date last_produce_ns, re-drive.
+    const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = AlwaysZeroCtx{};
+    const D = struct {
+        p: *AlwaysZeroCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(AlwaysZeroCtx, s.p, AlwaysZeroCtx.next, "text/event-stream");
+        }
+    };
+    var sd = D{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = D.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    c.stream_repoll_ms = 5;
+    c.stream_idle_timeout_ms = 10;
+    const t = ft.transport();
+
+    // First step: dispatch → head pumped → chunk(0) → park.
+    const r1 = c.step(t, d);
+    try testing.expectEqual(StepResult.want_stream_repoll, r1);
+
+    // Simulate 50ms of idle (well past the 10ms cap) by back-dating last_produce_ns.
+    c.last_produce_ns = monotonicNow() - 50 * std.time.ns_per_ms;
+
+    // Simulate timer fire: .streaming → .writing.
+    _ = c.onDeadline();
+    // Re-drive: hits chunk(0) → cap check → hard close.
+    const r = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, r);
+    try testing.expectEqual(State.closing, c.state);
+    // No chunked terminator written (truncate, not clean close).
+    try testing.expect(std.mem.indexOf(u8, ft.written.items, "0\r\n\r\n") == null);
+}
+
+test "stream idle cap: real chunk resets window, subsequent chunk(0) parks (not closes)" {
+    // After a real chunk resets last_produce_ns, a subsequent chunk(0) should NOT fire cap
+    // (last_produce_ns is fresh) and should park as want_stream_repoll.
+    const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Producer: chunk(0) → "hello" → chunk(0) forever.
+    var ctx = ZeroThenRealCtx{ .payload = "hello" };
+    const D2 = struct {
+        p: *ZeroThenRealCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(ZeroThenRealCtx, s.p, ZeroThenRealCtx.next, "text/event-stream");
+        }
+    };
+    var sd = D2{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = D2.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    c.stream_repoll_ms = 5;
+    c.stream_idle_timeout_ms = 10;
+    const t = ft.transport();
+
+    // Park on first chunk(0).
+    const r1 = c.step(t, d);
+    try testing.expectEqual(StepResult.want_stream_repoll, r1);
+
+    // Back-date so cap WOULD fire if last_produce_ns isn't reset by the real chunk.
+    c.last_produce_ns = monotonicNow() - 50 * std.time.ns_per_ms;
+
+    // Cap check lives inside the n==0 branch; a real chunk (n>0) bypasses it entirely and
+    // resets last_produce_ns. So back-dating before a real-chunk step cannot trigger the cap.
+    _ = c.onDeadline();
+    const r2 = c.step(t, d);
+    // Real chunk "hello" delivered, then done → done_close. "hello" in written confirms cap didn't fire.
+    try testing.expectEqual(StepResult.done_close, r2);
+    const written = ft.written.items;
+    try testing.expect(std.mem.indexOf(u8, written, "hello") != null);
+    try testing.expect(c.pull_streamer == null);
+}
+
+test "stream idle cap: disabled (timeout==0) never closes even with old stamp" {
+    // With stream_idle_timeout_ms == 0, cap is never applied; chunk(0) parks normally.
+    const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = AlwaysZeroCtx{};
+    const D3 = struct {
+        p: *AlwaysZeroCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(AlwaysZeroCtx, s.p, AlwaysZeroCtx.next, "text/event-stream");
+        }
+    };
+    var sd = D3{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = D3.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    c.stream_repoll_ms = 5;
+    c.stream_idle_timeout_ms = 0; // disabled
+    const t = ft.transport();
+
+    // Park.
+    const r1 = c.step(t, d);
+    try testing.expectEqual(StepResult.want_stream_repoll, r1);
+
+    // Back-date to look idle for 10 seconds — cap must NOT fire.
+    c.last_produce_ns = monotonicNow() - 10_000 * std.time.ns_per_ms;
+
+    // Re-drive.
+    _ = c.onDeadline();
+    const r2 = c.step(t, d);
+    // Cap disabled → parks again, not done_close.
+    try testing.expectEqual(StepResult.want_stream_repoll, r2);
+    try testing.expectEqual(State.streaming, c.state);
+}
+
+test "stream idle cap: busy-spin path (repoll_ms==0) + cap fires → done_close" {
+    // With stream_repoll_ms==0 (busy-spin, .want_write path), cap still applies.
+    // Producer always returns chunk(0). Back-date last_produce_ns → cap fires on first chunk(0).
+    const raw = "GET /sse HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx = RealThenZeroCtx{ .payload = "x" };
+    const D4 = struct {
+        p: *RealThenZeroCtx,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(RealThenZeroCtx, s.p, RealThenZeroCtx.next, "text/event-stream");
+        }
+    };
+    var sd = D4{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = D4.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    c.stream_repoll_ms = 0; // busy-spin: uses want_write path
+    c.stream_idle_timeout_ms = 10;
+    const t = ft.transport();
+
+    // First step: dispatch → head pumped → first real chunk "x" → wrote_all → chunk(0) in busy-spin.
+    // Back-date after first step to trigger cap on the second chunk(0).
+    // Drive until we hit the chunk(0) path: keep stepping until want_write (busy-spin on chunk(0)).
+    var r = c.step(t, d);
+    // After head + first real chunk, we expect want_write (chunk(0) busy-spin).
+    // The guard loop from other tests shows we may need multiple steps.
+    var guard: usize = 0;
+    while (r == .want_write and c.state == .writing and guard < 10) : (guard += 1) {
+        // Back-date once we know the real chunk was served.
+        if (ctx.real_served) {
+            c.last_produce_ns = monotonicNow() - 50 * std.time.ns_per_ms;
+        }
+        r = c.step(t, d);
+    }
+    try testing.expectEqual(StepResult.done_close, r);
+    try testing.expectEqual(State.closing, c.state);
+    // No terminator.
+    try testing.expect(std.mem.indexOf(u8, ft.written.items, "0\r\n\r\n") == null);
 }

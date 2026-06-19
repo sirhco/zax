@@ -176,6 +176,9 @@ pub const EventedOptions = struct {
     /// Backoff (ms) before re-polling a not-ready streaming producer;
     /// 0 disables (legacy want_write busy behavior).
     stream_repoll_ms: u32 = 5,
+    /// Whole-stream idle cap (ms) for pull streams: close a stream that has
+    /// produced no data for this long. 0 disables (default — no cap).
+    stream_idle_timeout_ms: u32 = 0,
 };
 
 /// `App(AppState)` — a server bound to one concrete, read-only app-state type.
@@ -516,6 +519,7 @@ pub fn App(comptime AppState: type) type {
                 .idle_timeout_ms = self.opts.idle_timeout_ms,
                 .tcp_nodelay = self.opts.tcp_nodelay,
                 .stream_repoll_ms = opts.stream_repoll_ms,
+                .stream_idle_timeout_ms = opts.stream_idle_timeout_ms,
             };
 
             // Init workers.  Track counts separately so the single cleanup path
