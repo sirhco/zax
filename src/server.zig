@@ -3048,12 +3048,10 @@ test "threaded pull-stream idle cap: truncates without chunked terminator" {
     cw.interface.flush() catch unreachable;
 
     // Read until the connection closes (idle cap triggers hard close).
-    var total: usize = 0;
     while (true) {
         cr.interface.fillMore() catch break;
-        total = cr.interface.buffered().len;
     }
-    const received = cr.interface.buffered()[0..total];
+    const received = cr.interface.buffered();
 
     // Must contain 200 OK header.
     try testing.expect(std.mem.indexOf(u8, received, "200 OK") != null);
