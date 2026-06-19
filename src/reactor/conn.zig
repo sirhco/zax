@@ -16,6 +16,7 @@ const parser = @import("../http/parser.zig");
 const request = @import("../http/request.zig");
 const response_mod = @import("../http/response.zig");
 const transport_mod = @import("transport.zig");
+const chunked_mod = @import("../http/chunked.zig");
 
 const Response = response_mod.Response;
 
@@ -77,8 +78,6 @@ pub const RequestError = error{
     BodyTooLarge,
     /// Request line or headers are syntactically invalid.
     Malformed,
-    /// Chunked transfer-encoding is not supported (v1.1 → reject with 411).
-    ChunkedNotSupported,
 };
 
 // ---------------------------------------------------------------------------
@@ -287,18 +286,53 @@ pub const Conn = struct {
     }
 
     // ----------------------------------------------------------------
-    // Phase 2: validate + read body by Content-Length.
+    // Phase 2: validate + read body (Content-Length or chunked).
     // ----------------------------------------------------------------
     fn readBody(self: *Conn, t: Transport, p: parser.Parsed) ParseOutcome {
-        // Reject chunked transfer-encoding (v1.1 → 411 in Task 5).
+        const head_abs = self.r_start + p.head_len;
+
+        // --- Chunked transfer-encoding path ---
         if (p.request.isChunked()) {
-            return .{ .failed = error.ChunkedNotSupported };
+            self.state = .reading_body;
+            const max = self.max_body_size;
+
+            while (true) {
+                // Try to decode whatever is buffered after the head.
+                const buf_slice = self.read_buf[head_abs..self.r_end];
+                switch (chunked_mod.decodeInPlace(buf_slice, max)) {
+                    .done => |d| {
+                        var result = p;
+                        result.request.body = self.read_buf[head_abs .. head_abs + d.body_len];
+                        result.body_consumed = d.consumed;
+                        return .{ .parsed = result };
+                    },
+                    .incomplete => {
+                        // Buffer full but no terminator → encoded body too large.
+                        if (self.r_end == self.read_buf.len) {
+                            return .{ .failed = error.BodyTooLarge };
+                        }
+                        // Need more data — read into the remainder of the buffer.
+                        const space = self.read_buf[self.r_end..];
+                        switch (t.read(space)) {
+                            .ok => |n| {
+                                if (n == 0) return .closed;
+                                self.r_end += n;
+                            },
+                            .would_block => return .need_more,
+                            .closed => return .closed,
+                        }
+                    },
+                    .malformed => return .{ .failed = error.Malformed },
+                    .too_large => return .{ .failed = error.BodyTooLarge },
+                }
+            }
         }
 
-        // No Content-Length → body is empty; done.
+        // --- No Content-Length → body is empty; done. ---
         const clen = p.request.contentLength() orelse {
             var result = p;
             result.request.body = "";
+            result.body_consumed = 0;
             return .{ .parsed = result };
         };
 
@@ -332,8 +366,8 @@ pub const Conn = struct {
 
         // Attach body as a zero-copy slice.
         var result = p;
-        const head_abs = self.r_start + p.head_len;
         result.request.body = self.read_buf[head_abs .. head_abs + clen];
+        result.body_consumed = clen;
         return .{ .parsed = result };
     }
 
@@ -470,7 +504,6 @@ pub const Conn = struct {
                             // Map parse error → HTTP status.
                             const status: response_mod.Status = switch (e) {
                                 error.Malformed => .bad_request, // 400
-                                error.ChunkedNotSupported => .length_required, // 411
                                 error.BodyTooLarge => .payload_too_large, // 413
                                 error.HeaderFieldsTooLarge => .request_header_fields_too_large, // 431
                             };
@@ -490,7 +523,9 @@ pub const Conn = struct {
 
                             // Advance r_start past this request so the next
                             // compact() sees only pipelined leftovers.
-                            const consumed = p.head_len + p.request.body.len;
+                            // Use body_consumed (encoded length) not body.len
+                            // (decoded length) so chunked framing is consumed.
+                            const consumed = p.head_len + p.body_consumed;
                             self.r_start += consumed;
 
                             // Keep-alive decision (mirrors server.zig handleConn).
@@ -863,9 +898,11 @@ test "conn: reads a POST body by content-length" {
     try testing.expectEqualStrings("/echo", out.parsed.request.path);
 }
 
-test "conn: rejects chunked transfer-encoding" {
-    const raw = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
-    var ft = FakeTransport.init(testing.allocator, &.{raw});
+test "conn: chunked body decoded one-shot" {
+    // "hello world" in two chunks + terminator.
+    const head = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const body_enc = "6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{ head, body_enc });
     defer ft.deinit();
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
@@ -874,9 +911,66 @@ test "conn: rejects chunked transfer-encoding" {
     var c = Conn.init(&rbuf, &wbuf, &arena);
     const t = ft.transport();
 
-    const out = c.fillAndParse(t);
+    var out: ParseOutcome = .need_more;
+    for (0..10) |_| {
+        out = c.fillAndParse(t);
+        if (out != .need_more) break;
+    }
+    try testing.expect(out == .parsed);
+    try testing.expectEqualStrings("hello world", out.parsed.request.body);
+}
+
+test "conn: chunked body decoded in split delivery" {
+    // Head + first chunk arrive on read #1 (would_block after).
+    // Second chunk + terminator arrive on read #2.
+    const head = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const part1 = "6\r\nhello \r\n";     // first chunk only — no terminator yet
+    const part2 = "5\r\nworld\r\n0\r\n\r\n"; // second chunk + terminator
+    var ft = FakeTransport.init(testing.allocator, &.{ head, part1, part2 });
+    defer ft.deinit();
+    // Block after delivering head+part1 so read #2 returns would_block first.
+    ft.block_after = 2; // deliver reads 0 and 1 (head, part1), then block
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+
+    // First call: head + part1 buffered, decode → .incomplete → need_more.
+    const out1 = c.fillAndParse(t);
+    try testing.expect(out1 == .need_more);
+
+    // Second call: part2 arrives, decode completes → parsed.
+    var out2: ParseOutcome = .need_more;
+    for (0..10) |_| {
+        out2 = c.fillAndParse(t);
+        if (out2 != .need_more) break;
+    }
+    try testing.expect(out2 == .parsed);
+    try testing.expectEqualStrings("hello world", out2.parsed.request.body);
+}
+
+test "conn: malformed chunked body returns 400" {
+    const head = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    // Invalid hex size → malformed.
+    const bad_body = "ZZ\r\nbad data\r\n0\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{ head, bad_body });
+    defer ft.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+
+    var out: ParseOutcome = .need_more;
+    for (0..10) |_| {
+        out = c.fillAndParse(t);
+        if (out != .need_more) break;
+    }
     try testing.expect(out == .failed);
-    try testing.expectEqual(error.ChunkedNotSupported, out.failed);
+    try testing.expectEqual(error.Malformed, out.failed);
 }
 
 test "conn: body over max_body_size returns BodyTooLarge" {
@@ -1219,8 +1313,10 @@ test "conn: step — malformed head → 400 bad_request" {
     try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 400"));
 }
 
-test "conn: step — chunked transfer-encoding → 411 length_required" {
-    const raw = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+test "conn: step — chunked transfer-encoding decoded → 200 not 411" {
+    // Full chunked request: head + encoded body delivered together.
+    const raw = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n";
     var ft = FakeTransport.init(testing.allocator, &.{raw});
     defer ft.deinit();
 
@@ -1233,11 +1329,17 @@ test "conn: step — chunked transfer-encoding → 411 length_required" {
     const t = ft.transport();
     const d = makeEchoDispatcher();
 
-    const result = c.step(t, d);
+    // Drive until we get a terminal result (done_close or want_write→done_close).
+    var result: StepResult = .want_read;
+    for (0..20) |_| {
+        result = c.step(t, d);
+        if (result == .done_close) break;
+    }
     try testing.expectEqual(StepResult.done_close, result);
 
     const written = ft.written.items;
-    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 411"));
+    // Must be 200, never 411.
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200"));
 }
 
 test "conn: step — body over max_body_size → 413 payload_too_large" {
