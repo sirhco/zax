@@ -775,7 +775,7 @@ pub fn App(comptime AppState: type) type {
 fn writeResponse(w: *Io.Writer, resp: Response) bool {
     // Pull-streamed response: loop next(buf) writing chunks to the blocking writer.
     if (resp.pull_streamer) |ps| {
-        resp.writeHead(w) catch return false;
+        resp.writeHead(w, false) catch return false;
         var chunk_buf: [4096]u8 = undefined;
         while (true) {
             switch (ps.next(&chunk_buf)) {
@@ -792,7 +792,7 @@ fn writeResponse(w: *Io.Writer, resp: Response) bool {
     }
     // Push-streamed response: func writes directly to the connection writer.
     if (resp.streamer) |s| {
-        resp.writeHead(w) catch return false;
+        resp.writeHead(w, false) catch return false;
         s.func(s.context, w) catch return false;
         w.flush() catch return false;
         return true;

@@ -349,7 +349,7 @@ pub const Conn = struct {
     /// head does not fit in `write_buf`.
     pub fn serializeHead(self: *Conn, resp: Response) error{ResponseTooLarge}!usize {
         var w = std.Io.Writer.fixed(self.write_buf);
-        resp.writeHead(&w) catch {
+        resp.writeHead(&w, false) catch {
             self.w_len = w.end;
             self.w_off = 0;
             return error.ResponseTooLarge;

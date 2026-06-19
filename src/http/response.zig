@@ -285,18 +285,28 @@ pub const Response = struct {
         return r;
     }
 
-    /// Emit the response head. `content_length` is emitted only when given
-    /// (a streamed response omits it).
-    fn writeHeaders(self: Response, w: *Writer, content_length: ?usize) Writer.Error!void {
+    /// Shared head serializer. `content_length` is emitted only when given.
+    /// When `chunked` is true (streamed + keep-alive), emits
+    /// `transfer-encoding: chunked` and `connection: keep-alive`;
+    /// otherwise honors `self.keep_alive`.
+    fn writeHeadersFramed(self: Response, w: *Writer, content_length: ?usize, chunked: bool) Writer.Error!void {
         try w.print("HTTP/1.1 {d} {s}\r\n", .{ self.status.code(), self.status.reason() });
         if (content_length) |n| try w.print("content-length: {d}\r\n", .{n});
+        if (chunked) try w.writeAll("transfer-encoding: chunked\r\n");
         try w.print("content-type: {s}\r\n", .{self.content_type});
         for (self.headers) |h| {
             try w.print("{s}: {s}\r\n", .{ h.name, h.value });
         }
         if (self.location) |loc| try w.print("location: {s}\r\n", .{loc});
-        try w.writeAll(if (self.keep_alive) "connection: keep-alive\r\n" else "connection: close\r\n");
+        const ka = chunked or self.keep_alive;
+        try w.writeAll(if (ka) "connection: keep-alive\r\n" else "connection: close\r\n");
         try w.writeAll("\r\n");
+    }
+
+    /// Emit the response head. `content_length` is emitted only when given
+    /// (a streamed response omits it). Buffered path: chunked=false.
+    fn writeHeaders(self: Response, w: *Writer, content_length: ?usize) Writer.Error!void {
+        try self.writeHeadersFramed(w, content_length, false);
     }
 
     /// Serialize a complete HTTP/1.1 response (head + buffered body) to `w`.
@@ -305,10 +315,11 @@ pub const Response = struct {
         try w.writeAll(self.body);
     }
 
-    /// Write the head for a streamed (connection-close) response: no
-    /// content-length, no body. The caller writes the body afterward.
-    pub fn writeHead(self: Response, w: *Writer) Writer.Error!void {
-        try self.writeHeaders(w, null);
+    /// Write the head for a streamed response. When `chunked` is true, emits
+    /// `transfer-encoding: chunked` and `connection: keep-alive`; when false,
+    /// uses connection-close framing (existing behavior).
+    pub fn writeHead(self: Response, w: *Writer, chunked: bool) Writer.Error!void {
+        try self.writeHeadersFramed(w, null, chunked);
     }
 };
 
@@ -492,7 +503,7 @@ test "writeHead omits content-length and sets connection close" {
     var buf: [256]u8 = undefined;
     var w = Writer.fixed(&buf);
     const r = Response{ .content_type = "text/plain; charset=utf-8" };
-    r.writeHead(&w) catch unreachable;
+    r.writeHead(&w, false) catch unreachable;
     const out = w.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "content-length:") == null);
     try testing.expect(std.mem.indexOf(u8, out, "connection: close\r\n") != null);
@@ -641,4 +652,25 @@ test "ssePull: event larger than the buffer → err" {
     const ps = r.pull_streamer.?;
     var buf: [16]u8 = undefined; // far smaller than the 200-byte payload
     try testing.expectEqual(PullResult.err, ps.next(&buf));
+}
+
+test "writeHead chunked=true emits transfer-encoding chunked + keep-alive, no content-length" {
+    var buf: [256]u8 = undefined;
+    var w = Writer.fixed(&buf);
+    const r = Response{ .content_type = "text/plain" };
+    try r.writeHead(&w, true);
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "transfer-encoding: chunked\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "connection: keep-alive\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "content-length") == null);
+}
+
+test "writeHead chunked=false emits connection close" {
+    var buf: [256]u8 = undefined;
+    var w = Writer.fixed(&buf);
+    const r = Response{ .content_type = "text/plain" };
+    try r.writeHead(&w, false);
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "connection: close\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "transfer-encoding") == null);
 }
