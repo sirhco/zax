@@ -92,6 +92,12 @@ does **not** busy-spin the reactor (since v0.3.0), so sparse SSE works on evente
 `sse()` helper and the push `stream` streamer are Writer-based and **threaded-only**; for SSE
 on the evented backend, drive `streamPull` directly or use `ssePull` (below).
 
+`EventedOptions.stream_idle_timeout_ms` (default `0` = disabled) hard-closes a pull stream
+(`streamPull` / `ssePull`) that produces no data for that many milliseconds. When triggered,
+the connection is truncated (no `0\r\n\r\n` chunked terminator) so the client detects an
+incomplete stream. This composes with `stream_repoll_ms` — the re-poll cadence is the check
+granularity. Evented backend only.
+
 ### Server-Sent Events on the evented backend
 
 The push `sse()` helper is threaded-only (it writes to a blocking writer). For SSE on the
