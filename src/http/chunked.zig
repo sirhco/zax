@@ -67,6 +67,75 @@ pub const ChunkedWriter = struct {
     }
 };
 
+pub const DecodeResult = union(enum) {
+    /// Fully decoded. body_len = decoded bytes at buf[0..body_len];
+    /// consumed = encoded bytes eaten (chunk sizes + data + CRLFs + terminator + trailers).
+    done: struct { body_len: usize, consumed: usize },
+    /// Buffer lacks a complete chunked body — read more and retry.
+    incomplete,
+    /// Malformed chunk framing → 400.
+    malformed,
+    /// Decoded length would exceed `max` → 413.
+    too_large,
+};
+
+/// Decode a chunked request body IN PLACE. `buf` starts at the first chunk-size
+/// line. On `.done`, the decoded body is buf[0..body_len]; bytes at
+/// buf[consumed..] (a pipelined next request) are untouched. `max` caps decoded
+/// length (0 = unbounded). Tolerates chunk extensions (`<hex>;...`) and trailer
+/// headers after the 0-chunk (both skipped, not surfaced).
+///
+/// TWO-PASS and REPEAT-SAFE: pass 1 validates framing + measures WITHOUT writing,
+/// so calling this repeatedly on a growing buffer (incremental reads) never
+/// corrupts the input — `.incomplete`/`.malformed`/`.too_large` leave `buf`
+/// untouched. Only a complete body triggers pass 2 (the in-place compaction).
+pub fn decodeInPlace(buf: []u8, max: usize) DecodeResult {
+    // --- Pass 1: validate + measure, NO mutation ---
+    var i: usize = 0;
+    var total: usize = 0;
+    const consumed = blk: {
+        while (true) {
+            const line_end = std.mem.indexOfPos(u8, buf, i, "\r\n") orelse return .incomplete;
+            var size_end = line_end;
+            if (std.mem.indexOfScalarPos(u8, buf[0..line_end], i, ';')) |semi| size_end = semi;
+            const size_tok = buf[i..size_end];
+            if (size_tok.len == 0) return .malformed;
+            const size = std.fmt.parseInt(usize, size_tok, 16) catch return .malformed;
+            const data_start = line_end + 2;
+            if (size == 0) {
+                // last chunk: skip trailer header lines to the final blank line.
+                var j = data_start;
+                while (true) {
+                    const te = std.mem.indexOfPos(u8, buf, j, "\r\n") orelse return .incomplete;
+                    if (te == j) break :blk te + 2; // empty line → end of body
+                    j = te + 2;
+                }
+            }
+            if (data_start + size + 2 > buf.len) return .incomplete;
+            if (buf[data_start + size] != '\r' or buf[data_start + size + 1] != '\n') return .malformed;
+            if (max != 0 and total + size > max) return .too_large;
+            total += size;
+            i = data_start + size + 2;
+        }
+    };
+
+    // --- Pass 2: compact in place (forward copy, dest <= src) ---
+    var ri: usize = 0;
+    var w: usize = 0;
+    while (true) {
+        const line_end = std.mem.indexOfPos(u8, buf, ri, "\r\n").?;
+        var size_end = line_end;
+        if (std.mem.indexOfScalarPos(u8, buf[0..line_end], ri, ';')) |semi| size_end = semi;
+        const size = std.fmt.parseInt(usize, buf[ri..size_end], 16) catch unreachable;
+        const data_start = line_end + 2;
+        if (size == 0) break;
+        std.mem.copyForwards(u8, buf[w .. w + size], buf[data_start .. data_start + size]);
+        w += size;
+        ri = data_start + size + 2;
+    }
+    return .{ .done = .{ .body_len = w, .consumed = consumed } };
+}
+
 const testing = std.testing;
 
 test "ChunkedWriter frames each flush as a chunk + finish emits terminator" {
@@ -123,4 +192,65 @@ test "writeTerminator is 0 CRLF CRLF" {
     var w = Writer.fixed(&buf);
     try writeTerminator(&w);
     try testing.expectEqualStrings("0\r\n\r\n", w.buffered());
+}
+
+test "decodeInPlace: single chunk" {
+    var buf = "5\r\nhello\r\n0\r\n\r\n".*;
+    const r = decodeInPlace(&buf, 0);
+    try std.testing.expect(r == .done);
+    try std.testing.expectEqual(@as(usize, 5), r.done.body_len);
+    try std.testing.expectEqual(buf.len, r.done.consumed);
+    try std.testing.expectEqualStrings("hello", buf[0..r.done.body_len]);
+}
+
+test "decodeInPlace: multi-chunk concatenates" {
+    var buf = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".*;
+    const r = decodeInPlace(&buf, 0);
+    try std.testing.expectEqualStrings("hello world", buf[0..r.done.body_len]);
+    try std.testing.expectEqual(buf.len, r.done.consumed);
+}
+
+test "decodeInPlace: chunk extension skipped" {
+    var buf = "5;foo=bar\r\nhello\r\n0\r\n\r\n".*;
+    const r = decodeInPlace(&buf, 0);
+    try std.testing.expectEqualStrings("hello", buf[0..r.done.body_len]);
+}
+
+test "decodeInPlace: trailers skipped, counted in consumed" {
+    var buf = "5\r\nhello\r\n0\r\nX-Trace: 1\r\n\r\n".*;
+    const r = decodeInPlace(&buf, 0);
+    try std.testing.expectEqualStrings("hello", buf[0..r.done.body_len]);
+    try std.testing.expectEqual(buf.len, r.done.consumed);
+}
+
+test "decodeInPlace: empty body" {
+    var buf = "0\r\n\r\n".*;
+    const r = decodeInPlace(&buf, 0);
+    try std.testing.expectEqual(@as(usize, 0), r.done.body_len);
+    try std.testing.expectEqual(buf.len, r.done.consumed);
+}
+
+test "decodeInPlace: incomplete (no terminator)" {
+    var buf = "5\r\nhel".*;
+    try std.testing.expect(decodeInPlace(&buf, 0) == .incomplete);
+}
+
+test "decodeInPlace: incomplete (data shorter than size)" {
+    var buf = "5\r\nhi\r\n".*;
+    try std.testing.expect(decodeInPlace(&buf, 0) == .incomplete);
+}
+
+test "decodeInPlace: malformed hex size" {
+    var buf = "zz\r\nhello\r\n0\r\n\r\n".*;
+    try std.testing.expect(decodeInPlace(&buf, 0) == .malformed);
+}
+
+test "decodeInPlace: malformed missing data CRLF" {
+    var buf = "5\r\nhelloXX0\r\n\r\n".*;
+    try std.testing.expect(decodeInPlace(&buf, 0) == .malformed);
+}
+
+test "decodeInPlace: too_large" {
+    var buf = "5\r\nhello\r\n0\r\n\r\n".*;
+    try std.testing.expect(decodeInPlace(&buf, 4) == .too_large);
 }
