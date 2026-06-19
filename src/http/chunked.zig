@@ -111,9 +111,14 @@ pub fn decodeInPlace(buf: []u8, max: usize) DecodeResult {
                     j = te + 2;
                 }
             }
-            if (data_start + size + 2 > buf.len) return .incomplete;
+            // Use subtraction to avoid usize overflow on attacker-supplied size.
+            // data_start <= buf.len always holds (line_end was found within buf).
+            if (size > buf.len - data_start) return .incomplete;
+            if (buf.len - data_start - size < 2) return .incomplete;
             if (buf[data_start + size] != '\r' or buf[data_start + size + 1] != '\n') return .malformed;
-            if (max != 0 and total + size > max) return .too_large;
+            // total <= max invariant: total starts 0; each iteration adds size only
+            // after this guard, so total <= max always when the guard runs.
+            if (max != 0 and size > max - total) return .too_large;
             total += size;
             i = data_start + size + 2;
         }
@@ -253,4 +258,11 @@ test "decodeInPlace: malformed missing data CRLF" {
 test "decodeInPlace: too_large" {
     var buf = "5\r\nhello\r\n0\r\n\r\n".*;
     try std.testing.expect(decodeInPlace(&buf, 4) == .too_large);
+}
+
+test "decodeInPlace: oversized chunk size does not overflow" {
+    var buf = "fffffffffffffffe\r\nhi\r\n0\r\n\r\n".*;
+    // Must NOT panic; size far exceeds buffer → incomplete, never a crash.
+    const r = decodeInPlace(&buf, 0);
+    try std.testing.expect(r == .incomplete);
 }
