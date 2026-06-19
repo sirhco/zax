@@ -117,6 +117,15 @@ fn events(feed: *Feed) zax.Response {
 the push `sse()` helper. A single event larger than the write buffer yields an error and closes
 the connection.
 
+### Keep-alive after a stream (chunked transfer-encoding)
+
+Streamed responses are sent with **`Transfer-Encoding: chunked`** and keep the connection alive
+when the client is HTTP/1.1 and persistent (the default unless it sent `Connection: close`). The
+connection is then reused for the next request. HTTP/1.0 clients, `Connection: close`, exceeding
+`max_keep_alive_requests`, or a server with keep-alive disabled fall back to connection-close
+framing. This applies to all streaming APIs (`stream`, `sse`, `streamPull`, `ssePull`) on both
+backends; a not-ready (`chunk(0)`) producer never emits a zero-length chunk (only end-of-stream does).
+
 ## Limitations
 
 See "Evented backend status" in `docs/superpowers/specs/2026-06-17-evented-reactor-design.md`.

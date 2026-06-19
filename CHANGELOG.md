@@ -8,6 +8,10 @@ All notable changes to zax are documented here. The format is based on
 
 ### Added
 
+- **Chunked transfer-encoding for streamed responses.** Streamed responses (`stream`, `sse`,
+  `streamPull`, `ssePull`) now use `Transfer-Encoding: chunked` and keep the connection alive for
+  HTTP/1.1 persistent clients, on both backends; connection-close framing remains the fallback
+  for HTTP/1.0 / `Connection: close` / keep-alive-disabled.
 - **`Response.ssePull` — pull-model Server-Sent Events.** Emits SSE on **both** backends
   (the push `sse()` helper remains threaded-only). `nextFn(*Ctx) -> SsePull` returns
   `{ event, comment, not_ready, done }`; zax frames each event/comment via the SSE wire
