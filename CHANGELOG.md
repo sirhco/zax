@@ -4,6 +4,12 @@ All notable changes to zax are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Threaded backend: pull streams (`streamPull`/`ssePull`) now back off (`Options.stream_repoll_ms`, default 5ms) instead of busy-looping on a not-ready (`chunk(0)`) producer, and honor `Options.stream_idle_timeout_ms` (idle cap, hard-close) — parity with the evented backend.
+
 ## [0.6.0] - 2026-06-19
 
 ### Added
