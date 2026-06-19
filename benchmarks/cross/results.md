@@ -436,28 +436,34 @@ cloud-VM vCPU steal — the shared-nothing-vs-work-stealing tradeoff, not a fixa
 
 ## Memory (RSS)
 
-macOS, 30s, 64 conns, `BACKEND=both ./run.sh` (2026-06-19). RSS via `ps`; idle =
-post-readiness at rest, peak = max under load; one process per server.
+macOS, 64 conns, `BACKEND=both ./run.sh`. RSS via `ps`; idle = post-readiness at
+rest, peak = max under load; one process per server.
+
+Post lazy-slot-buffer change (`docs/superpowers/specs/2026-06-19-evented-lazy-slots-design.md`),
+8 s run:
 
 | Framework        | idle (MB) | peak (MB) |
 |------------------|----------:|----------:|
 | zax (threaded)   |       1.8 |       3.2 |
-| zax-ev (evented) |     477.7 |     478.6 |
-| axum             |       2.7 |      10.3 |
-| go               |      10.9 |      26.0 |
+| zax-ev (evented) |      44.3 |      46.2 |
+| axum             |       2.7 |      10.5 |
+| go               |      11.0 |      26.0 |
 | httpz            |       3.2 |       4.1 |
 
 **Threaded zax is the lightest of all five** (1.8 idle / 3.2 peak) — buffers are
 allocated per connection on demand (`src/server.zig` handleConn), so the footprint
 tracks live connections.
 
-**Evented zax is the heaviest by far** (~478 MB, idle≈peak). The shared-nothing
-reactor **preallocates its full connection pool upfront** (`src/reactor/worker.zig`):
-`workers × max_connections (default 1024) × (read_buffer 16 KB + write_buffer 8 KB +
-arena)`. With ~20 workers that is ~478 MB committed at startup, independent of load —
-a fixed RAM-for-latency tradeoff (evented also leads throughput + p99.9: ~180k req/s,
-p99.9 ≈ 0.87 ms vs threaded's macOS-loopback 35 ms tail). Tunable via
-`EventedOptions.workers` and `Options.max_connections`; a lazy slot-buffer allocation
-would cut the idle footprint.
+**Evented zax: ~478 MB → ~44 MB after lazy slot buffers.** The shared-nothing reactor
+used to preallocate its full pool upfront (`workers × max_connections (1024) ×
+(read_buffer 16 KB + write_buffer 8 KB)` ≈ 478 MB, idle≈peak). Buffers are now
+allocated lazily on first accept into a slot and retained, so the footprint tracks the
+**peak concurrent connections** (high-water-mark) instead of the full pool —
+~44 MB for this 64-conn load across ~20 workers. `max_connections` stays the cap.
+Evented also leads throughput + p99.9 (≈239k req/s, p99.9 ≈ 0.63 ms vs threaded's
+macOS-loopback 35 ms tail).
+
+> **Pre-fix figure (for reference):** before the lazy-slot change, `zax-ev` measured
+> 477.7 idle / 478.6 peak MB.
 
 (Regenerate: `cd benchmarks/cross && ./run.sh` — `BACKEND=both` to include evented.)

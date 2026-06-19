@@ -143,7 +143,7 @@ pub const Worker = struct {
         const slots = try gpa.alloc(Slot, opts.max_connections);
         errdefer gpa.free(slots);
         for (slots, 0..) |*s, i| {
-            s.* = try Slot.init(gpa, opts.read_buffer_size, opts.write_buffer_size);
+            s.* = Slot.init(gpa, opts.read_buffer_size, opts.write_buffer_size);
             s.free_idx = i; // not meaningful yet but keeps things tidy
         }
 
@@ -471,6 +471,13 @@ pub const Worker = struct {
             const slot_idx = self.free[self.free_len];
             const slot = &self.slots[slot_idx];
 
+            // Allocate this slot's buffers on first use; shed the connection on OOM.
+            slot.ensureBuffers(self.gpa) catch {
+                closeFd(conn_fd);
+                self.freeSlot(slot_idx);
+                continue;
+            };
+
             // Initialise / reuse the slot.
             slot.conn = Conn.init(slot.read_buf, slot.write_buf, &slot.arena);
             applyConnConfig(&slot.conn, self.opts);
@@ -602,29 +609,37 @@ pub const Worker = struct {
 // ---------------------------------------------------------------------------
 
 /// Owns the memory for one connection: buffers, arena, and the Conn state machine.
+/// Buffers are allocated lazily on first accept (`ensureBuffers`) and retained across
+/// reuse, so idle workers commit no per-connection buffer memory.
 const Slot = struct {
-    read_buf: []u8,
-    write_buf: []u8,
+    read_buf: []u8 = &.{},
+    write_buf: []u8 = &.{},
+    read_size: usize,
+    write_size: usize,
     arena: std.heap.ArenaAllocator,
     conn: Conn = undefined, // valid only when active
     fd: i32 = -1,
     active: bool = false,
     free_idx: usize = 0, // index back into Worker.slots (set at alloc time)
 
-    fn init(gpa: std.mem.Allocator, read_buf_size: usize, write_buf_size: usize) !Slot {
-        const rb = try gpa.alloc(u8, read_buf_size);
-        errdefer gpa.free(rb);
-        const wb = try gpa.alloc(u8, write_buf_size);
+    // No allocation here — record sizes + init the (lazy) arena. Infallible.
+    fn init(gpa: std.mem.Allocator, read_buf_size: usize, write_buf_size: usize) Slot {
         return .{
-            .read_buf = rb,
-            .write_buf = wb,
+            .read_size = read_buf_size,
+            .write_size = write_buf_size,
             .arena = std.heap.ArenaAllocator.init(gpa),
         };
     }
 
+    // Allocate the read/write buffers on first use; idempotent (retained across reuse).
+    fn ensureBuffers(self: *Slot, gpa: std.mem.Allocator) !void {
+        if (self.read_buf.len == 0) self.read_buf = try gpa.alloc(u8, self.read_size);
+        if (self.write_buf.len == 0) self.write_buf = try gpa.alloc(u8, self.write_size);
+    }
+
     fn deinit(self: *Slot, gpa: std.mem.Allocator) void {
-        gpa.free(self.read_buf);
-        gpa.free(self.write_buf);
+        if (self.read_buf.len != 0) gpa.free(self.read_buf);
+        if (self.write_buf.len != 0) gpa.free(self.write_buf);
         self.arena.deinit();
     }
 };
@@ -1299,4 +1314,66 @@ test "worker: stream_idle_timeout_ms propagates from WorkerOpts to conn" {
     };
     applyConnConfig(&c, opts);
     try testing.expectEqual(@as(u32, 1234), c.stream_idle_timeout_ms);
+}
+
+test "evented slot buffers are lazy: none allocated at Worker.init" {
+    if (!reactor_supported) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    const Bundle = struct { io: std.Io };
+    const DispCtx = struct {
+        fn dispatch(ctx: *anyopaque, req: *const request.Request, arena: *std.heap.ArenaAllocator) Response {
+            _ = @as(*Bundle, @ptrCast(@alignCast(ctx))).io;
+            _ = req;
+            _ = arena;
+            return Response.text("ok");
+        }
+    };
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var bundle = Bundle{ .io = threaded.io() };
+
+    const disp = Dispatcher{
+        .ctx = @ptrCast(&bundle),
+        .dispatchFn = DispCtx.dispatch,
+    };
+
+    const opts = WorkerOpts{
+        .max_connections = 4,
+        .read_buffer_size = 16 * 1024,
+        .write_buffer_size = 8 * 1024,
+        .keep_alive = false,
+        .max_keep_alive_requests = 1,
+        .max_body_size = 0,
+        .read_timeout_ms = 5000,
+        .idle_timeout_ms = 5000,
+        .tcp_nodelay = false,
+    };
+
+    var shutdown = std.atomic.Value(bool).init(false);
+    const listen_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+
+    var w = try Worker.init(testing.allocator, disp, opts, listen_addr, &shutdown);
+    defer w.deinit();
+
+    for (w.slots) |s| {
+        try testing.expectEqual(@as(usize, 0), s.read_buf.len);
+        try testing.expectEqual(@as(usize, 0), s.write_buf.len);
+    }
+}
+
+test "evented slot ensureBuffers allocates once and is idempotent" {
+    var slot = Slot.init(std.testing.allocator, 16 * 1024, 8 * 1024);
+    defer slot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), slot.read_buf.len);
+    try slot.ensureBuffers(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 16 * 1024), slot.read_buf.len);
+    try std.testing.expectEqual(@as(usize, 8 * 1024), slot.write_buf.len);
+    const rptr = slot.read_buf.ptr;
+    const wptr = slot.write_buf.ptr;
+    try slot.ensureBuffers(std.testing.allocator); // idempotent — no realloc
+    try std.testing.expectEqual(rptr, slot.read_buf.ptr);
+    try std.testing.expectEqual(wptr, slot.write_buf.ptr);
 }
