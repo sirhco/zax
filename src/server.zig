@@ -161,6 +161,13 @@ pub const Options = struct {
     /// latency tail. 0 = unbounded (default; unchanged behavior). A good starting
     /// value is roughly the core count.
     max_in_flight: usize = 0,
+    /// Sleep (ms) between re-polls of a not-ready (`chunk(0)`) pull-stream
+    /// producer on the threaded backend; 0 = legacy busy-loop.
+    stream_repoll_ms: u32 = 5,
+    /// Whole-stream idle cap (ms): close a threaded pull stream that has
+    /// produced no data for this long; 0 = disabled. Hard-close (truncate,
+    /// no chunked terminator).
+    stream_idle_timeout_ms: u32 = 0,
 };
 
 /// Options for the evented backend (`serveEvented`).
@@ -648,14 +655,14 @@ pub fn App(comptime AppState: type) type {
 
                 var hs: [request.max_headers]Header = undefined;
                 var parsed = readHead(&cr, &hs, read_to, idle_to) catch |e| {
-                    terminalResponse(w, e);
+                    terminalResponse(io, w, e);
                     break;
                 };
 
                 const t_head: i96 = if (comptime build_options.trace_latency) nowNs(io) else 0;
 
                 readBody(&cr, &parsed, self.opts.max_body_size, read_to) catch |e| {
-                    terminalResponse(w, e);
+                    terminalResponse(io, w, e);
                     break;
                 };
                 const consumed = parsed.head_len + parsed.body_consumed;
@@ -679,7 +686,7 @@ pub fn App(comptime AppState: type) type {
                 const streamed = resp.streamer != null or resp.pull_streamer != null;
                 const chunked = streamed and persistent;
                 resp.keep_alive = persistent and !streamed; // unchanged for buffered; streamed head driven by writeHead(chunked)
-                if (!writeResponse(w, resp, chunked)) break;
+                if (!writeResponse(w, resp, chunked, io, self.opts.stream_repoll_ms, self.opts.stream_idle_timeout_ms)) break;
 
                 if (comptime build_options.trace_latency) {
                     const t_write = nowNs(io);
@@ -772,15 +779,26 @@ pub fn App(comptime AppState: type) type {
 }
 
 /// Write and flush a response; returns false on a write error (caller closes).
-fn writeResponse(w: *Io.Writer, resp: Response, chunked: bool) bool {
+fn writeResponse(w: *Io.Writer, resp: Response, chunked: bool, io: Io, repoll_ms: u32, idle_ms: u32) bool {
     // Pull-streamed response: loop next(buf) writing chunks to the blocking writer.
     if (resp.pull_streamer) |ps| {
         resp.writeHead(w, chunked) catch return false;
         var chunk_buf: [4096]u8 = undefined;
+        var last_produce: i96 = nowNs(io); // idle window starts at stream start
         while (true) {
             switch (ps.next(&chunk_buf)) {
                 .chunk => |n| {
-                    if (n == 0) continue; // empty chunk: call next again (busy-loop unchanged on threaded)
+                    if (n == 0) {
+                        // Whole-stream idle cap: no data for too long → hard close (truncate).
+                        if (idle_ms != 0 and nowNs(io) - last_produce > @as(i96, idle_ms) * 1_000_000) {
+                            w.flush() catch {}; // push head bytes to client before truncating
+                            return false; // caller closes; NO terminator
+                        }
+                        if (repoll_ms != 0)
+                            Io.sleep(io, Io.Duration.fromMilliseconds(repoll_ms), .awake) catch {};
+                        continue;
+                    }
+                    last_produce = nowNs(io); // real data resets the idle window
                     if (chunked) {
                         chunked_mod.writeChunk(w, chunk_buf[0..n]) catch return false;
                     } else {
@@ -979,13 +997,13 @@ fn readBody(cr: *ConnReader, parsed: *parser.Parsed, max_body: usize, read_to: I
 }
 
 /// Send the terminal response for a RequestError (or nothing for Closed).
-fn terminalResponse(w: *Io.Writer, e: RequestError) void {
+fn terminalResponse(io: Io, w: *Io.Writer, e: RequestError) void {
     switch (e) {
-        error.HeaderFieldsTooLarge => _ = writeResponse(w, Response.fromStatus(.request_header_fields_too_large), false),
-        error.BodyTooLarge => _ = writeResponse(w, Response.fromStatus(.payload_too_large), false),
-        error.Timeout => _ = writeResponse(w, Response.fromStatus(.request_timeout), false),
-        error.Malformed => _ = writeResponse(w, Response.fromStatus(.bad_request), false),
-        error.MalformedBody => _ = writeResponse(w, Response.fromStatus(.bad_request), false),
+        error.HeaderFieldsTooLarge => _ = writeResponse(w, Response.fromStatus(.request_header_fields_too_large), false, io, 0, 0),
+        error.BodyTooLarge => _ = writeResponse(w, Response.fromStatus(.payload_too_large), false, io, 0, 0),
+        error.Timeout => _ = writeResponse(w, Response.fromStatus(.request_timeout), false, io, 0, 0),
+        error.Malformed => _ = writeResponse(w, Response.fromStatus(.bad_request), false, io, 0, 0),
+        error.MalformedBody => _ = writeResponse(w, Response.fromStatus(.bad_request), false, io, 0, 0),
         error.Closed => {},
     }
 }
@@ -2893,4 +2911,191 @@ test "serveEvented: request_id generated and echoed" {
     app.requestShutdown(shutdown_threaded.io());
     srv_thread.join();
     try testing.expect(serve_ctx.err == null);
+}
+
+// ---------------------------------------------------------------------------
+// Threaded pull-stream backoff + idle-cap tests
+// ---------------------------------------------------------------------------
+
+/// A counter-driven pull producer for the backoff tests.
+/// Behaviour is controlled by two counters:
+///   - `zeros_left`: how many chunk(0) calls before we return real data
+///   - chunks are returned from `payloads[payload_idx]` in order, then .done
+const BackoffProducer = struct {
+    zeros_left: usize,
+    payload_idx: usize,
+    payloads: []const []const u8,
+
+    fn next(self: *BackoffProducer, buf: []u8) response.PullResult {
+        if (self.zeros_left > 0) {
+            self.zeros_left -= 1;
+            return .{ .chunk = 0 };
+        }
+        if (self.payload_idx >= self.payloads.len) return .done;
+        const p = self.payloads[self.payload_idx];
+        self.payload_idx += 1;
+        @memcpy(buf[0..p.len], p);
+        return .{ .chunk = p.len };
+    }
+};
+
+fn backoffHandler(a: @import("extract/alloc.zig").Alloc) !Response {
+    const c = try a.value.create(BackoffProducer);
+    c.* = .{ .zeros_left = 2, .payload_idx = 0, .payloads = &[_][]const u8{ "hello", "world" } };
+    return Response.streamPull(BackoffProducer, c, BackoffProducer.next, "text/plain");
+}
+
+/// A producer that returns chunk(0) forever (idle-cap test).
+const InfiniteZeroProducer = struct {
+    fn next(_: *InfiniteZeroProducer, _: []u8) response.PullResult {
+        return .{ .chunk = 0 };
+    }
+};
+
+fn idleCapHandler(a: @import("extract/alloc.zig").Alloc) !Response {
+    const c = try a.value.create(InfiniteZeroProducer);
+    c.* = .{};
+    return Response.streamPull(InfiniteZeroProducer, c, InfiniteZeroProducer.next, "text/plain");
+}
+
+/// A producer that returns chunk(0) once then "ok" then .done.
+const ZeroOnceThenOkProducer = struct {
+    called: bool = false,
+    done: bool = false,
+
+    fn next(self: *ZeroOnceThenOkProducer, buf: []u8) response.PullResult {
+        if (!self.called) {
+            self.called = true;
+            return .{ .chunk = 0 };
+        }
+        if (!self.done) {
+            self.done = true;
+            const p = "ok";
+            @memcpy(buf[0..p.len], p);
+            return .{ .chunk = p.len };
+        }
+        return .done;
+    }
+};
+
+fn zeroOnceThenOkHandler(a: @import("extract/alloc.zig").Alloc) !Response {
+    const c = try a.value.create(ZeroOnceThenOkProducer);
+    c.* = .{};
+    return Response.streamPull(ZeroOnceThenOkProducer, c, ZeroOnceThenOkProducer.next, "text/plain");
+}
+
+test "threaded pull-stream backoff: chunk(0) x2 then data completes correctly" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{ .stream_repoll_ms = 1, .idle_timeout_ms = 50 });
+    defer app.deinit();
+    try app.get("/backoff", backoffHandler);
+
+    const port: u16 = 18210;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    cw.interface.writeAll("GET /backoff HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+
+    var out: [4096]u8 = undefined;
+    const r = readChunkedResp(&cr.interface, &out);
+
+    try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "transfer-encoding: chunked") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "hello") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "world") != null);
+    // The stream must end with the chunked terminator.
+    try testing.expect(std.mem.indexOf(u8, r, "0\r\n\r\n") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "threaded pull-stream idle cap: truncates without chunked terminator" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    // idle cap of 5 ms; repoll every 1 ms so the cap fires quickly.
+    var app = try TestApp.init(testing.allocator, &db, .{ .stream_repoll_ms = 1, .stream_idle_timeout_ms = 5, .idle_timeout_ms = 50 });
+    defer app.deinit();
+    try app.get("/idle", idleCapHandler);
+
+    const port: u16 = 18211;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    cw.interface.writeAll("GET /idle HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+
+    // Read until the connection closes (idle cap triggers hard close).
+    var total: usize = 0;
+    while (true) {
+        cr.interface.fillMore() catch break;
+        total = cr.interface.buffered().len;
+    }
+    const received = cr.interface.buffered()[0..total];
+
+    // Must contain 200 OK header.
+    try testing.expect(std.mem.indexOf(u8, received, "200 OK") != null);
+    // Must NOT contain the chunked terminator (truncated).
+    try testing.expect(std.mem.indexOf(u8, received, "0\r\n\r\n") == null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "threaded pull-stream repoll_ms=0: no-sleep path still completes" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    // repoll_ms=0 → legacy busy-loop; stream still completes.
+    var app = try TestApp.init(testing.allocator, &db, .{ .stream_repoll_ms = 0, .idle_timeout_ms = 50 });
+    defer app.deinit();
+    try app.get("/legacy", zeroOnceThenOkHandler);
+
+    const port: u16 = 18212;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    cw.interface.writeAll("GET /legacy HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+
+    var out: [4096]u8 = undefined;
+    const r = readChunkedResp(&cr.interface, &out);
+
+    try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "ok") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "0\r\n\r\n") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
 }
