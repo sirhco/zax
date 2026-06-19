@@ -39,6 +39,11 @@ pub fn main(init: std.process.Init) !void {
   (`sched_getaffinity` / online CPUs), so it respects `taskset`/cgroup/container limits.
 - `max_connections: usize = 1024` — per-worker cap; excess connections are shed (accept+close).
 
+**Lazy connection buffers.** Each worker's per-connection read/write buffers are allocated on the
+first accept into a slot and retained for reuse, so an idle worker commits almost no per-connection
+memory. The footprint grows with the peak number of concurrent connections (high-water-mark) rather
+than `max_connections × buffer size`. `max_connections` is the cap, not an upfront commitment.
+
 The rest comes from the app's existing `Options` (buffer sizes, `keep_alive`,
 `max_keep_alive_requests`, `max_body_size`, `read_timeout_ms`, `idle_timeout_ms`, `tcp_nodelay`,
 `request_id`).

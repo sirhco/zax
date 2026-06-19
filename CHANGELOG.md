@@ -4,6 +4,12 @@ All notable changes to zax are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Evented reactor: per-connection buffers are now allocated lazily on first use and retained, instead of preallocated for the whole pool — idle RSS drops dramatically (footprint tracks peak concurrent connections; `max_connections` stays the cap).
+
 ## [0.7.0] - 2026-06-19
 
 ### Changed

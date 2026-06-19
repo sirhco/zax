@@ -460,4 +460,8 @@ p99.9 ≈ 0.87 ms vs threaded's macOS-loopback 35 ms tail). Tunable via
 `EventedOptions.workers` and `Options.max_connections`; a lazy slot-buffer allocation
 would cut the idle footprint.
 
+> **Note:** the `zax-ev` ~478 MB above predates the lazy-slot-buffer change
+> (`docs/superpowers/specs/2026-06-19-evented-lazy-slots-design.md`); re-run to refresh —
+> evented idle RSS is now small and grows with concurrent connections.
+
 (Regenerate: `cd benchmarks/cross && ./run.sh` — `BACKEND=both` to include evented.)
