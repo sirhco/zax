@@ -74,6 +74,7 @@ pub const WorkerOpts = struct {
     read_timeout_ms: u32,
     idle_timeout_ms: u32,
     stream_repoll_ms: u32 = 5,
+    stream_idle_timeout_ms: u32 = 0,
     tcp_nodelay: bool,
     /// If nonzero, set SO_SNDBUF to this value on each accepted socket.
     /// 0 = system default (no override).  Useful in tests to force write
@@ -758,6 +759,7 @@ fn applyConnConfig(conn: *Conn, opts: WorkerOpts) void {
     conn.read_timeout_ms = opts.read_timeout_ms;
     conn.idle_timeout_ms = opts.idle_timeout_ms;
     conn.stream_repoll_ms = opts.stream_repoll_ms;
+    conn.stream_idle_timeout_ms = opts.stream_idle_timeout_ms;
 }
 
 /// Set O_NONBLOCK + O_CLOEXEC on `fd` via fcntl.  macOS/BSD only.
@@ -1272,4 +1274,29 @@ test "worker: stream_repoll_ms propagates from WorkerOpts to conn (default=5, cu
         applyConnConfig(&c, opts);
         try testing.expectEqual(@as(u32, 99), c.stream_repoll_ms);
     }
+}
+
+test "worker: stream_idle_timeout_ms propagates from WorkerOpts to conn" {
+    // Drives applyConnConfig — ensures the new stream_idle_timeout_ms field
+    // lands on Conn so a dropped assignment is caught before any behavior lands.
+    const testing = std.testing;
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = conn_mod.Conn.init(&rbuf, &wbuf, &arena);
+    const opts = WorkerOpts{
+        .read_buffer_size = 4096,
+        .write_buffer_size = 4096,
+        .keep_alive = false,
+        .max_keep_alive_requests = 1,
+        .max_body_size = 0,
+        .read_timeout_ms = 5000,
+        .idle_timeout_ms = 5000,
+        .tcp_nodelay = false,
+        .stream_idle_timeout_ms = 1234,
+    };
+    applyConnConfig(&c, opts);
+    try testing.expectEqual(@as(u32, 1234), c.stream_idle_timeout_ms);
 }

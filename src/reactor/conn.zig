@@ -202,6 +202,12 @@ pub const Conn = struct {
     /// 0 = disabled — fall back to old `.want_write` behavior (busy-spin).
     /// Default 5 ms is a constant backoff; future: exponential backoff capped at idle_timeout.
     stream_repoll_ms: u32 = 5,
+    /// Whole-stream idle cap (ms): close a pull stream that has produced no
+    /// data for this long. 0 disables (default — no cap, legacy behavior).
+    stream_idle_timeout_ms: u32 = 0,
+    /// Monotonic stamp (ns) of the last real chunk produced; also set at
+    /// stream start. Only read when `stream_idle_timeout_ms != 0`.
+    last_produce_ns: i96 = 0,
     /// When true, the active pull stream is framed as chunked transfer-encoding
     /// and the connection is kept alive after the terminator. Set at dispatch
     /// from `persistent`; cleared on each keep-alive reset.
