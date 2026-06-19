@@ -14,6 +14,7 @@ pub const Method = request.Method;
 pub const Header = request.Header;
 pub const Response = response.Response;
 pub const sse = @import("http/sse.zig");
+pub const chunked = @import("http/chunked.zig");
 pub const Sse = sse.Sse;
 pub const SseEvent = sse.Event;
 pub const Writer = std.Io.Writer;
