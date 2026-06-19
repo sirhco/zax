@@ -125,6 +125,10 @@ pub fn monotonicNow() i96 {
 }
 
 pub const Conn = struct {
+    /// Front bytes of `write_buf` reserved for a chunk's `<hexlen>\r\n` header so a
+    /// producer chunk can be framed in place without shifting its data.
+    const chunk_hdr_reserve: usize = 16;
+
     state: State = .reading_head,
 
     /// Caller-owned read buffer (lent from the worker pool).
@@ -198,6 +202,10 @@ pub const Conn = struct {
     /// 0 = disabled — fall back to old `.want_write` behavior (busy-spin).
     /// Default 5 ms is a constant backoff; future: exponential backoff capped at idle_timeout.
     stream_repoll_ms: u32 = 5,
+    /// When true, the active pull stream is framed as chunked transfer-encoding
+    /// and the connection is kept alive after the terminator. Set at dispatch
+    /// from `persistent`; cleared on each keep-alive reset.
+    stream_chunked: bool = false,
     /// Absolute monotonic deadline in nanoseconds for the current state.
     /// Set by step() on state entry; read by the worker's timer wheel via
     /// `conn.deadline_ns`. Sentinel `no_deadline` means no active deadline.
@@ -347,9 +355,9 @@ pub const Conn = struct {
     /// Serialize only the response HEAD (no body, no content-length) into `write_buf`.
     /// Used for pull-streamed responses. Returns `error.ResponseTooLarge` if the
     /// head does not fit in `write_buf`.
-    pub fn serializeHead(self: *Conn, resp: Response) error{ResponseTooLarge}!usize {
+    pub fn serializeHead(self: *Conn, resp: Response, chunked: bool) error{ResponseTooLarge}!usize {
         var w = std.Io.Writer.fixed(self.write_buf);
-        resp.writeHead(&w, false) catch {
+        resp.writeHead(&w, chunked) catch {
             self.w_len = w.end;
             self.w_off = 0;
             return error.ResponseTooLarge;
@@ -377,6 +385,38 @@ pub const Conn = struct {
             .would_block => return .want_write,
             .closed => return .closed,
         }
+    }
+
+    /// Buffer slice handed to the producer's `next`. When chunked, reserve the
+    /// header prefix and a 2-byte CRLF suffix so the chunk can be framed in place.
+    fn pullDst(self: *Conn) []u8 {
+        if (self.stream_chunked) return self.write_buf[chunk_hdr_reserve .. self.write_buf.len - 2];
+        return self.write_buf;
+    }
+
+    /// After the producer wrote `n` bytes at `write_buf[chunk_hdr_reserve..]`,
+    /// frame them as `<hexlen>\r\n<data>\r\n` in place and set w_off/w_len.
+    fn frameChunk(self: *Conn, n: usize) void {
+        var hbuf: [chunk_hdr_reserve]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&hbuf, "{x}\r\n", .{n}) catch unreachable; // fits: n < buf.len
+        const data_start = chunk_hdr_reserve;
+        const hdr_start = data_start - hdr.len;
+        @memcpy(self.write_buf[hdr_start..data_start], hdr);
+        self.write_buf[data_start + n] = '\r';
+        self.write_buf[data_start + n + 1] = '\n';
+        self.w_off = hdr_start;
+        self.w_len = data_start + n + 2;
+    }
+
+    /// Load the chunked end-of-stream terminator into write_buf and clear the
+    /// streamer so the normal wrote_all path runs (served++ + keep-alive).
+    fn loadChunkedTerminator(self: *Conn) void {
+        const term = "0\r\n\r\n";
+        @memcpy(self.write_buf[0..term.len], term);
+        self.w_off = 0;
+        self.w_len = term.len;
+        self.pull_streamer = null;
+        self.deadline_ns = no_deadline;
     }
 
     // -----------------------------------------------------------------------
@@ -459,20 +499,23 @@ pub const Conn = struct {
                             // The legacy push `streamer` keeps buffer-or-500 behavior on
                             // the evented path (see comment below).
                             if (resp.pull_streamer) |ps| {
-                                // Serialize HEAD only (no content-length); connection-close.
-                                resp.keep_alive = false;
+                                // Chunked transfer-encoding + keep-alive when the request is
+                                // persistent; otherwise legacy connection-close raw framing.
+                                self.stream_chunked = persistent;
+                                resp.keep_alive = persistent; // header disposition (writeHead(chunked) drives the actual line)
                                 if (self.on_response) |hook| hook(&p.request, &resp);
-                                if (self.serializeHead(resp)) |_| {} else |_| {
+                                if (self.serializeHead(resp, self.stream_chunked)) |_| {} else |_| {
                                     // Head won't fit (extremely small write_buf) — 500 + close.
                                     var e500 = Response.fromStatus(.internal_server_error);
                                     e500.keep_alive = false;
                                     _ = self.serializeResponse(e500) catch {};
+                                    self.stream_chunked = false;
                                     self.close_after_write = true;
                                     self.state = .writing;
                                     continue;
                                 }
                                 self.pull_streamer = ps;
-                                self.close_after_write = true; // always close after stream
+                                self.close_after_write = !self.stream_chunked; // chunked → keep-alive after terminator
                                 self.state = .writing; // pump the head first
                                 continue;
                             }
@@ -523,7 +566,7 @@ pub const Conn = struct {
                     // immediately (empty chunk — producer signalled 0 bytes this call).
                     if (self.w_len == 0) {
                         if (self.pull_streamer) |ps| {
-                            switch (ps.next(self.write_buf)) {
+                            switch (ps.next(self.pullDst())) {
                                 .chunk => |n| {
                                     if (n == 0) {
                                         // Producer not ready yet (sparse stream, e.g. SSE).
@@ -537,15 +580,26 @@ pub const Conn = struct {
                                         self.deadline_ns = monotonicNow() + @as(i96, self.stream_repoll_ms) * 1_000_000;
                                         return .want_stream_repoll;
                                     }
-                                    self.w_off = 0;
-                                    self.w_len = n;
+                                    if (self.stream_chunked) {
+                                        self.frameChunk(n);
+                                    } else {
+                                        self.w_off = 0;
+                                        self.w_len = n;
+                                    }
                                     self.deadline_ns = no_deadline; // re-arm per-chunk stall deadline
                                 },
                                 .done => {
-                                    self.pull_streamer = null;
-                                    self.served += 1;
-                                    self.state = .closing;
-                                    return .done_close;
+                                    if (self.stream_chunked) {
+                                        // Load terminator; fall through to pumpWrite. Once it
+                                        // writes, the wrote_all path (pull_streamer now null)
+                                        // does served++ + keep-alive.
+                                        self.loadChunkedTerminator();
+                                    } else {
+                                        self.pull_streamer = null;
+                                        self.served += 1;
+                                        self.state = .closing;
+                                        return .done_close;
+                                    }
                                 },
                                 .err => {
                                     self.pull_streamer = null;
@@ -571,7 +625,7 @@ pub const Conn = struct {
                             // Pull-streaming: head (or last chunk) fully written.
                             // Load the next chunk into write_buf and keep pumping.
                             if (self.pull_streamer) |ps| {
-                                switch (ps.next(self.write_buf)) {
+                                switch (ps.next(self.pullDst())) {
                                     .chunk => |n| {
                                         if (n == 0) {
                                             // Producer not ready yet (sparse stream, e.g. SSE).
@@ -587,13 +641,22 @@ pub const Conn = struct {
                                             self.deadline_ns = monotonicNow() + @as(i96, self.stream_repoll_ms) * 1_000_000;
                                             return .want_stream_repoll;
                                         }
-                                        self.w_off = 0;
-                                        self.w_len = n;
+                                        if (self.stream_chunked) {
+                                            self.frameChunk(n);
+                                        } else {
+                                            self.w_off = 0;
+                                            self.w_len = n;
+                                        }
                                         self.deadline_ns = no_deadline; // re-arm per-chunk stall deadline
                                         // Stay in .writing; loop calls pumpWrite for this chunk.
                                         continue;
                                     },
                                     .done => {
+                                        if (self.stream_chunked) {
+                                            // Pump terminator; wrote_all (streamer null) → served++ + keep-alive.
+                                            self.loadChunkedTerminator();
+                                            continue;
+                                        }
                                         // Stream finished — close.
                                         self.pull_streamer = null;
                                         self.served += 1;
@@ -618,6 +681,7 @@ pub const Conn = struct {
                             }
                             // Keep-alive: reset for next request.
                             self.close_after_write = false;
+                            self.stream_chunked = false;
                             _ = self.arena.reset(.retain_capacity);
                             self.compact();
                             self.state = .reading_head;
@@ -1462,7 +1526,7 @@ test "conn: pull streamer — partial write mid-chunk advances w_off, no bytes l
         defer sz_arena.deinit();
         var sz_c = Conn.init(&sz_rbuf, &sz_wbuf, &sz_arena);
         const head_resp = Response{ .content_type = "text/plain", .keep_alive = false };
-        break :blk try sz_c.serializeHead(head_resp);
+        break :blk try sz_c.serializeHead(head_resp, false);
     };
     // Threshold: write head fully, then 4 bytes into the 11-byte chunk.
     // Requires: head_size + 4 < head_size + 11.  Always true since 4 < 11.
@@ -2005,4 +2069,111 @@ test "conn: ssePull producer — events flush, not_ready parks (want_stream_repo
     const p1 = std.mem.indexOf(u8, written, "data: one") orelse return error.TestUnexpectedResult;
     const p2 = std.mem.indexOf(u8, written, "data: two") orelse return error.TestUnexpectedResult;
     try testing.expect(p1 < p2);
+}
+
+// ---------------------------------------------------------------------------
+// Task 4 (chunked-streaming) tests — chunked framing + keep-alive on evented
+// ---------------------------------------------------------------------------
+
+test "conn: chunked streamPull on a persistent request — chunked head, framed body, second request served" {
+    const TwoChunk = struct {
+        i: usize = 0,
+        fn next(c: *@This(), buf: []u8) response_mod.PullResult {
+            const chunks = [_][]const u8{ "one", "two" };
+            if (c.i >= chunks.len) return .done;
+            const ch = chunks[c.i];
+            c.i += 1;
+            @memcpy(buf[0..ch.len], ch);
+            return .{ .chunk = ch.len };
+        }
+    };
+    // Two pipelined persistent requests on one connection.
+    const raw = "GET /s HTTP/1.1\r\nHost: x\r\n\r\nGET /s HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var ctx1 = TwoChunk{};
+    var ctx2 = TwoChunk{};
+    const Disp = struct {
+        a: *TwoChunk,
+        b: *TwoChunk,
+        n: usize = 0,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req;
+            _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            const c = if (s.n == 0) s.a else s.b;
+            s.n += 1;
+            return Response.streamPull(TwoChunk, c, TwoChunk.next, "text/plain");
+        }
+    };
+    var sd = Disp{ .a = &ctx1, .b = &ctx2 };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = Disp.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = true; // persistent
+    const t = ft.transport();
+
+    var guard: usize = 0;
+    var result = c.step(t, d);
+    while (result != .done_close and guard < 100) : (guard += 1) {
+        if (result == .want_read) break; // entered keep-alive idle after first stream + pipelined consumed
+        result = c.step(t, d);
+    }
+
+    const out = ft.written.items;
+    // Chunked head + framed chunks + terminator for the FIRST stream.
+    try testing.expect(std.mem.indexOf(u8, out, "transfer-encoding: chunked") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "connection: keep-alive") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "3\r\none\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "3\r\ntwo\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "0\r\n\r\n") != null);
+    // Second request was dispatched (proves the connection survived the stream).
+    try testing.expectEqual(@as(usize, 2), sd.n);
+}
+
+test "conn: streamPull on a Connection: close request stays connection-close (no chunked)" {
+    const OneChunk = struct {
+        done: bool = false,
+        fn next(c: *@This(), buf: []u8) response_mod.PullResult {
+            if (c.done) return .done;
+            c.done = true;
+            @memcpy(buf[0..3], "abc");
+            return .{ .chunk = 3 };
+        }
+    };
+    const raw = "GET /s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ctx = OneChunk{};
+    const Disp = struct {
+        p: *OneChunk,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req;
+            _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.streamPull(OneChunk, s.p, OneChunk.next, "text/plain");
+        }
+    };
+    var sd = Disp{ .p = &ctx };
+    const d = Dispatcher{ .ctx = &sd, .dispatchFn = Disp.dispatch };
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = true;
+    const t = ft.transport();
+    var guard: usize = 0;
+    var result = c.step(t, d);
+    while (result != .done_close and guard < 50) : (guard += 1) result = c.step(t, d);
+    const out = ft.written.items;
+    try testing.expect(std.mem.indexOf(u8, out, "connection: close") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "transfer-encoding") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "abc") != null); // raw body, not framed
+    try testing.expectEqual(StepResult.done_close, result);
 }
