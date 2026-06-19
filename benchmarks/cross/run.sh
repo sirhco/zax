@@ -326,7 +326,7 @@ for pass in "${PASSES[@]}"; do
   esac
   env ${kv:+"$kv"} ${steal_kv:+"$steal_kv"} $srv_pin $cmd >/dev/null 2>&1 &
   pid=$!
-  trap 'kill "$pid" 2>/dev/null || true; kill "${sampler:-}" 2>/dev/null || true; stop_hog' EXIT
+  trap 'kill "$pid" 2>/dev/null || true; kill "${sampler:-}" 2>/dev/null || true; rm -f "${rssfile:-}"; stop_hog' EXIT
   # wait for readiness
   for _ in $(seq 1 50); do
     curl -fs "http://127.0.0.1:$port/" >/dev/null 2>&1 && break
