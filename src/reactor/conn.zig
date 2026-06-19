@@ -1365,6 +1365,103 @@ test "conn: step — body over max_body_size → 413 payload_too_large" {
     try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 413"));
 }
 
+test "conn: step — chunked POST + pipelined GET → encoded length advance is correct" {
+    // Chunked body "hello world" (11 bytes decoded) encoded as:
+    //   "6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n"  (28 bytes encoded)
+    // Immediately followed on the wire by a second pipelined GET.
+    // If r_start advances by the DECODED length (11) instead of the ENCODED
+    // length (28) the second request will be mis-parsed or fail.
+    const chunked_body = "6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n";
+    const req1 = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        chunked_body;
+    const req2 = "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n";
+    const both = req1 ++ req2;
+
+    var ft = FakeTransport.init(testing.allocator, &.{both});
+    defer ft.deinit();
+
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Dispatcher that records the last dispatched body (heap-allocated so it
+    // outlives the arena reset between requests).
+    const BodyCtx = struct {
+        body: []const u8 = "",
+        allocator: std.mem.Allocator,
+
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = ar;
+            const self: *@This() = @ptrCast(@alignCast(self_ctx));
+            // Free prior copy.
+            if (self.body.len > 0) self.allocator.free(self.body);
+            self.body = self.allocator.dupe(u8, req.body) catch "";
+            return Response.text(req.path);
+        }
+    };
+    var bctx = BodyCtx{ .allocator = testing.allocator };
+    defer if (bctx.body.len > 0) testing.allocator.free(bctx.body);
+    const d = Dispatcher{ .ctx = &bctx, .dispatchFn = BodyCtx.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = true;
+    c.max_keep_alive_requests = 10;
+
+    const t = ft.transport();
+
+    // One step should: parse + dispatch req1, then see req2 buffered, parse +
+    // dispatch req2, then hit want_read (no more data).
+    var result: StepResult = .want_read;
+    for (0..30) |_| {
+        result = c.step(t, d);
+        if (result == .want_read or result == .done_close) break;
+    }
+    try testing.expectEqual(StepResult.want_read, result);
+
+    // Two requests must have been served.
+    try testing.expectEqual(@as(usize, 2), c.served);
+
+    // First request decoded body must be "hello world".
+    // bctx.body now holds the LAST dispatched body (req2 has no body → "").
+    // We verify via the written responses: req1 → /up, req2 → /ping both 200.
+    const written = ft.written.items;
+    try testing.expect(std.mem.count(u8, written, "HTTP/1.1 200 ") == 2);
+    // /ping appears only if r_start advanced past the full encoded chunked body.
+    try testing.expect(std.mem.indexOf(u8, written, "/ping") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "/up") != null);
+}
+
+test "conn: step — chunked body over max_body_size → 413 payload_too_large" {
+    // Chunked encoding of "hello world!" (12 bytes) in one chunk.
+    // With max_body_size=8 the decoder hits .too_large → 413.
+    const head = "POST /data HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const chunked_body = "c\r\nhello world!\r\n0\r\n\r\n"; // 12-byte payload, hex c
+
+    var ft = FakeTransport.init(testing.allocator, &.{ head, chunked_body });
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.max_body_size = 8; // smaller than 12-byte decoded body
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    var result: StepResult = .want_read;
+    for (0..20) |_| {
+        result = c.step(t, d);
+        if (result == .done_close) break;
+    }
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 413"));
+}
+
 test "conn: onDeadline while reading_head → 408 + want_write + close flag" {
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
