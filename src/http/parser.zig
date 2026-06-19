@@ -30,6 +30,10 @@ pub const Parsed = struct {
     /// Number of bytes consumed by the head (request line + headers + final
     /// CRLF). Body bytes, if any, begin at `buffer[head_len..]`.
     head_len: usize,
+    /// Encoded body bytes after the head: the Content-Length value, or the full
+    /// encoded length of a chunked body. The stream advances by
+    /// `head_len + body_consumed`. parseHead leaves 0; readBody sets it.
+    body_consumed: usize = 0,
 };
 
 /// Parse the request head from `buffer`. Header storage is written into
