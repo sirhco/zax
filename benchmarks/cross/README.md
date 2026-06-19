@@ -139,6 +139,15 @@ oversubscription) → pursue the bounded-worker-pool theme
 (`docs/superpowers/specs/2026-06-17-evented-io-decision.md`). If zax's tail collapses
 toward axum/go off-box, it was mostly same-host contention.
 
+## Methodology
+
+### Memory
+
+The harness samples each server's resident set size via `ps` — idle RSS
+(at rest, right after readiness) and peak RSS (max during the load run) — and prints a
+separate MEMORY table. Each server is a single process, so the figure is whole-server
+resident memory. Portable across macOS and Linux/Docker.
+
 ## Toolchains
 
 - zax: Zig 0.16.0 (`zig build -Doptimize=ReleaseFast`)

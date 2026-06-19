@@ -223,6 +223,25 @@ FRAMEWORKS=(
   "httpz 8084 ./httpz/zig-out/bin/httpz-bench"
 )
 
+# rss_kb <pid> — resident set size in KB, or empty if the process is gone.
+# `ps -o rss=` prints KB on both macOS (BSD ps) and Linux (procps).
+rss_kb() { ps -o rss= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# sample_peak <pid> <outfile> — poll RSS ~2x/sec, keep the running max in outfile.
+# Exits when the process is gone.
+sample_peak() {
+  local max=0 cur
+  while cur=$(rss_kb "$1"); do
+    [ -z "$cur" ] && break
+    [ "$cur" -gt "$max" ] && max="$cur"
+    printf '%s' "$max" > "$2"
+    sleep 0.5
+  done
+}
+
+# kb_to_mb <kb> — KB→MB with one decimal (awk; no bc/locale dependency).
+kb_to_mb() { awk -v k="${1:-0}" 'BEGIN{printf "%.1f", k/1024}'; }
+
 # drive <name> <scenario> <url> [method] [data]
 # Warmup (discarded) then a measured run; appends "name|scenario|reqs|p50|p99" to
 # ROWS. For oha the metrics are parsed into the summary table; wrk/bombardier
@@ -292,6 +311,8 @@ for entry in "${FRAMEWORKS[@]}"; do
   fi
 done
 
+MEM=()
+
 for pass in "${PASSES[@]}"; do
   IFS='|' read -r name port kv cmd <<<"$pass"
   echo
@@ -305,18 +326,31 @@ for pass in "${PASSES[@]}"; do
   esac
   env ${kv:+"$kv"} ${steal_kv:+"$steal_kv"} $srv_pin $cmd >/dev/null 2>&1 &
   pid=$!
-  trap 'kill "$pid" 2>/dev/null || true; stop_hog' EXIT
+  trap 'kill "$pid" 2>/dev/null || true; kill "${sampler:-}" 2>/dev/null || true; rm -f "${rssfile:-}"; stop_hog' EXIT
   # wait for readiness
   for _ in $(seq 1 50); do
     curl -fs "http://127.0.0.1:$port/" >/dev/null 2>&1 && break
     sleep 0.1
   done
 
+  # --- memory: idle RSS (at rest, post-readiness) + background peak sampler ---
+  rssfile=$(mktemp)
+  idle_kb=$(rss_kb "$pid")
+  printf '%s' "${idle_kb:-0}" > "$rssfile"
+  sample_peak "$pid" "$rssfile" & sampler=$!
+
   start_hog
   drive "$name" static "http://127.0.0.1:$port/"
   drive "$name" param  "http://127.0.0.1:$port/users/42"
   drive "$name" json   "http://127.0.0.1:$port/echo" POST '{"msg":"hi"}'
   stop_hog
+
+  # --- memory: stop sampler, read peak, record idle+peak in MB ---
+  kill "$sampler" 2>/dev/null || true
+  wait "$sampler" 2>/dev/null || true
+  peak_kb=$(cat "$rssfile" 2>/dev/null)
+  rm -f "$rssfile"
+  MEM+=("$name|$(kb_to_mb "${idle_kb:-0}")|$(kb_to_mb "${peak_kb:-0}")")
 
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
@@ -339,3 +373,12 @@ echo "(p50/p99/p99.9/max parsed from oha; copy into results.md. RAW=1 for full o
 [ "${INFLIGHT:-0}" != 0 ] && echo "(INFLIGHT=$INFLIGHT: compare zax vs zax-cap on P99.9/MAX — cap flattens the thread-per-conn tail.)"
 [ "$BACKEND" = both ] && echo "(BACKEND=both: compare zax (threaded) vs zax-ev (evented epoll reactor) — throughput + tail.)"
 [ "$BACKEND" = evented ] && echo "(BACKEND=evented: evented epoll reactor only.)"
+
+echo
+echo "==================== MEMORY (RSS) ===================="
+printf '%-8s %10s %10s\n' "FRAMEWORK" "IDLE(MB)" "PEAK(MB)"
+for row in "${MEM[@]}"; do
+  IFS='|' read -r f i p <<<"$row"
+  printf '%-8s %10s %10s\n' "$f" "$i" "$p"
+done
+echo "(RSS via ps: idle = post-readiness at rest, peak = max under load; one process per server.)"
