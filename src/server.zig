@@ -30,6 +30,7 @@ const request = @import("http/request.zig");
 const Header = request.Header;
 const response = @import("http/response.zig");
 const Response = response.Response;
+const chunked_mod = @import("http/chunked.zig");
 const parser = @import("http/parser.zig");
 const router = @import("router/router.zig");
 const radix = @import("router/radix.zig");
@@ -651,7 +652,7 @@ pub fn App(comptime AppState: type) type {
 
                 // Chunked request bodies are unsupported: reject and close.
                 if (parsed.request.isChunked()) {
-                    _ = writeResponse(w, Response.fromStatus(.length_required));
+                    _ = writeResponse(w, Response.fromStatus(.length_required), false);
                     break;
                 }
 
@@ -678,8 +679,9 @@ pub fn App(comptime AppState: type) type {
                     resp = resp.withHeader(arena.allocator(), "x-request-id", rid) catch resp;
                 }
                 const streamed = resp.streamer != null or resp.pull_streamer != null;
-                resp.keep_alive = persistent and !streamed;
-                if (!writeResponse(w, resp)) break;
+                const chunked = streamed and persistent;
+                resp.keep_alive = persistent and !streamed; // unchanged for buffered; streamed head driven by writeHead(chunked)
+                if (!writeResponse(w, resp, chunked)) break;
 
                 if (comptime build_options.trace_latency) {
                     const t_write = nowNs(io);
@@ -702,7 +704,7 @@ pub fn App(comptime AppState: type) type {
                     };
                     for (self.observers.items) |obs| obs.func(obs.context, rec);
                 }
-                if (streamed) break; // connection-close framing: close after a stream
+                if (streamed and !chunked) break; // close only after a connection-close stream
 
                 cr.consume(consumed);
                 served += 1;
@@ -772,28 +774,40 @@ pub fn App(comptime AppState: type) type {
 }
 
 /// Write and flush a response; returns false on a write error (caller closes).
-fn writeResponse(w: *Io.Writer, resp: Response) bool {
+fn writeResponse(w: *Io.Writer, resp: Response, chunked: bool) bool {
     // Pull-streamed response: loop next(buf) writing chunks to the blocking writer.
     if (resp.pull_streamer) |ps| {
-        resp.writeHead(w, false) catch return false;
+        resp.writeHead(w, chunked) catch return false;
         var chunk_buf: [4096]u8 = undefined;
         while (true) {
             switch (ps.next(&chunk_buf)) {
                 .chunk => |n| {
-                    if (n == 0) continue; // empty chunk: call next again
-                    w.writeAll(chunk_buf[0..n]) catch return false;
+                    if (n == 0) continue; // empty chunk: call next again (busy-loop unchanged on threaded)
+                    if (chunked) {
+                        chunked_mod.writeChunk(w, chunk_buf[0..n]) catch return false;
+                    } else {
+                        w.writeAll(chunk_buf[0..n]) catch return false;
+                    }
                 },
                 .done => break,
                 .err => return false,
             }
         }
+        if (chunked) chunked_mod.writeTerminator(w) catch return false;
         w.flush() catch return false;
         return true;
     }
     // Push-streamed response: func writes directly to the connection writer.
     if (resp.streamer) |s| {
-        resp.writeHead(w, false) catch return false;
-        s.func(s.context, w) catch return false;
+        resp.writeHead(w, chunked) catch return false;
+        if (chunked) {
+            var cw_buf: [4096]u8 = undefined;
+            var cw = chunked_mod.ChunkedWriter.init(w, &cw_buf);
+            s.func(s.context, cw.writer()) catch return false;
+            cw.finish() catch return false;
+        } else {
+            s.func(s.context, w) catch return false;
+        }
         w.flush() catch return false;
         return true;
     }
@@ -946,10 +960,10 @@ fn readBody(cr: *ConnReader, parsed: *parser.Parsed, max_body: usize, read_to: I
 /// Send the terminal response for a RequestError (or nothing for Closed).
 fn terminalResponse(w: *Io.Writer, e: RequestError) void {
     switch (e) {
-        error.HeaderFieldsTooLarge => _ = writeResponse(w, Response.fromStatus(.request_header_fields_too_large)),
-        error.BodyTooLarge => _ = writeResponse(w, Response.fromStatus(.payload_too_large)),
-        error.Timeout => _ = writeResponse(w, Response.fromStatus(.request_timeout)),
-        error.Malformed => _ = writeResponse(w, Response.fromStatus(.bad_request)),
+        error.HeaderFieldsTooLarge => _ = writeResponse(w, Response.fromStatus(.request_header_fields_too_large), false),
+        error.BodyTooLarge => _ = writeResponse(w, Response.fromStatus(.payload_too_large), false),
+        error.Timeout => _ = writeResponse(w, Response.fromStatus(.request_timeout), false),
+        error.Malformed => _ = writeResponse(w, Response.fromStatus(.bad_request), false),
         error.Closed => {},
     }
 }
@@ -1722,7 +1736,7 @@ test "streaming: connection-close streamed body over a real connection" {
     defer cs.close(io);
     var wb: [128]u8 = undefined;
     var cw = cs.writer(io, &wb);
-    cw.interface.writeAll("GET /stream HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.writeAll("GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") catch unreachable;
     cw.interface.flush() catch unreachable;
 
     // Read to EOF (the server closes after a streamed, connection-close response).
@@ -1771,7 +1785,7 @@ test "sse: event stream over a real connection" {
     defer cs.close(io);
     var wb: [128]u8 = undefined;
     var cw = cs.writer(io, &wb);
-    cw.interface.writeAll("GET /events HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.writeAll("GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") catch unreachable;
     cw.interface.flush() catch unreachable;
 
     var rb: [4096]u8 = undefined;
@@ -2364,6 +2378,94 @@ test "max_in_flight: default (0) is unbounded — all requests succeed" {
     // concurrent clients each sleeping 5 ms, at least 2 must overlap.  This
     // makes the capped test's `<= 2` assertion meaningful by contrast.
     try testing.expect(state.max_seen.load(.acquire) >= 2);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+// ---------------------------------------------------------------------------
+// Chunked-streaming + keep-alive tests (threaded backend)
+// ---------------------------------------------------------------------------
+
+/// Read exactly one chunked HTTP response from `r`: headers + body up to and
+/// including the `0\r\n\r\n` terminator. Copies into `out` and consumes from
+/// the reader buffer. Returns the slice of `out` that was filled.
+fn readChunkedResp(r: *Io.Reader, out: []u8) []const u8 {
+    // Fill until we have the full header block.
+    while (std.mem.indexOf(u8, r.buffered(), "\r\n\r\n") == null) {
+        r.fillMore() catch break;
+    }
+    // Fill until we have the chunked terminator "0\r\n\r\n".
+    while (std.mem.indexOf(u8, r.buffered(), "0\r\n\r\n") == null) {
+        r.fillMore() catch break;
+    }
+    const term = (std.mem.indexOf(u8, r.buffered(), "0\r\n\r\n") orelse return out[0..0]) + 5;
+    const total = @min(term, out.len);
+    @memcpy(out[0..total], r.buffered()[0..total]);
+    r.toss(total);
+    return out[0..total];
+}
+
+const TwoChunks = struct { n: usize };
+fn twoChunksNext(c: *TwoChunks, buf: []u8) response.PullResult {
+    if (c.n == 0) return .done;
+    const payload = if (c.n == 2) "one" else "two";
+    c.n -= 1;
+    @memcpy(buf[0..payload.len], payload);
+    return .{ .chunk = payload.len };
+}
+fn twoChunksPullHandler(a: @import("extract/alloc.zig").Alloc) !Response {
+    const c = try a.value.create(TwoChunks);
+    c.* = .{ .n = 2 };
+    return Response.streamPull(TwoChunks, c, twoChunksNext, "text/plain");
+}
+
+test "streaming: persistent pull-stream uses chunked framing and keeps connection alive" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/chunks", twoChunksPullHandler);
+    try app.get("/ping", pingHandler);
+
+    const port: u16 = 18200;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    // First request: persistent HTTP/1.1 to the pull-stream route.
+    cw.interface.writeAll("GET /chunks HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+
+    var out1: [2048]u8 = undefined;
+    const r1 = readChunkedResp(&cr.interface, &out1);
+
+    // Response head must advertise chunked + keep-alive.
+    try testing.expect(std.mem.indexOf(u8, r1, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "transfer-encoding: chunked") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "connection: keep-alive") != null);
+
+    // Body must contain the two framed chunks and the terminator.
+    try testing.expect(std.mem.indexOf(u8, r1, "3\r\none\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "3\r\ntwo\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, r1, "0\r\n\r\n") != null);
+
+    // Second request on the SAME connection — proves keep-alive worked.
+    cw.interface.writeAll("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var out2: [1024]u8 = undefined;
+    const r2 = readResp(&cr.interface, &out2);
+    try testing.expect(std.mem.indexOf(u8, r2, "200 OK") != null);
+    try testing.expect(std.mem.endsWith(u8, r2, "pong"));
 
     app.requestShutdown(io);
     loop_fut.await(io);
