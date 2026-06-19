@@ -132,6 +132,14 @@ connection is then reused for the next request. HTTP/1.0 clients, `Connection: c
 framing. This applies to all streaming APIs (`stream`, `sse`, `streamPull`, `ssePull`) on both
 backends; a not-ready (`chunk(0)`) producer never emits a zero-length chunk (only end-of-stream does).
 
+### Inbound chunked request bodies
+
+Inbound `Transfer-Encoding: chunked` request bodies are now **decoded on both backends** and
+delivered to handlers as the normal `ctx.req.body` slice. This replaces the previous 411 rejection.
+The decoded body is bounded by `max_body_size` (decoded length) and the read buffer (encoded length);
+chunk extensions and trailer headers are tolerated but not surfaced to handlers. Malformed framing
+yields a 400 response; exceeding size limits yields 413.
+
 ## Limitations
 
 See "Evented backend status" in `docs/superpowers/specs/2026-06-17-evented-reactor-design.md`.

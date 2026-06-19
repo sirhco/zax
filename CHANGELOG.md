@@ -9,6 +9,7 @@ All notable changes to zax are documented here. The format is based on
 ### Added
 
 - Evented reactor: `EventedOptions.stream_idle_timeout_ms` — opt-in whole-stream idle cap that hard-closes a pull stream (`streamPull`/`ssePull`) producing no data for N ms (default 0 = disabled).
+- Inbound `Transfer-Encoding: chunked` request bodies are now decoded on both backends (previously rejected with 411). Bounded by `max_body_size`; chunk extensions and trailers tolerated; malformed framing → 400.
 
 ## [0.5.0] - 2026-06-18
 
