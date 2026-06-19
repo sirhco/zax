@@ -86,17 +86,18 @@ fn download(body: *Body) zax.Response {
 ready yet (sparse/long-idle streams, e.g. SSE waiting on external events), or `.done` at end.
 Streamed responses use connection-close framing (the connection closes after the body).
 
-On the evented backend a `.chunk = 0` parks the connection on the timer wheel and re-polls
-after `EventedOptions.stream_repoll_ms` (default 5 ms; `0` = the legacy busy behavior) — it
-does **not** busy-spin the reactor (since v0.3.0), so sparse SSE works on evented. Note the
-`sse()` helper and the push `stream` streamer are Writer-based and **threaded-only**; for SSE
-on the evented backend, drive `streamPull` directly or use `ssePull` (below).
+On both backends, a `.chunk = 0` parks the connection and re-polls after `Options.stream_repoll_ms`
+(default 5 ms; `0` = legacy busy behavior) — it does **not** busy-spin (since v0.3.0 on evented,
+now also on threaded). Note the `sse()` helper and the push `stream` streamer are Writer-based
+and **threaded-only**; for SSE on the evented backend, drive `streamPull` directly or use
+`ssePull` (below). Both backends achieve full parity on pull-stream backoff and idle-cap.
 
-`EventedOptions.stream_idle_timeout_ms` (default `0` = disabled) hard-closes a pull stream
+`Options.stream_idle_timeout_ms` (default `0` = disabled) hard-closes a pull stream
 (`streamPull` / `ssePull`) that produces no data for that many milliseconds. When triggered,
 the connection is truncated (no `0\r\n\r\n` chunked terminator) so the client detects an
 incomplete stream. This composes with `stream_repoll_ms` — the re-poll cadence is the check
-granularity. Evented backend only.
+granularity. Both backends support these knobs (on threaded via base `Options`, on evented
+via `EventedOptions`).
 
 ### Server-Sent Events on the evented backend
 
@@ -118,10 +119,9 @@ fn events(feed: *Feed) zax.Response {
 }
 ```
 
-`not_ready` emits a 0-byte chunk: on evented it parks the connection and re-polls after
-`stream_repoll_ms`; on threaded it loops, so for sparse streams on the threaded backend prefer
-the push `sse()` helper. A single event larger than the write buffer yields an error and closes
-the connection.
+`not_ready` emits a 0-byte chunk: on both backends it parks the connection and re-polls after
+`stream_repoll_ms`, so sparse streams are efficiently handled on both backends. A single event
+larger than the write buffer yields an error and closes the connection.
 
 ### Keep-alive after a stream (chunked transfer-encoding)
 
