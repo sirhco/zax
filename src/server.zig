@@ -654,17 +654,11 @@ pub fn App(comptime AppState: type) type {
 
                 const t_head: i96 = if (comptime build_options.trace_latency) nowNs(io) else 0;
 
-                // Chunked request bodies are unsupported: reject and close.
-                if (parsed.request.isChunked()) {
-                    _ = writeResponse(w, Response.fromStatus(.length_required), false);
-                    break;
-                }
-
                 readBody(&cr, &parsed, self.opts.max_body_size, read_to) catch |e| {
                     terminalResponse(w, e);
                     break;
                 };
-                const consumed = parsed.head_len + parsed.request.body.len;
+                const consumed = parsed.head_len + parsed.body_consumed;
 
                 const t_body: i96 = if (comptime build_options.trace_latency) nowNs(io) else 0;
 
@@ -921,6 +915,7 @@ const RequestError = error{
     BodyTooLarge, // -> 413
     Timeout, // -> 408
     Malformed, // -> 400
+    MalformedBody, // -> 400
     Closed, // -> close, no response
 };
 
@@ -944,9 +939,30 @@ fn readHead(cr: *ConnReader, hs: *[request.max_headers]Header, read_to: Io.Timeo
     }
 }
 
-/// Validate Content-Length against the effective limit, then fill until the body
-/// is buffered and attach it as a zero-copy slice.
+/// Read and attach the request body. Branches on chunked vs Content-Length.
+/// Sets `parsed.body_consumed` on both paths so the stream can advance past
+/// the encoded bytes (head_len + body_consumed).
 fn readBody(cr: *ConnReader, parsed: *parser.Parsed, max_body: usize, read_to: Io.Timeout) RequestError!void {
+    if (parsed.request.isChunked()) {
+        const max = max_body; // bounds decoded length (0 = unbounded)
+        while (true) {
+            const enc = cr.buffered()[parsed.head_len..];
+            switch (chunked_mod.decodeInPlace(@constCast(enc), max)) {
+                .done => |d| {
+                    parsed.request.body = cr.buffered()[parsed.head_len .. parsed.head_len + d.body_len];
+                    parsed.body_consumed = d.consumed;
+                    return;
+                },
+                .incomplete => cr.fill(read_to) catch |e| switch (e) {
+                    error.Timeout => return error.Timeout,
+                    error.BufferFull => return error.BodyTooLarge,
+                    error.Closed => return error.Closed,
+                },
+                .malformed => return error.MalformedBody,
+                .too_large => return error.BodyTooLarge,
+            }
+        }
+    }
     const clen = parsed.request.contentLength() orelse return;
     const buf_bound = cr.buf.len - parsed.head_len;
     const limit = if (max_body == 0) buf_bound else @min(max_body, buf_bound);
@@ -959,6 +975,7 @@ fn readBody(cr: *ConnReader, parsed: *parser.Parsed, max_body: usize, read_to: I
         };
     }
     parsed.request.body = cr.buffered()[parsed.head_len .. parsed.head_len + clen];
+    parsed.body_consumed = clen;
 }
 
 /// Send the terminal response for a RequestError (or nothing for Closed).
@@ -968,6 +985,7 @@ fn terminalResponse(w: *Io.Writer, e: RequestError) void {
         error.BodyTooLarge => _ = writeResponse(w, Response.fromStatus(.payload_too_large), false),
         error.Timeout => _ = writeResponse(w, Response.fromStatus(.request_timeout), false),
         error.Malformed => _ = writeResponse(w, Response.fromStatus(.bad_request), false),
+        error.MalformedBody => _ = writeResponse(w, Response.fromStatus(.bad_request), false),
         error.Closed => {},
     }
 }
@@ -981,6 +999,7 @@ const State = @import("extract/state.zig").State;
 const Forwarded = @import("extract/forwarded.zig").Forwarded;
 const Form = @import("extract/form.zig").Form;
 const Cookies = @import("extract/cookie.zig").Cookies;
+const Bytes = @import("extract/bytes.zig").Bytes;
 
 const Db = struct { msg: []const u8 };
 const TestApp = App(*const Db);
@@ -992,6 +1011,9 @@ fn echoId(p: Path(struct { id: u64 })) Response {
     // Body borrows: format into a static-ish buffer is unsafe; return fixed text
     // proving the param parsed. (id is validated by reaching here.)
     return if (p.value.id == 42) Response.text("forty-two") else Response.fromStatus(.not_found);
+}
+fn echoBody(b: Bytes) Response {
+    return Response.text(b.value);
 }
 
 fn parseClen(head: []const u8) usize {
@@ -1156,7 +1178,7 @@ test "keep-alive: Connection: close ends the connection" {
     loop_fut.await(io);
 }
 
-test "keep-alive: chunked request body is rejected with 411" {
+test "keep-alive: chunked request body is decoded and connection reused" {
     var threaded = Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -1164,14 +1186,57 @@ test "keep-alive: chunked request body is rejected with 411" {
     var db = Db{ .msg = "pong" };
     var app = try TestApp.init(testing.allocator, &db, .{});
     defer app.deinit();
-    try app.post("/ping", pingHandler);
+    try app.post("/echo", echoBody);
+    try app.get("/ping", pingHandler);
 
     const port: u16 = 18093;
     var loop_fut = startTestApp(io, &app, port);
 
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    // Chunked POST: "hello" + " world" = "hello world".
+    cw.interface.writeAll("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var out1: [1024]u8 = undefined;
+    const resp1 = readResp(&cr.interface, &out1);
+    try testing.expect(std.mem.indexOf(u8, resp1, "200 OK") != null);
+    try testing.expect(std.mem.endsWith(u8, resp1, "hello world"));
+    try testing.expect(std.mem.indexOf(u8, resp1, "connection: keep-alive") != null);
+
+    // Second request on the SAME connection proves keep-alive survived.
+    cw.interface.writeAll("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n") catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var out2: [1024]u8 = undefined;
+    const resp2 = readResp(&cr.interface, &out2);
+    try testing.expect(std.mem.indexOf(u8, resp2, "200 OK") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "keep-alive: malformed chunked body is rejected with 400" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.post("/echo", echoBody);
+
+    const port: u16 = 18096;
+    var loop_fut = startTestApp(io, &app, port);
+
     var rb: [2048]u8 = undefined;
-    const resp = doRequest(io, port, "POST /ping HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", &rb);
-    try testing.expect(std.mem.indexOf(u8, resp, "411 Length Required") != null);
+    // "zz" is not a valid hex chunk-size → malformed.
+    const resp = doRequest(io, port, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nbad\r\n0\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, resp, "400") != null);
 
     app.requestShutdown(io);
     loop_fut.await(io);
