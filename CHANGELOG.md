@@ -4,7 +4,7 @@ All notable changes to zax are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [0.4.0] - 2026-06-18
+## [Unreleased]
 
 ### Added
 
@@ -12,6 +12,11 @@ All notable changes to zax are documented here. The format is based on
   `streamPull`, `ssePull`) now use `Transfer-Encoding: chunked` and keep the connection alive for
   HTTP/1.1 persistent clients, on both backends; connection-close framing remains the fallback
   for HTTP/1.0 / `Connection: close` / keep-alive-disabled.
+
+## [0.4.0] - 2026-06-18
+
+### Added
+
 - **`Response.ssePull` — pull-model Server-Sent Events.** Emits SSE on **both** backends
   (the push `sse()` helper remains threaded-only). `nextFn(*Ctx) -> SsePull` returns
   `{ event, comment, not_ready, done }`; zax frames each event/comment via the SSE wire
