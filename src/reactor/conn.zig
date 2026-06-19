@@ -2305,7 +2305,7 @@ test "stream idle cap: chunk(0) past window hard-closes (no terminator)" {
     try testing.expectEqual(StepResult.done_close, r);
     try testing.expectEqual(State.closing, c.state);
     // No chunked terminator written (truncate, not clean close).
-    try testing.expect(!std.mem.endsWith(u8, c.write_buf[0..c.w_len], "0\r\n\r\n"));
+    try testing.expect(std.mem.indexOf(u8, ft.written.items, "0\r\n\r\n") == null);
 }
 
 test "stream idle cap: real chunk resets window, subsequent chunk(0) parks (not closes)" {
@@ -2346,14 +2346,11 @@ test "stream idle cap: real chunk resets window, subsequent chunk(0) parks (not 
     // Back-date so cap WOULD fire if last_produce_ns isn't reset by the real chunk.
     c.last_produce_ns = monotonicNow() - 50 * std.time.ns_per_ms;
 
-    // Fire timer → step: chunk(0) cap check (old stamp → fires cap before real chunk).
-    // But wait — ctx.calls==1 means the NEXT call is the real chunk call (#2).
-    // Reorder: re-drive timer, step delivers real chunk "hello", updates last_produce_ns.
+    // Cap check lives inside the n==0 branch; a real chunk (n>0) bypasses it entirely and
+    // resets last_produce_ns. So back-dating before a real-chunk step cannot trigger the cap.
     _ = c.onDeadline();
     const r2 = c.step(t, d);
-    // The real chunk should be delivered; since done follows immediately, r2 == done_close.
-    // But we want to verify cap didn't fire. If cap had fired we'd get done_close WITH no data.
-    // If real chunk served and done: done_close WITH data. Check "hello" in written.
+    // Real chunk "hello" delivered, then done → done_close. "hello" in written confirms cap didn't fire.
     try testing.expectEqual(StepResult.done_close, r2);
     const written = ft.written.items;
     try testing.expect(std.mem.indexOf(u8, written, "hello") != null);
@@ -2451,5 +2448,5 @@ test "stream idle cap: busy-spin path (repoll_ms==0) + cap fires → done_close"
     try testing.expectEqual(StepResult.done_close, r);
     try testing.expectEqual(State.closing, c.state);
     // No terminator.
-    try testing.expect(!std.mem.endsWith(u8, c.write_buf[0..c.w_len], "0\r\n\r\n"));
+    try testing.expect(std.mem.indexOf(u8, ft.written.items, "0\r\n\r\n") == null);
 }
