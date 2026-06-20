@@ -211,6 +211,18 @@ pub const Conn = struct {
     /// and the connection is kept alive after the terminator. Set at dispatch
     /// from `persistent`; cleared on each keep-alive reset.
     stream_chunked: bool = false,
+
+    // -----------------------------------------------------------------------
+    // Task 1: large buffered body pump fields
+    // -----------------------------------------------------------------------
+
+    /// Slice of the response body to pump in place after the head has been sent.
+    /// Set when a buffered response body overflows `write_buf`; cleared on
+    /// keep-alive reset. No copy: points directly into the arena-allocated body.
+    pending_body: []const u8 = &.{},
+    /// When true, `pumpWrite` drains `pending_body` instead of `write_buf`.
+    /// False during head phase; set to true once the head is fully written.
+    body_phase: bool = false,
     /// Absolute monotonic deadline in nanoseconds for the current state.
     /// Set by step() on state entry; read by the worker's timer wheel via
     /// `conn.deadline_ns`. Sentinel `no_deadline` means no active deadline.
@@ -407,7 +419,27 @@ pub const Conn = struct {
         return self.w_len;
     }
 
-    /// Drive a non-blocking write of `write_buf[w_off..w_len]` through `t`.
+    /// Serialize the response HEAD with `content-length: resp.body.len` into
+    /// `write_buf` (no body bytes). Used to send the head of a large buffered
+    /// response before pumping the body in place. Returns `error.ResponseTooLarge`
+    /// if the head itself does not fit in `write_buf`.
+    fn serializeHeadWithLen(self: *Conn, resp: Response) error{ResponseTooLarge}!usize {
+        var w = std.Io.Writer.fixed(self.write_buf);
+        resp.writeHeaders(&w, resp.body.len) catch {
+            self.w_len = w.end;
+            self.w_off = 0;
+            return error.ResponseTooLarge;
+        };
+        self.w_len = w.end;
+        self.w_off = 0;
+        return self.w_len;
+    }
+
+    /// Drive a non-blocking write through `t`.
+    ///
+    /// When `body_phase` is false (head phase): drains `write_buf[w_off..w_len]`.
+    /// When `body_phase` is true (body phase): drains `pending_body[w_off..w_len]`
+    /// (no copy; w_off/w_len index directly into the slice).
     ///
     /// - `.ok n` → advance `w_off` by `n`; if `w_off == w_len` → `.wrote_all`.
     ///   A partial write (n < remaining) is treated like `.would_block` — the
@@ -415,7 +447,10 @@ pub const Conn = struct {
     /// - `.would_block` → `.want_write` (resume next time the fd is writable).
     /// - `.closed` → `.closed`.
     pub fn pumpWrite(self: *Conn, t: Transport) enum { wrote_all, want_write, closed } {
-        const remaining = self.write_buf[self.w_off..self.w_len];
+        const remaining: []const u8 = if (self.body_phase)
+            self.pending_body[self.w_off..self.w_len]
+        else
+            self.write_buf[self.w_off..self.w_len];
         switch (t.write(remaining)) {
             .ok => |n| {
                 self.w_off += n;
@@ -581,11 +616,20 @@ pub const Conn = struct {
                                     self.close_after_write = true;
                                 }
                             } else |_| {
-                                // Response overflowed write_buf — synthesize a 500 and close.
-                                var e500 = Response.fromStatus(.internal_server_error);
-                                e500.keep_alive = false;
-                                _ = self.serializeResponse(e500) catch {};
-                                self.close_after_write = true;
+                                // Response body overflowed write_buf — send the head from
+                                // write_buf, then pump the body in place (no copy).
+                                // Only fall back to 500 if the head itself overflows.
+                                if (self.serializeHeadWithLen(resp)) |_| {
+                                    self.pending_body = resp.body;
+                                    self.body_phase = false; // head first; body_phase set after wrote_all
+                                    if (!persistent) self.close_after_write = true;
+                                } else |_| {
+                                    // Head too large — synthesize 500 and close.
+                                    var e500 = Response.fromStatus(.internal_server_error);
+                                    e500.keep_alive = false;
+                                    _ = self.serializeResponse(e500) catch {};
+                                    self.close_after_write = true;
+                                }
                             }
 
                             self.state = .writing;
@@ -737,6 +781,14 @@ pub const Conn = struct {
                                 }
                             }
 
+                            // Large-body pump: head just finished — switch to body phase.
+                            if (self.pending_body.len > 0 and !self.body_phase) {
+                                self.body_phase = true;
+                                self.w_off = 0;
+                                self.w_len = self.pending_body.len;
+                                continue; // loop back to pumpWrite with body_phase=true
+                            }
+
                             // Normal (non-streaming) path.
                             // Count this request regardless of keep-alive disposition.
                             self.served += 1;
@@ -747,6 +799,8 @@ pub const Conn = struct {
                             // Keep-alive: reset for next request.
                             self.close_after_write = false;
                             self.stream_chunked = false;
+                            self.pending_body = &.{};
+                            self.body_phase = false;
                             _ = self.arena.reset(.retain_capacity);
                             self.compact();
                             self.state = .reading_head;
@@ -2648,4 +2702,216 @@ test "stream idle cap: busy-spin path (repoll_ms==0) + cap fires → done_close"
     try testing.expectEqual(State.closing, c.state);
     // No terminator.
     try testing.expect(std.mem.indexOf(u8, ft.written.items, "0\r\n\r\n") == null);
+}
+
+// ---------------------------------------------------------------------------
+// Task 1: large buffered body pump tests
+// ---------------------------------------------------------------------------
+
+test "conn: large buffered body — head + body pumped in place, no 500" {
+    // write_buf is 128 bytes (enough for the head ~97B, not for head+body).
+    // The response body is 1000 bytes — serializeResponse overflows → new path.
+    // serializeHeadWithLen writes the head into write_buf, pending_body is
+    // drained via pumpWrite across writable events.
+    // We block the write once mid-body to force multiple steps.
+    //
+    // Assert: full 200 + content-length: 1000 + all 1000 body bytes, no "500".
+
+    // Build a 1000-byte body.
+    var body_buf: [1000]u8 = undefined;
+    @memset(&body_buf, 'Z');
+    const body: []const u8 = &body_buf;
+
+    const raw = "GET /big HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+    // Block after the first 150 bytes written (lands inside the body).
+    ft.write_block_after_bytes = 150;
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [128]u8 = undefined; // fits head (~97B) but NOT head+body together
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const LargeDispatch = struct {
+        b: []const u8,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.text(s.b);
+        }
+    };
+    var ld = LargeDispatch{ .b = body };
+    const d = Dispatcher{ .ctx = &ld, .dispatchFn = LargeDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    const t = ft.transport();
+
+    // Drive until done (allow up to 50 steps to drain head + 1000B body with backpressure).
+    var result: StepResult = undefined;
+    for (0..50) |_| {
+        result = c.step(t, d);
+        if (result == .done_close) break;
+        if (result != .want_write) break; // unexpected — bail
+    }
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    // Must be a 200, not a 500.
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200"));
+    // Must contain content-length: 1000.
+    try testing.expect(std.mem.indexOf(u8, written, "content-length: 1000") != null);
+    // All 1000 'Z' bytes must appear in the body (contiguous block).
+    try testing.expect(std.mem.indexOf(u8, written, body) != null);
+    // No 500 anywhere.
+    try testing.expect(std.mem.indexOf(u8, written, "500") == null);
+}
+
+test "conn: large buffered body — pipelined second request served after state reset" {
+    // Two pipelined requests, each returning a 500-byte body (> 128B write_buf).
+    // After the first large response, the keep-alive reset must clear pending_body
+    // and body_phase so the second request serves correctly.
+
+    var body_buf: [500]u8 = undefined;
+    @memset(&body_buf, 'Y');
+    const body: []const u8 = &body_buf;
+
+    const req1 = "GET /r1 HTTP/1.1\r\nHost: x\r\n\r\n";
+    const req2 = "GET /r2 HTTP/1.1\r\nHost: x\r\n\r\n";
+    // Feed both requests as two read chunks.
+    var ft = FakeTransport.init(testing.allocator, &.{ req1, req2 });
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [128]u8 = undefined; // fits head (~97B) but NOT head+body (500B)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const PipeDispatch = struct {
+        b: []const u8,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.text(s.b);
+        }
+    };
+    var pd = PipeDispatch{ .b = body };
+    const d = Dispatcher{ .ctx = &pd, .dispatchFn = PipeDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = true;
+    c.max_keep_alive_requests = 10;
+    const t = ft.transport();
+
+    // Drive until the connection closes (both requests served, then reads .closed).
+    // With large bodies over a 128B write_buf, many want_write iterations needed.
+    var result: StepResult = undefined;
+    for (0..200) |_| {
+        result = c.step(t, d);
+        if (result == .done_close) break;
+        // want_read and want_write both loop — keep driving.
+    }
+
+    // Both requests must be served (served counter incremented twice).
+    // We check the written output contains two 200 responses with body.
+    const written = ft.written.items;
+    try testing.expect(std.mem.count(u8, written, "HTTP/1.1 200") == 2);
+    // content-length: 500 must appear twice.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, written, "content-length: 500"));
+    // No 500 anywhere in the status line (distinguish "500 Internal" from "content-length: 500").
+    try testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 500") == null);
+    // All body bytes present (at least 2 × 500 = 1000 'Y' bytes).
+    var y_count: usize = 0;
+    for (written) |b| if (b == 'Y') { y_count += 1; };
+    try testing.expectEqual(@as(usize, 1000), y_count);
+}
+
+test "conn: small buffered response — fast path unchanged, pending_body stays empty" {
+    // A response that fits in write_buf (64B write_buf, tiny body) must NOT set
+    // pending_body — the original one-shot serializeResponse path must be used.
+
+    const raw = "GET /small HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [512]u8 = undefined; // big enough for a small response
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const SmallDispatch = struct {
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = self_ctx; _ = req; _ = ar;
+            return Response.text("hi");
+        }
+    };
+    var sd_ctx: SmallDispatch = .{};
+    const d = Dispatcher{ .ctx = &sd_ctx, .dispatchFn = SmallDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    const t = ft.transport();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    // Fast path: pending_body must be empty (never set).
+    try testing.expectEqual(@as(usize, 0), c.pending_body.len);
+    // Must be a valid 200 with "hi" in body.
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, written, "hi") != null);
+    // No 500.
+    try testing.expect(std.mem.indexOf(u8, written, "500") == null);
+}
+
+test "conn: oversized HEAD — falls back to 500 and closes" {
+    // write_buf is only 4 bytes — even the HTTP/1.1 status line won't fit.
+    // serializeHeadWithLen must fail → fall back to 500 + close.
+    // (The 500 itself is synthesized with keep_alive=false; if it also overflows,
+    //  the conn closes without writing. Either way, no hang and no partial response.)
+
+    const raw = "GET /huge HTTP/1.1\r\nHost: x\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4]u8 = undefined; // absurdly small — head overflows
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Response body too large for write_buf (and head too large too).
+    var body_buf: [200]u8 = undefined;
+    @memset(&body_buf, 'W');
+
+    const HugeDispatch = struct {
+        b: []const u8,
+        fn dispatch(self_ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = req; _ = ar;
+            const s: *@This() = @ptrCast(@alignCast(self_ctx));
+            return Response.text(s.b);
+        }
+    };
+    var hd = HugeDispatch{ .b = &body_buf };
+    const d = Dispatcher{ .ctx = &hd, .dispatchFn = HugeDispatch.dispatch };
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    c.keep_alive = false;
+    const t = ft.transport();
+
+    // Drive until done or stuck.
+    var result: StepResult = undefined;
+    for (0..10) |_| {
+        result = c.step(t, d);
+        if (result == .done_close) break;
+    }
+    try testing.expectEqual(StepResult.done_close, result);
+
+    // The connection must have closed (no infinite loop).
+    // If the 500 itself fit (unlikely with 4B buf) it would contain "500";
+    // if it didn't fit we simply closed. Either is acceptable — no 200, no hang.
+    const written = ft.written.items;
+    // Must NOT be a 200 OK.
+    try testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 200") == null);
 }

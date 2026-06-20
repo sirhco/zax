@@ -145,6 +145,13 @@ The decoded body is bounded by `max_body_size` (decoded length) and the read buf
 chunk extensions and trailer headers are tolerated but not surfaced to handlers. Malformed framing
 yields a 400 response; exceeding size limits yields 413.
 
+## Responses
+
+**Buffered responses of any size.** A buffered (non-streamed) response larger than the write
+buffer is sent by writing the head from the write buffer and then streaming the body in place
+across writable events — no fixed cap and no copy. (Previously such responses returned 500 on
+the evented backend.)
+
 ## Limitations
 
 See "Evented backend status" in `docs/superpowers/specs/2026-06-17-evented-reactor-design.md`.

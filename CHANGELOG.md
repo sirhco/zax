@@ -10,6 +10,10 @@ All notable changes to zax are documented here. The format is based on
 
 - Evented reactor: per-connection buffers are now allocated lazily on first use and retained, instead of preallocated for the whole pool — idle RSS drops dramatically (footprint tracks peak concurrent connections; `max_connections` stays the cap).
 
+### Fixed
+
+- Evented reactor: buffered (non-streamed) responses larger than the write buffer (default 8 KB) are now sent correctly — the head is written from the buffer and the body is streamed in place — instead of returning 500. The threaded backend was unaffected.
+
 ## [0.7.0] - 2026-06-19
 
 ### Changed
