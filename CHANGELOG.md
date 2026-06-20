@@ -6,6 +6,10 @@ All notable changes to zax are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Full standard HTTP status set as `Status` variants, plus `Response.fromCode(u16)` for arbitrary/non-standard codes (the `Status` enum is now non-exhaustive). Expanded the canonical `Error` set (`Gone`, `UnsupportedMediaType`, `NotAcceptable`, `PreconditionFailed`, `BadGateway`, `GatewayTimeout`) with `classify` mappings.
+
 ### Changed
 
 - Evented reactor: per-connection buffers are now allocated lazily on first use and retained, instead of preallocated for the whole pool — idle RSS drops dramatically (footprint tracks peak concurrent connections; `max_connections` stays the cap).

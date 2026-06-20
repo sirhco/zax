@@ -346,7 +346,12 @@ app.onError(&renderError); // applies to extractor, handler, 404, and 405 respon
 
 Note: classification keys off the error value, so handlers should use the
 canonical `zax.Error` set; an unrecognized error is treated as `500`, and
-`on_error` can re-classify by inspecting the raw error.
+`on_error` can re-classify by inspecting the raw error. The full standard HTTP
+status set is supported as `Status` variants (`.gone`, `.unsupported_media_type`,
+`.not_acceptable`, `.precondition_failed`, `.bad_gateway`, `.gateway_timeout`,
+and more). For arbitrary or non-standard codes, use `Response.fromCode(u16)`.
+The expanded `zax.Error` set covers all common handler-facing statuses; each
+variant maps to a canonical status via `classify`.
 
 ## Responses
 
@@ -527,7 +532,10 @@ comparison against `std.http.Server`, http.zig, or non-Zig servers exists yet.
 
 A focused HTTP/1.1 framework. **Shipped:** routing, comptime extractors,
 keep-alive, middleware, graceful drain, HTTPS via reverse-proxy termination
-(forwarded-header trust), request size limits, and read/idle timeouts.
+(forwarded-header trust), request size limits, read/idle timeouts, and full
+standard HTTP status support (the `Status` enum covers all IANA-registered codes;
+`Response.fromCode(u16)` handles non-standard codes; the `zax.Error` set covers
+all common handler-facing statuses).
 
 Streaming is full-featured: push (`stream`/`sse`) and pull
 (`streamPull`/`ssePull`) bodies, `Transfer-Encoding: chunked` with keep-alive,
