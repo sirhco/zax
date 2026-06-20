@@ -145,6 +145,11 @@ The decoded body is bounded by `max_body_size` (decoded length) and the read buf
 chunk extensions and trailer headers are tolerated but not surfaced to handlers. Malformed framing
 yields a 400 response; exceeding size limits yields 413.
 
+**Request framing validation (RFC 7230 §3.3.3).** Both backends reject ambiguous request framing
+to prevent HTTP request smuggling: a request with both `Content-Length` and `Transfer-Encoding`
+headers, or with duplicate `Content-Length` / multiple `Transfer-Encoding` headers, receives a
+`400 Bad Request` response and the connection is closed. This applies to all inbound requests.
+
 ## Responses
 
 **Buffered responses of any size.** A buffered (non-streamed) response larger than the write

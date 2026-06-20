@@ -4,6 +4,12 @@ All notable changes to zax are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- Reject ambiguous request framing with `400 Bad Request` — a request carrying both `Content-Length` and `Transfer-Encoding`, or duplicate `Content-Length` / multiple `Transfer-Encoding` headers (RFC 7230 §3.3.3) — to prevent HTTP request smuggling. Both backends.
+
 ## [0.8.0] - 2026-06-20
 
 ### Added
