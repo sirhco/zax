@@ -69,6 +69,27 @@ pub const Request = struct {
         return self.version_minor >= 1;
     }
 
+    /// True when the request's framing headers are ambiguous (RFC 7230 §3.3.3) —
+    /// an HTTP request-smuggling vector — and the request must be rejected (400):
+    ///   - both Transfer-Encoding and Content-Length present, or
+    ///   - more than one Content-Length header, or
+    ///   - more than one Transfer-Encoding header.
+    /// Scans all headers because `header()` only returns the first of a duplicate.
+    pub fn hasFramingConflict(self: *const Request) bool {
+        var n_cl: usize = 0;
+        var n_te: usize = 0;
+        for (self.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "content-length")) {
+                n_cl += 1;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) {
+                n_te += 1;
+            }
+        }
+        if (n_cl > 1) return true;
+        if (n_te > 1) return true;
+        return n_cl >= 1 and n_te >= 1;
+    }
+
     /// Whether the request body uses chunked transfer-encoding (unsupported in
     /// v1.1 — the server rejects these with 411).
     pub fn isChunked(self: *const Request) bool {
@@ -115,4 +136,36 @@ test "isChunked detects chunked transfer-encoding" {
     try testing.expect(reqWith(1, &.{.{ .name = "transfer-encoding", .value = "gzip, chunked" }}).isChunked());
     try testing.expect(!reqWith(1, &.{.{ .name = "Transfer-Encoding", .value = "gzip" }}).isChunked());
     try testing.expect(!reqWith(1, &.{}).isChunked());
+}
+
+test "hasFramingConflict detects smuggling framing" {
+    const mk = struct {
+        fn req(hs: []const Header) Request {
+            return .{ .method = .POST, .target = "/", .path = "/", .query = "",
+                      .version_minor = 1, .headers = hs, .body = "" };
+        }
+    };
+    // CL + TE → conflict
+    try std.testing.expect(mk.req(&.{
+        .{ .name = "Content-Length", .value = "5" },
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+    }).hasFramingConflict());
+    // duplicate Content-Length → conflict
+    try std.testing.expect(mk.req(&.{
+        .{ .name = "content-length", .value = "5" },
+        .{ .name = "Content-Length", .value = "5" },
+    }).hasFramingConflict());
+    // multiple Transfer-Encoding → conflict
+    try std.testing.expect(mk.req(&.{
+        .{ .name = "transfer-encoding", .value = "gzip" },
+        .{ .name = "transfer-encoding", .value = "chunked" },
+    }).hasFramingConflict());
+    // CL only → ok
+    try std.testing.expect(!mk.req(&.{ .{ .name = "Content-Length", .value = "5" } }).hasFramingConflict());
+    // TE chunked only → ok
+    try std.testing.expect(!mk.req(&.{ .{ .name = "Transfer-Encoding", .value = "chunked" } }).hasFramingConflict());
+    // single TE with coding list, no CL → ok
+    try std.testing.expect(!mk.req(&.{ .{ .name = "Transfer-Encoding", .value = "gzip, chunked" } }).hasFramingConflict());
+    // no framing headers → ok
+    try std.testing.expect(!mk.req(&.{ .{ .name = "Host", .value = "x" } }).hasFramingConflict());
 }
