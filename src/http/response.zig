@@ -305,7 +305,7 @@ pub const Response = struct {
 
     /// Emit the response head. `content_length` is emitted only when given
     /// (a streamed response omits it). Buffered path: chunked=false.
-    fn writeHeaders(self: Response, w: *Writer, content_length: ?usize) Writer.Error!void {
+    pub fn writeHeaders(self: Response, w: *Writer, content_length: ?usize) Writer.Error!void {
         try self.writeHeadersFramed(w, content_length, false);
     }
 
