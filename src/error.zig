@@ -25,6 +25,12 @@ pub const Error = error{
     Internal,
     NotImplemented,
     ServiceUnavailable,
+    Gone,
+    UnsupportedMediaType,
+    NotAcceptable,
+    PreconditionFailed,
+    BadGateway,
+    GatewayTimeout,
 };
 
 /// Map any error to a status + reason. Covers the canonical `Error` set and the
@@ -43,6 +49,12 @@ pub fn classify(e: anyerror) ErrorInfo {
         error.NotImplemented => .{ .status = .not_implemented, .reason = "not implemented" },
         error.ServiceUnavailable => .{ .status = .service_unavailable, .reason = "service unavailable" },
         error.PayloadTooLarge => .{ .status = .payload_too_large, .reason = "payload too large" },
+        error.Gone => .{ .status = .gone, .reason = "gone" },
+        error.UnsupportedMediaType => .{ .status = .unsupported_media_type, .reason = "unsupported media type" },
+        error.NotAcceptable => .{ .status = .not_acceptable, .reason = "not acceptable" },
+        error.PreconditionFailed => .{ .status = .precondition_failed, .reason = "precondition failed" },
+        error.BadGateway => .{ .status = .bad_gateway, .reason = "bad gateway" },
+        error.GatewayTimeout => .{ .status = .gateway_timeout, .reason = "gateway timeout" },
 
         // Extractor tags (from path.zig/query.zig/json.zig/scalar.zig).
         error.MissingPathParam => .{ .status = .bad_request, .reason = "missing path parameter" },
@@ -84,4 +96,14 @@ test "classify maps unknown errors to 500" {
     const info = classify(error.SomethingNobodyDefined);
     try testing.expectEqual(Status.internal_server_error, info.status);
     try testing.expectEqualStrings("internal server error", info.reason);
+}
+
+test "classify maps the expanded error set" {
+    try testing.expectEqual(Status.gone, classify(Error.Gone).status);
+    try testing.expectEqual(Status.unsupported_media_type, classify(Error.UnsupportedMediaType).status);
+    try testing.expectEqual(Status.not_acceptable, classify(Error.NotAcceptable).status);
+    try testing.expectEqual(Status.precondition_failed, classify(Error.PreconditionFailed).status);
+    try testing.expectEqual(Status.bad_gateway, classify(Error.BadGateway).status);
+    try testing.expectEqual(Status.gateway_timeout, classify(Error.GatewayTimeout).status);
+    try testing.expectEqualStrings("gone", classify(Error.Gone).reason);
 }
