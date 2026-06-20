@@ -301,6 +301,7 @@ pub const Conn = struct {
     // Phase 2: validate + read body (Content-Length or chunked).
     // ----------------------------------------------------------------
     fn readBody(self: *Conn, t: Transport, p: parser.Parsed) ParseOutcome {
+        if (p.request.hasFramingConflict()) return .{ .failed = error.Malformed };
         const head_abs = self.r_start + p.head_len;
 
         // --- Chunked transfer-encoding path ---
@@ -1514,6 +1515,101 @@ test "conn: step — chunked body over max_body_size → 413 payload_too_large" 
 
     const written = ft.written.items;
     try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 413"));
+}
+
+test "conn: step — CL+TE framing conflict → 400 bad_request" {
+    // Both Content-Length and Transfer-Encoding present → request smuggling vector → 400.
+    const raw = "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 400"));
+}
+
+test "conn: step — duplicate Content-Length → 400 bad_request" {
+    const raw = "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\ncontent-length: 5\r\n\r\nhello";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 400"));
+}
+
+test "conn: step — normal CL POST → 200 (no false positive from framing check)" {
+    const body = "hello";
+    const head = "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{ head, body });
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    var result: StepResult = .want_read;
+    for (0..20) |_| {
+        result = c.step(t, d);
+        if (result == .done_close) break;
+    }
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200"));
+}
+
+test "conn: step — normal chunked POST → 200 (no false positive from framing check)" {
+    const raw = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n0\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    var result: StepResult = .want_read;
+    for (0..20) |_| {
+        result = c.step(t, d);
+        if (result == .done_close) break;
+    }
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200"));
 }
 
 test "conn: onDeadline while reading_head → 408 + want_write + close flag" {

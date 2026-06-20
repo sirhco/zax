@@ -961,6 +961,7 @@ fn readHead(cr: *ConnReader, hs: *[request.max_headers]Header, read_to: Io.Timeo
 /// Sets `parsed.body_consumed` on both paths so the stream can advance past
 /// the encoded bytes (head_len + body_consumed).
 fn readBody(cr: *ConnReader, parsed: *parser.Parsed, max_body: usize, read_to: Io.Timeout) RequestError!void {
+    if (parsed.request.hasFramingConflict()) return error.Malformed;
     if (parsed.request.isChunked()) {
         const max = max_body; // bounds decoded length (0 = unbounded)
         while (true) {
@@ -1255,6 +1256,52 @@ test "keep-alive: malformed chunked body is rejected with 400" {
     // "zz" is not a valid hex chunk-size → malformed.
     const resp = doRequest(io, port, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nbad\r\n0\r\n\r\n", &rb);
     try testing.expect(std.mem.indexOf(u8, resp, "400") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "security: CL+TE request smuggling attempt rejected with 400" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.post("/echo", echoBody);
+    try app.get("/ping", pingHandler);
+
+    const port: u16 = 18097;
+    var loop_fut = startTestApp(io, &app, port);
+
+    // CL + TE → 400 (framing conflict)
+    var rb1: [2048]u8 = undefined;
+    const resp1 = doRequest(io, port,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
+        &rb1);
+    try testing.expect(std.mem.indexOf(u8, resp1, "400") != null);
+
+    // Duplicate Content-Length → 400
+    var rb2: [2048]u8 = undefined;
+    const resp2 = doRequest(io, port,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\ncontent-length: 5\r\n\r\nhello",
+        &rb2);
+    try testing.expect(std.mem.indexOf(u8, resp2, "400") != null);
+
+    // Normal CL POST → 200 (no false positive)
+    var rb3: [2048]u8 = undefined;
+    const resp3 = doRequest(io, port,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+        &rb3);
+    try testing.expect(std.mem.indexOf(u8, resp3, "200") != null);
+
+    // Normal chunked POST → 200 (no false positive)
+    var rb4: [2048]u8 = undefined;
+    const resp4 = doRequest(io, port,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        &rb4);
+    try testing.expect(std.mem.indexOf(u8, resp4, "200") != null);
 
     app.requestShutdown(io);
     loop_fut.await(io);
