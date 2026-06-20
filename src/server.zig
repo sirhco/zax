@@ -1280,14 +1280,14 @@ test "security: CL+TE request smuggling attempt rejected with 400" {
     const resp1 = doRequest(io, port,
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
         &rb1);
-    try testing.expect(std.mem.indexOf(u8, resp1, "400") != null);
+    try testing.expect(std.mem.startsWith(u8, resp1, "HTTP/1.1 400"));
 
     // Duplicate Content-Length → 400
     var rb2: [2048]u8 = undefined;
     const resp2 = doRequest(io, port,
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\ncontent-length: 5\r\n\r\nhello",
         &rb2);
-    try testing.expect(std.mem.indexOf(u8, resp2, "400") != null);
+    try testing.expect(std.mem.startsWith(u8, resp2, "HTTP/1.1 400"));
 
     // Normal CL POST → 200 (no false positive)
     var rb3: [2048]u8 = undefined;
@@ -1302,6 +1302,31 @@ test "security: CL+TE request smuggling attempt rejected with 400" {
         "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
         &rb4);
     try testing.expect(std.mem.indexOf(u8, resp4, "200") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "security: duplicate Transfer-Encoding rejected with 400" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.post("/echo", echoBody);
+    try app.get("/ping", pingHandler);
+
+    const port: u16 = 18221;
+    var loop_fut = startTestApp(io, &app, port);
+
+    // Two Transfer-Encoding headers → 400 (multi-TE smuggling vector)
+    var rb: [2048]u8 = undefined;
+    const resp = doRequest(io, port,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
+        &rb);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400"));
 
     app.requestShutdown(io);
     loop_fut.await(io);

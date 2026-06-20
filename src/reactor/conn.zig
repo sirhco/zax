@@ -1560,6 +1560,28 @@ test "conn: step — duplicate Content-Length → 400 bad_request" {
     try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 400"));
 }
 
+test "conn: step — duplicate Transfer-Encoding → 400 bad_request" {
+    // Two Transfer-Encoding headers → request smuggling vector → 400.
+    const raw = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n";
+    var ft = FakeTransport.init(testing.allocator, &.{raw});
+    defer ft.deinit();
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+    const t = ft.transport();
+    const d = makeEchoDispatcher();
+
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.done_close, result);
+
+    const written = ft.written.items;
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 400"));
+}
+
 test "conn: step — normal CL POST → 200 (no false positive from framing check)" {
     const body = "hello";
     const head = "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n";
