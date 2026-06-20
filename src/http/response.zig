@@ -109,7 +109,7 @@ pub const Status = enum(u16) {
             .unsupported_media_type => "Unsupported Media Type",
             .range_not_satisfiable => "Range Not Satisfiable",
             .expectation_failed => "Expectation Failed",
-            .im_a_teapot => "I'm a Teapot",
+            .im_a_teapot => "I'm a teapot",
             .misdirected_request => "Misdirected Request",
             .unprocessable_entity => "Unprocessable Entity",
             .locked => "Locked",
@@ -694,6 +694,7 @@ test "status: expanded named codes" {
     try testing.expectEqual(@as(u16, 502), Status.bad_gateway.code());
     try testing.expectEqualStrings("Bad Gateway", Status.bad_gateway.reason());
     try testing.expectEqual(@as(u16, 418), Status.im_a_teapot.code());
+    try testing.expectEqualStrings("I'm a teapot", Status.im_a_teapot.reason());
     try testing.expectEqual(@as(u16, 206), Status.partial_content.code());
     try testing.expectEqual(@as(u16, 100), Status.@"continue".code());
 }
