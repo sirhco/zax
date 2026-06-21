@@ -1,6 +1,8 @@
 //! `SetCookie` — build a `Set-Cookie` response header value (RFC 6265). The
 //! cookie value is emitted raw (symmetric with the `Cookies` read extractor,
 //! which does not percent-decode); `serialize` validates the name and value.
+//! `domain` and `path` are emitted as-is — CR (`\r`) and LF (`\n`) are
+//! rejected to prevent header injection, but other content is caller-controlled.
 //! Note: browsers require `Secure` when `SameSite=None` — set `.secure = true`
 //! in that case (not auto-enforced here).
 
@@ -13,7 +15,11 @@ pub const SetCookie = struct {
     value: []const u8,
     /// Max-Age in seconds. 0 expires the cookie immediately. null omits it.
     max_age: ?i64 = null,
+    /// `Domain` attribute value. Emitted as-is; CR/LF are rejected by
+    /// `serialize` to prevent header injection. Other content is caller-controlled.
     domain: ?[]const u8 = null,
+    /// `Path` attribute value. Emitted as-is; CR/LF are rejected by
+    /// `serialize` to prevent header injection. Other content is caller-controlled.
     path: ?[]const u8 = null,
     secure: bool = false,
     http_only: bool = false,
@@ -23,9 +29,12 @@ pub const SetCookie = struct {
 
     /// Serialize to a `Set-Cookie` header VALUE (no "set-cookie:" prefix), into
     /// `arena`. Validates the name (RFC 6265 token) and value (cookie-octet).
+    /// Also rejects CR/LF in `domain` and `path` to prevent header injection.
     pub fn serialize(self: SetCookie, arena: std.mem.Allocator) Error![]const u8 {
         if (!isValidName(self.name)) return error.InvalidCookieName;
         if (!isValidValue(self.value)) return error.InvalidCookieValue;
+        if (self.domain) |d| if (hasCRLF(d)) return error.InvalidCookieValue;
+        if (self.path) |p| if (hasCRLF(p)) return error.InvalidCookieValue;
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         try out.appendSlice(arena, self.name);
@@ -84,6 +93,11 @@ fn isValidValue(value: []const u8) bool {
         }
     }
     return true;
+}
+
+/// Returns true if `s` contains CR (`\r`) or LF (`\n`).
+fn hasCRLF(s: []const u8) bool {
+    return std.mem.indexOfAny(u8, s, "\r\n") != null;
 }
 
 // ----------------------------------------------------------------------------
@@ -150,4 +164,19 @@ test "SetCookie: invalid value rejected" {
     try testing.expectError(error.InvalidCookieValue, ser(a, .{ .name = "k", .value = "a;b" }));
     try testing.expectError(error.InvalidCookieValue, ser(a, .{ .name = "k", .value = "a\"b" }));
     try testing.expectError(error.InvalidCookieValue, ser(a, .{ .name = "k", .value = "a\\b" }));
+}
+
+test "SetCookie: CR/LF in path rejected (header-injection guard)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.InvalidCookieValue, ser(a, .{ .name = "k", .value = "v", .path = "/foo\r\nX-Injected: bad" }));
+    try testing.expectError(error.InvalidCookieValue, ser(a, .{ .name = "k", .value = "v", .path = "/foo\n" }));
+}
+
+test "SetCookie: LF in domain rejected (header-injection guard)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.InvalidCookieValue, ser(a, .{ .name = "k", .value = "v", .domain = "evil.com\nX-Injected: bad" }));
 }

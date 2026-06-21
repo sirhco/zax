@@ -144,6 +144,8 @@ To **set** cookies on the response, use `zax.SetCookie` with
 `serialize` validates the name (RFC 6265 token) and value (cookie-octet: rejects
 CTL, space, `"`, `,`, `;`, `\`); empty value is allowed. The value is emitted
 **raw** (symmetric with the `Cookies` read extractor, which does not percent-decode).
+`domain` and `path` are emitted as-is — only CR/LF are rejected (to prevent
+header injection); do not interpolate untrusted data into these attributes.
 
 > **Note:** Browsers require `Secure` when `SameSite=None` — set `.secure = true`
 > explicitly; it is not auto-enforced.
