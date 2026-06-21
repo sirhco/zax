@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     else
         64;
     {
-        const n = payload_kb * 1024;
+        const n = @max(payload_kb * 1024, 16);
         const buf = try allocator.alloc(u8, n);
         const prefix = "{\"data\":\"";
         const suffix = "\"}";

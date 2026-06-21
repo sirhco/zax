@@ -4,6 +4,7 @@
 //	GET  /            -> "hello"
 //	GET  /users/{id}  -> the captured id
 //	POST /echo        -> JSON echo of {"msg": "..."}
+//	GET  /large       -> buffered ~PAYLOAD_KB KB JSON body
 //
 // Requires Go 1.22+ (method+pattern ServeMux). Run: `go run .` (listens on :8083).
 package main

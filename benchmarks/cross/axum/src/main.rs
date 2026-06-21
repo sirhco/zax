@@ -37,7 +37,7 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
-    let n = kb * 1024;
+    let n = (kb * 1024).max(16);
     let mut body = String::with_capacity(n);
     body.push_str("{\"data\":\"");
     body.extend(std::iter::repeat('x').take(n - 11));

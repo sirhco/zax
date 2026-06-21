@@ -34,7 +34,7 @@ fn echo(a: zax.Alloc, body: zax.Json(struct { msg: []const u8 })) !zax.Response 
 }
 
 fn large() zax.Response {
-    return zax.Response.text(large_body);
+    return zax.Response.jsonRaw(large_body);
 }
 
 /// Timer task: sleep run_secs seconds then call requestShutdown so acceptLoop
@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
     else
         64;
     {
-        const n = payload_kb * 1024;
+        const n = @max(payload_kb * 1024, 16);
         const buf = try init.gpa.alloc(u8, n);
         const prefix = "{\"data\":\"";
         const suffix = "\"}";
