@@ -31,7 +31,7 @@ pub const Headers = struct {
 
     /// All values matching `name` (case-insensitive), in request order.
     /// Arena-allocated; empty slice when none match.
-    pub fn getAll(self: @This(), arena: std.mem.Allocator, name: []const u8) ![]const []const u8 {
+    pub fn getAll(self: @This(), arena: std.mem.Allocator, name: []const u8) error{OutOfMemory}![]const []const u8 {
         var out: std.ArrayListUnmanaged([]const u8) = .empty;
         for (self.list) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, name)) try out.append(arena, h.value);
