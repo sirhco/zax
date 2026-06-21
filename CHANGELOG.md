@@ -8,6 +8,7 @@ All notable changes to zax are documented here. The format is based on
 
 ### Added
 
+- `Headers` extractor — zero-copy, case-insensitive access to every request header via `.get(name)`, `.has(name)`, `.getAll(arena, name)` (all values, arena-allocated slice), `.all()`, and `.count()`.
 - `Multipart` extractor — parse `multipart/form-data` request bodies (file uploads) into a zero-copy list of parts (`mp.field` / `mp.file` / `mp.parts`); bounded by `max_body_size` and a 1024-part cap (malformed → 400, too many parts → 413).
 
 ## [0.8.2] - 2026-06-21
