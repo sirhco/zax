@@ -212,7 +212,10 @@ the bare prefix.
 
 `Response.text` / `.html` / `.json(arena, value)` / `.redirect(.found, "/path")` /
 `.fromStatus(.created)` cover the common cases; `r.withHeader(arena, n, v)` adds
-headers. For large or generated bodies, `Response.stream(Ctx, ctx, fn, "text/plain")`
+headers. Set response cookies with `r.withCookie(arena, zax.SetCookie{ ... })` or
+clear them with `r.expireCookie(arena, name, path)` — see the
+[Cookies section](../README.md#cookies) in the README for the full attribute list.
+For large or generated bodies, `Response.stream(Ctx, ctx, fn, "text/plain")`
 writes the body incrementally (connection-close, no Content-Length). `Response.sse(Ctx, ctx, fn)`
 streams Server-Sent Events: `fn` gets an `Sse` writer and calls
 `s.send(.{ .event = "...", .data = "..." })` per event.

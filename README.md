@@ -111,6 +111,64 @@ fn echo(h: zax.Headers, a: zax.Alloc) !zax.Response {
 `.get(name)` returns the first match; `.has(name)` tests existence; `.getAll(arena, name)`
 collects every value into an arena-allocated slice; `.all()` / `.count()` expose the full list.
 
+### Cookies
+
+The `Cookies` extractor reads cookies from the `Cookie` request header —
+`.get(name)` returns the first matching value (raw; not percent-decoded):
+
+```zig
+fn handler(c: zax.Cookies) zax.Response {
+    const sid = c.get("sid") orelse return zax.Response.fromStatus(.unauthorized);
+    _ = sid;
+    return zax.Response.text("ok\n");
+}
+```
+
+To **set** cookies on the response, use `zax.SetCookie` with
+`Response.withCookie(arena, cookie)` or `Response.expireCookie(arena, name, path)`.
+
+`zax.SetCookie` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | `[]const u8` | — | Cookie name (RFC 6265 token) |
+| `value` | `[]const u8` | — | Cookie value (raw, validated cookie-octet) |
+| `max_age` | `?i64` | `null` | `Max-Age` in seconds; `0` expires immediately |
+| `domain` | `?[]const u8` | `null` | `Domain` attribute |
+| `path` | `?[]const u8` | `null` | `Path` attribute |
+| `secure` | `bool` | `false` | Adds `; Secure` |
+| `http_only` | `bool` | `false` | Adds `; HttpOnly` |
+| `same_site` | `?zax.SameSite` | `null` | `.strict` → `Strict`, `.lax` → `Lax`, `.none` → `None` |
+
+`withCookie` appends a `set-cookie` header; multiple calls emit multiple lines.
+`serialize` validates the name (RFC 6265 token) and value (cookie-octet: rejects
+CTL, space, `"`, `,`, `;`, `\`); empty value is allowed. The value is emitted
+**raw** (symmetric with the `Cookies` read extractor, which does not percent-decode).
+
+> **Note:** Browsers require `Secure` when `SameSite=None` — set `.secure = true`
+> explicitly; it is not auto-enforced.
+
+```zig
+fn login(a: zax.Alloc) !zax.Response {
+    return (try zax.Response.text("welcome").withCookie(a.value, .{
+        .name = "sid",
+        .value = "abc123",
+        .max_age = 3600,
+        .path = "/",
+        .http_only = true,
+        .same_site = .lax,
+    }));
+}
+
+fn logout(a: zax.Alloc) !zax.Response {
+    // clear the cookie: empty value, Max-Age=0
+    return zax.Response.text("bye").expireCookie(a.value, "sid", "/");
+}
+```
+
+`expireCookie(arena, name, path)` is shorthand for `.withCookie` with an empty
+value, `Max-Age=0`, and the given path (pass `null` to omit `Path`).
+
 ## Middleware
 
 Register an ordered chain wrapping matched route handlers. A middleware gets the
@@ -415,6 +473,8 @@ Build responses with the `Response` constructors:
 | `Response.seeOther/temporaryRedirect/permanentRedirect(loc)` | 303 / 307 / 308 redirects |
 | `Response.fromStatus(s)` | bare status |
 | `r.withHeader(arena, name, value)` | add a response header |
+| `r.withCookie(arena, SetCookie)` | append a `set-cookie` header (see [Cookies](#cookies)) |
+| `r.expireCookie(arena, name, path)` | clear a cookie (empty value, `Max-Age=0`) |
 
 A streamed response writes its body incrementally to the connection; the `ctx`
 must be arena-allocated. Useful for large or generated bodies. On HTTP/1.1
