@@ -64,6 +64,7 @@ extractor must come last** (enforced at compile time).
 | `Cookies` | request cookies via `.get(name)` |
 | `Bytes` | the raw request body (`[]const u8`, must be last) |
 | `Multipart` | parse `multipart/form-data` request bodies (file uploads) → a zero-copy parts list; `mp.field(name)` (text), `mp.file(name)` (file), `mp.part(name)` (either); must be last |
+| `Headers` | access all request headers — `.get(name)` (first match, case-insensitive), `.has(name)`, `.getAll(arena, name)` (all matches), `.all()`, `.count()` |
 | `Files` | serve files: `files.file(path)` / `files.dir(root, requested)` (traversal-safe) |
 
 Handlers return anything that satisfies `IntoResponse`: a `Response`, a `Status`,
@@ -92,6 +93,23 @@ fn upload(mp: zax.Multipart, a: zax.Alloc) !zax.Response {
 
 Errors: malformed multipart framing → `400`, exceeding 1024 parts or `max_body_size` → `413`.
 Each `Part` is valid for the request's lifetime (borrowed slices into the request body).
+
+### Request headers
+
+The `Headers` extractor gives zero-copy, case-insensitive access to every request header:
+
+```zig
+fn echo(h: zax.Headers, a: zax.Alloc) !zax.Response {
+    const accept = h.get("accept") orelse "*/*";
+    // all values for a repeated header (allocates only the result slice)
+    const fwds = try h.getAll(a.value, "x-forwarded-for");
+    _ = fwds; // []const []const u8, in order
+    return zax.Response.text(accept);
+}
+```
+
+`.get(name)` returns the first match; `.has(name)` tests existence; `.getAll(arena, name)`
+collects every value into an arena-allocated slice; `.all()` / `.count()` expose the full list.
 
 ## Middleware
 
@@ -572,8 +590,7 @@ Streaming is full-featured: push (`stream`/`sse`) and pull
 inbound chunked request-body decoding, and a not-ready backoff + idle cap — on
 both the threaded and evented backends.
 
-**Not yet built:** in-process TLS (blocked on std — use a proxy), `Headers`
-extractor, and HTTP/2. The evented reactor (`App.serveEvented`, epoll/kqueue) is
+**Not yet built:** in-process TLS (blocked on std — use a proxy) and HTTP/2. The evented reactor (`App.serveEvented`, epoll/kqueue) is
 shipped and opt-in; the default backend remains `Io.Threaded`. (Zax's reactor is
 its own epoll/kqueue loop — std's `Io.Evented` still can't serve TCP in 0.16.0.)
 

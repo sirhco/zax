@@ -1018,7 +1018,9 @@ const State = @import("extract/state.zig").State;
 const Forwarded = @import("extract/forwarded.zig").Forwarded;
 const Form = @import("extract/form.zig").Form;
 const Cookies = @import("extract/cookie.zig").Cookies;
+const Alloc = @import("extract/alloc.zig").Alloc;
 const Bytes = @import("extract/bytes.zig").Bytes;
+const Headers = @import("extract/headers.zig").Headers;
 
 const Db = struct { msg: []const u8 };
 const TestApp = App(*const Db);
@@ -3264,6 +3266,58 @@ test "threaded pull-stream repoll_ms=0: no-sleep path still completes" {
     try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
     try testing.expect(std.mem.indexOf(u8, r, "ok") != null);
     try testing.expect(std.mem.indexOf(u8, r, "0\r\n\r\n") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+fn headersGetHandler(h: Headers) Response {
+    return Response.text(h.get("x-test") orelse "");
+}
+
+fn headersGetAllHandler(a: Alloc, h: Headers) !Response {
+    const vals = try h.getAll(a.value, "x-dup");
+    const out = try std.fmt.allocPrint(a.value, "{d}", .{vals.len});
+    return Response.text(out);
+}
+
+test "Headers extractor: get() echoes first matching header value" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/hdr", headersGetHandler);
+
+    const port: u16 = 18213;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [1024]u8 = undefined;
+    const r = doRequest(io, port, "GET /hdr HTTP/1.1\r\nHost: x\r\nX-Test: hi\r\n\r\n", &rb);
+    try testing.expect(std.mem.endsWith(u8, r, "hi"));
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "Headers extractor: getAll() counts duplicate headers" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/hdrall", headersGetAllHandler);
+
+    const port: u16 = 18214;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [1024]u8 = undefined;
+    const r = doRequest(io, port, "GET /hdrall HTTP/1.1\r\nHost: x\r\nX-Dup: a\r\nX-Dup: b\r\n\r\n", &rb);
+    try testing.expect(std.mem.endsWith(u8, r, "2"));
 
     app.requestShutdown(io);
     loop_fut.await(io);

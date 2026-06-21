@@ -107,6 +107,7 @@ must be the **last** parameter (enforced at compile time).
 | `Cookies` | request cookies via `.get(name)` |
 | `Bytes` | raw request body |
 | `Multipart` | parse `multipart/form-data` bodies (file uploads) into a zero-copy parts list — must be last |
+| `Headers` | access all request headers — `.get(name)` (first match, case-insensitive), `.has(name)`, `.getAll(arena, name)` (all matches) |
 
 Handlers return anything `IntoResponse`: a `Response`, a `Status`, a byte-string,
 or a type with `pub fn intoResponse(self) Response`. A returned error → `500`.

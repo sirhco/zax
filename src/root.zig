@@ -47,6 +47,7 @@ pub const Cookies = @import("extract/cookie.zig").Cookies;
 pub const Bytes = @import("extract/bytes.zig").Bytes;
 pub const Multipart = @import("extract/multipart.zig").Multipart;
 pub const MultipartPart = @import("extract/multipart.zig").Part;
+pub const Headers = @import("extract/headers.zig").Headers;
 pub const files = @import("extract/files.zig");
 pub const Files = files.Files;
 
