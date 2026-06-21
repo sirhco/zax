@@ -1018,6 +1018,7 @@ const State = @import("extract/state.zig").State;
 const Forwarded = @import("extract/forwarded.zig").Forwarded;
 const Form = @import("extract/form.zig").Form;
 const Cookies = @import("extract/cookie.zig").Cookies;
+const Alloc = @import("extract/alloc.zig").Alloc;
 const Bytes = @import("extract/bytes.zig").Bytes;
 const Headers = @import("extract/headers.zig").Headers;
 
@@ -3274,7 +3275,7 @@ fn headersGetHandler(h: Headers) Response {
     return Response.text(h.get("x-test") orelse "");
 }
 
-fn headersGetAllHandler(a: @import("extract/alloc.zig").Alloc, h: Headers) !Response {
+fn headersGetAllHandler(a: Alloc, h: Headers) !Response {
     const vals = try h.getAll(a.value, "x-dup");
     const out = try std.fmt.allocPrint(a.value, "{d}", .{vals.len});
     return Response.text(out);
