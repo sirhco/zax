@@ -3,6 +3,7 @@
 //!   GET  /            -> "hello"
 //!   GET  /users/{id}  -> the captured id (echoes the path param)
 //!   POST /echo        -> JSON echo of {"msg": "..."}
+//!   GET  /large       -> buffered ~PAYLOAD_KB KB JSON body
 //! Run: `zig build -Doptimize=ReleaseFast run` (listens on :8081).
 //!
 //! Self-shutdown timer: set ZAX_RUN_SECS=N to have the server stop itself after
@@ -15,6 +16,10 @@ const zax = @import("zax");
 const Db = struct {};
 const Api = zax.App(*const Db);
 
+/// Module-level storage for the pre-built large-payload body.
+/// Allocated once at startup from init.gpa and never freed (process lifetime).
+var large_body: []const u8 = "";
+
 fn hello() zax.Response {
     return zax.Response.text("hello");
 }
@@ -26,6 +31,10 @@ fn user(p: zax.Path(struct { id: []const u8 })) zax.Response {
 // `Json` consumes the body, so it must be the last parameter.
 fn echo(a: zax.Alloc, body: zax.Json(struct { msg: []const u8 })) !zax.Response {
     return zax.Response.json(a.value, .{ .msg = body.value.msg });
+}
+
+fn large() zax.Response {
+    return zax.Response.text(large_body);
 }
 
 /// Timer task: sleep run_secs seconds then call requestShutdown so acceptLoop
@@ -96,6 +105,23 @@ pub fn main(init: std.process.Init) !void {
     else
         0;
 
+    // Large-payload route: PAYLOAD_KB=N sets the response size in kilobytes (default 64).
+    const payload_kb: usize = if (init.environ_map.get("PAYLOAD_KB")) |v|
+        std.fmt.parseUnsigned(usize, v, 10) catch 64
+    else
+        64;
+    {
+        const n = payload_kb * 1024;
+        const buf = try init.gpa.alloc(u8, n);
+        const prefix = "{\"data\":\"";
+        const suffix = "\"}";
+        @memcpy(buf[0..prefix.len], prefix);
+        const fill_end = n - suffix.len;
+        @memset(buf[prefix.len..fill_end], 'x');
+        @memcpy(buf[fill_end..n], suffix);
+        large_body = buf;
+    }
+
     var db = Db{};
     var app = try Api.init(init.gpa, &db, .{
         .tcp_nodelay = nodelay,
@@ -107,6 +133,7 @@ pub fn main(init: std.process.Init) !void {
     try app.get("/", hello);
     try app.get("/users/:id", user);
     try app.post("/echo", echo);
+    try app.get("/large", large);
 
     const port: u16 = 8081;
 
