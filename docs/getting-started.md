@@ -106,6 +106,7 @@ must be the **last** parameter (enforced at compile time).
 | `Form(T)` | urlencoded body → struct (must be last) |
 | `Cookies` | request cookies via `.get(name)` |
 | `Bytes` | raw request body |
+| `Multipart` | parse `multipart/form-data` bodies (file uploads) into a zero-copy parts list — must be last |
 
 Handlers return anything `IntoResponse`: a `Response`, a `Status`, a byte-string,
 or a type with `pub fn intoResponse(self) Response`. A returned error → `500`.
