@@ -46,6 +46,7 @@ cd "$(dirname "$0")"
 
 DURATION="${DURATION:-30s}"
 CONNS="${CONNS:-64}"
+export PAYLOAD_KB="${PAYLOAD_KB:-64}"
 LOAD="${LOAD:-oha}"
 WARMUP="${WARMUP:-3s}"
 PIN="${PIN:-0}"
@@ -343,6 +344,7 @@ for pass in "${PASSES[@]}"; do
   drive "$name" static "http://127.0.0.1:$port/"
   drive "$name" param  "http://127.0.0.1:$port/users/42"
   drive "$name" json   "http://127.0.0.1:$port/echo" POST '{"msg":"hi"}'
+  drive "$name" large "http://127.0.0.1:$port/large"
   stop_hog
 
   # --- memory: stop sampler, read peak, record idle+peak in MB ---
