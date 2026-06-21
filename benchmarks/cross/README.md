@@ -19,13 +19,28 @@ benchmarks/cross/
   results.md  record your numbers here
 ```
 
-## Equivalent app (all three, byte-for-byte)
+## Equivalent app (all four, byte-for-byte)
 
-| Route             | Behavior                                  |
-|-------------------|-------------------------------------------|
-| `GET /`           | returns `hello`                           |
-| `GET /users/{id}` | returns the captured `id` (path param)    |
-| `POST /echo`      | parses `{"msg":"..."}` and echoes it back |
+| Route             | Behavior                                                            |
+|-------------------|---------------------------------------------------------------------|
+| `GET /`           | returns `hello`                                                     |
+| `GET /users/{id}` | returns the captured `id` (path param)                              |
+| `POST /echo`      | parses `{"msg":"..."}` and echoes it back                           |
+| `GET /large`      | returns a buffered body of `PAYLOAD_KB` KB (default 64 KB)         |
+
+The `large` scenario exercises buffered large-response throughput across all four
+servers and drives the MEMORY table's peak-RSS column — larger bodies demand more
+allocator activity per request, which is where allocator + GC differences appear.
+
+### `PAYLOAD_KB` (default 64)
+
+Set `PAYLOAD_KB=N` before running to change the response size (KB) for every
+server. The export propagates to each server process automatically:
+
+```sh
+PAYLOAD_KB=256 ./run.sh          # 256 KB bodies
+PAYLOAD_KB=1024 ./run.sh         # 1 MB bodies
+```
 
 ## Run
 
@@ -138,6 +153,33 @@ stay sub-ms **off-box**, the tail is the concurrency model (thread-per-conn
 oversubscription) → pursue the bounded-worker-pool theme
 (`docs/superpowers/specs/2026-06-17-evented-io-decision.md`). If zax's tail collapses
 toward axum/go off-box, it was mostly same-host contention.
+
+## Soak / leak check (`soak.sh`)
+
+`soak.sh` launches zax-ev once (`ZAX_BACKEND=evented`), runs `SOAK_WAVES`
+back-to-back load waves against `/large`, samples the server's RSS after each
+wave, and prints a wave → RSS(MB) table plus a **plateau-vs-climb verdict**:
+
+```sh
+./soak.sh                          # 5 waves × 10 s, PAYLOAD_KB=64
+SOAK_WAVES=10 SOAK_DUR=30s ./soak.sh
+PAYLOAD_KB=256 SOAK_WAVES=8 ./soak.sh
+```
+
+| Env var        | Default | Meaning                                      |
+|----------------|---------|----------------------------------------------|
+| `SOAK_WAVES`   | 5       | number of load waves                         |
+| `SOAK_DUR`     | 10s     | duration of each wave (oha `-z`)             |
+| `PAYLOAD_KB`   | 64      | response body size passed to the server      |
+| `CONNS`        | 64      | concurrent connections per wave              |
+
+**Expected outcome:** zax-ev serves `GET /large` with HTTP 200 (not 500) at
+competitive throughput, and RSS plateaus from wave 1 to the final wave (growth
+≤ 10%). A `POSSIBLE LEAK` verdict means RSS climbed > 10% — investigate the
+evented allocator path for uncollected per-request buffers.
+
+Requires `oha` (`brew install oha`). The script exits cleanly with an error
+message if `oha` is absent — it is safe to run on machines without a load tool.
 
 ## Methodology
 

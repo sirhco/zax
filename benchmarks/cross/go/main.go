@@ -4,6 +4,7 @@
 //	GET  /            -> "hello"
 //	GET  /users/{id}  -> the captured id
 //	POST /echo        -> JSON echo of {"msg": "..."}
+//	GET  /large       -> buffered ~PAYLOAD_KB KB JSON body
 //
 // Requires Go 1.22+ (method+pattern ServeMux). Run: `go run .` (listens on :8083).
 package main
@@ -13,6 +14,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 )
 
 type msg struct {
@@ -38,6 +41,27 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(m)
+	})
+
+	largeKB := 64
+	if v := os.Getenv("PAYLOAD_KB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			largeKB = n
+		}
+	}
+	n := largeKB * 1024
+	if n < 16 {
+		n = 16
+	}
+	largeBuf := make([]byte, n)
+	copy(largeBuf, []byte(`{"data":"`))
+	for i := len(`{"data":"`); i < n-2; i++ {
+		largeBuf[i] = 'x'
+	}
+	copy(largeBuf[n-2:], []byte(`"}`))
+	mux.HandleFunc("GET /large", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(largeBuf)
 	})
 
 	const addr = "127.0.0.1:8083"
