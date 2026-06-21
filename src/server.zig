@@ -3322,3 +3322,28 @@ test "Headers extractor: getAll() counts duplicate headers" {
     app.requestShutdown(io);
     loop_fut.await(io);
 }
+
+fn setCookieHandler(a: Alloc) anyerror!Response {
+    return Response.text("ok").withCookie(a.value, .{ .name = "sid", .value = "xyz", .http_only = true });
+}
+
+test "e2e: handler sets a cookie via withCookie" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/cookie", setCookieHandler);
+
+    const port: u16 = 18215;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [1024]u8 = undefined;
+    const r = doRequest(io, port, "GET /cookie HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "set-cookie: sid=xyz; HttpOnly\r\n") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
