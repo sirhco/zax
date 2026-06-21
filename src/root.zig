@@ -45,6 +45,8 @@ pub const urlencoded = @import("extract/urlencoded.zig");
 pub const Form = @import("extract/form.zig").Form;
 pub const Cookies = @import("extract/cookie.zig").Cookies;
 pub const Bytes = @import("extract/bytes.zig").Bytes;
+pub const Multipart = @import("extract/multipart.zig").Multipart;
+pub const MultipartPart = @import("extract/multipart.zig").Part;
 pub const files = @import("extract/files.zig");
 pub const Files = files.Files;
 
@@ -92,6 +94,4 @@ test {
     // Pull every module into analysis so their `test` blocks run under
     // `zig build test`.
     std.testing.refAllDecls(@This());
-    // Task 1: multipart.zig not yet re-exported from root; pull it in for tests.
-    _ = @import("extract/multipart.zig");
 }
