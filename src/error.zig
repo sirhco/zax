@@ -99,7 +99,9 @@ test "classify maps PayloadTooLarge to 413" {
 
 test "classify maps multipart errors" {
     try testing.expectEqual(Status.bad_request, classify(error.InvalidMultipart).status);
+    try testing.expectEqualStrings("invalid multipart body", classify(error.InvalidMultipart).reason);
     try testing.expectEqual(Status.payload_too_large, classify(error.TooManyParts).status);
+    try testing.expectEqualStrings("too many multipart parts", classify(error.TooManyParts).reason);
 }
 
 test "classify maps unknown errors to 500" {

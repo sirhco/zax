@@ -1864,9 +1864,11 @@ test "input parity: Form + Cookies over a real connection" {
 
 const Multipart = @import("extract/multipart.zig").Multipart;
 
-fn multipartHandler(mp: Multipart) Response {
+fn multipartHandler(a: @import("extract/alloc.zig").Alloc, mp: Multipart) Response {
     const filename = mp.file("f").?.filename.?;
-    return Response.text(filename);
+    const desc = mp.field("desc").?;
+    const out = std.fmt.allocPrint(a.value, "{s}|{s}", .{ filename, desc }) catch "error";
+    return Response.text(out);
 }
 
 test "input parity: Multipart over a real connection" {
@@ -1902,6 +1904,7 @@ test "input parity: Multipart over a real connection" {
     const r = doRequest(io, port, raw, &rb);
     try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
     try testing.expect(std.mem.indexOf(u8, r, "a.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "hi") != null);
 
     app.requestShutdown(io);
     loop_fut.await(io);
