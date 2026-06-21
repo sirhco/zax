@@ -49,12 +49,16 @@ func main() {
 			largeKB = n
 		}
 	}
-	largeBuf := make([]byte, largeKB*1024)
+	n := largeKB * 1024
+	if n < 16 {
+		n = 16
+	}
+	largeBuf := make([]byte, n)
 	copy(largeBuf, []byte(`{"data":"`))
-	for i := len(`{"data":"`); i < len(largeBuf)-2; i++ {
+	for i := len(`{"data":"`); i < n-2; i++ {
 		largeBuf[i] = 'x'
 	}
-	copy(largeBuf[len(largeBuf)-2:], []byte(`"}`))
+	copy(largeBuf[n-2:], []byte(`"}`))
 	mux.HandleFunc("GET /large", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(largeBuf)
