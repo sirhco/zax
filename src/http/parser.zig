@@ -176,3 +176,21 @@ test "malformed request line and unknown method" {
     try testing.expectError(error.UnsupportedVersion, parseFixture("GET / HTTP/2.0\r\n\r\n", &hs));
     try testing.expectError(error.InvalidHeader, parseFixture("GET / HTTP/1.1\r\nBadHeaderNoColon\r\n\r\n", &hs));
 }
+
+test "fuzz: parseHead never panics on arbitrary input" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [8192]u8 = undefined;
+            const n = smith.sliceWithHash(&buf, 0x9001);
+            var hs: [request.max_headers]Header = undefined;
+            _ = parseHead(buf[0..n], &hs) catch {}; // any ParseError ok; contract = no panic
+        }
+    }.one, .{ .corpus = &.{
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST /e HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
+        "POST /e HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "BADLINE",
+        "GET / HTTP/1.1\r\n" ++ ("X: y\r\n" ** 80) ++ "\r\n",
+        "",
+    } });
+}

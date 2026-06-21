@@ -266,3 +266,22 @@ test "decodeInPlace: oversized chunk size does not overflow" {
     const r = decodeInPlace(&buf, 0);
     try std.testing.expect(r == .incomplete);
 }
+
+test "fuzz: decodeInPlace never panics on arbitrary input" {
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [8192]u8 = undefined;
+            const n = smith.sliceWithHash(&buf, 0x9002);
+            _ = decodeInPlace(buf[0..n], 4096); // bounded max
+            const n2 = smith.sliceWithHash(&buf, 0x9003);
+            _ = decodeInPlace(buf[0..n2], 0);   // unbounded max
+        }
+    }.one, .{ .corpus = &.{
+        "5\r\nhello\r\n0\r\n\r\n",
+        "5;ext=1\r\nhello\r\n0\r\nX-T: 1\r\n\r\n",
+        "0\r\n\r\n",
+        "zz\r\nbad\r\n",
+        "fffffffffffffffe\r\nhi\r\n0\r\n\r\n",
+        "",
+    } });
+}
