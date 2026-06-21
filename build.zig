@@ -144,6 +144,11 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmarks (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
 
+    // Build-only check of the ReleaseFast bench exe (no run) — used by CI to
+    // catch bench-code breakage without the machine-specific perf gate.
+    const bench_build = b.step("bench-build", "Build the benchmark exe (compile-check, no run)");
+    bench_build.dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
