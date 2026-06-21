@@ -467,3 +467,55 @@ macOS-loopback 35 ms tail).
 > 477.7 idle / 478.6 peak MB.
 
 (Regenerate: `cd benchmarks/cross && ./run.sh` — `BACKEND=both` to include evented.)
+
+## Large-payload load test (evented fixes validation)
+
+macOS, 30s, 64 conns, `BACKEND=both PAYLOAD_KB=64 ./run.sh` (2026-06-21). The `/large`
+route returns a ~64 KB **buffered** JSON body — the path that used to return 500 on the
+evented backend before the v0.8.0 large-response fix.
+
+### large — `GET /large` (~64 KB buffered body)
+
+| Framework        | req/s  | p50 (ms) | p99 (ms) | p99.9 (ms) | max (ms) |
+|------------------|-------:|---------:|---------:|-----------:|---------:|
+| zax (threaded)   | 115259 |   0.1170 |   7.1387 |    51.8715 |  86.7031 |
+| zax-ev (evented) | 121727 |   0.4837 |   1.0678 |     1.6879 |  10.0246 |
+| axum             | 121671 |   0.5182 |   0.6842 |     0.8114 |   2.0835 |
+| go               |  68345 |   0.9071 |   1.7246 |     2.1782 |   7.1312 |
+| httpz            | 126594 |   0.4889 |   0.7297 |     0.9070 |   6.5328 |
+
+**Verdict:** the v0.8.0 evented large-response fix is validated under load — `zax-ev`
+serves the 64 KB buffered body with **no 500s**, at ~122k req/s (on par with axum 121.7k
+and httpz 126.6k, ~1.8× go), p99.9 1.69 ms. Threaded `zax` also serves it (115k) but
+carries the known macOS-loopback thread-per-conn tail (p99.9 52 ms / max 87 ms) — a
+backend characteristic, not the large-response path.
+
+### Memory under large load (same run)
+
+| Framework        | idle (MB) | peak (MB) |
+|------------------|----------:|----------:|
+| zax (threaded)   |       1.9 |       3.4 |
+| zax-ev (evented) |      44.7 |      47.1 |
+| axum             |       2.8 |      12.5 |
+| go               |      11.2 |      27.0 |
+| httpz            |       3.3 |       4.2 |
+
+`zax-ev` peak RSS stays ~47 MB under 64 KB-body load (idle 44.7) — bounded, no balloon;
+the lazy-slot high-water-mark holds.
+
+### Soak / leak check — `SOAK_WAVES=5 PAYLOAD_KB=64 ./soak.sh`
+
+```
+WAVE      RSS(MB)
+1            46.4
+2            46.5
+3            46.6
+4            46.6
+5            46.7
+
+OK — RSS plateaued (47504KB -> 47840KB across 5 waves).
+```
+
+**Verdict:** no leak — RSS plateaus across repeated large-payload waves (+0.3 MB over 5
+waves = noise). The evented large-response + lazy-slot fixes are confirmed leak-free under
+sustained load.
