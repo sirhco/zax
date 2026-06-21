@@ -149,4 +149,5 @@ test "SetCookie: invalid value rejected" {
     try testing.expectError(error.InvalidCookieValue, ser(a, .{ .name = "k", .value = "a b" }));
     try testing.expectError(error.InvalidCookieValue, ser(a, .{ .name = "k", .value = "a;b" }));
     try testing.expectError(error.InvalidCookieValue, ser(a, .{ .name = "k", .value = "a\"b" }));
+    try testing.expectError(error.InvalidCookieValue, ser(a, .{ .name = "k", .value = "a\\b" }));
 }

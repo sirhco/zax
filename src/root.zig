@@ -23,8 +23,9 @@ pub const SsePull = response.SsePull;
 pub const PullResult = response.PullResult;
 pub const Status = response.Status;
 pub const intoResponse = response.intoResponse;
-pub const SetCookie = @import("http/set_cookie.zig").SetCookie;
-pub const SameSite = @import("http/set_cookie.zig").SameSite;
+pub const set_cookie = @import("http/set_cookie.zig");
+pub const SetCookie = set_cookie.SetCookie;
+pub const SameSite = set_cookie.SameSite;
 
 // --- Routing (Phase 2) ---
 pub const radix = @import("router/radix.zig");
