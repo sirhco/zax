@@ -62,7 +62,6 @@ fn parseBoundary(ct: []const u8) ?[]const u8 {
             return if (v.len == 0) null else v;
         }
         rest = if (next_semi) |n| param[n..] else "";
-        _ = &param;
     }
     return null;
 }
