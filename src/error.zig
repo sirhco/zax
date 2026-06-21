@@ -31,6 +31,8 @@ pub const Error = error{
     PreconditionFailed,
     BadGateway,
     GatewayTimeout,
+    InvalidMultipart,
+    TooManyParts,
 };
 
 /// Map any error to a status + reason. Covers the canonical `Error` set and the
@@ -55,6 +57,9 @@ pub fn classify(e: anyerror) ErrorInfo {
         error.PreconditionFailed => .{ .status = .precondition_failed, .reason = "precondition failed" },
         error.BadGateway => .{ .status = .bad_gateway, .reason = "bad gateway" },
         error.GatewayTimeout => .{ .status = .gateway_timeout, .reason = "gateway timeout" },
+
+        error.InvalidMultipart => .{ .status = .bad_request, .reason = "invalid multipart body" },
+        error.TooManyParts => .{ .status = .payload_too_large, .reason = "too many multipart parts" },
 
         // Extractor tags (from path.zig/query.zig/json.zig/scalar.zig).
         error.MissingPathParam => .{ .status = .bad_request, .reason = "missing path parameter" },
@@ -90,6 +95,13 @@ test "classify maps extractor tags to 4xx" {
 
 test "classify maps PayloadTooLarge to 413" {
     try testing.expectEqual(Status.payload_too_large, classify(error.PayloadTooLarge).status);
+}
+
+test "classify maps multipart errors" {
+    try testing.expectEqual(Status.bad_request, classify(error.InvalidMultipart).status);
+    try testing.expectEqualStrings("invalid multipart body", classify(error.InvalidMultipart).reason);
+    try testing.expectEqual(Status.payload_too_large, classify(error.TooManyParts).status);
+    try testing.expectEqualStrings("too many multipart parts", classify(error.TooManyParts).reason);
 }
 
 test "classify maps unknown errors to 500" {

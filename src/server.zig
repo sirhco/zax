@@ -1862,6 +1862,54 @@ test "input parity: Form + Cookies over a real connection" {
     loop_fut.await(io);
 }
 
+const Multipart = @import("extract/multipart.zig").Multipart;
+
+fn multipartHandler(a: @import("extract/alloc.zig").Alloc, mp: Multipart) Response {
+    const filename = mp.file("f").?.filename.?;
+    const desc = mp.field("desc").?;
+    const out = std.fmt.allocPrint(a.value, "{s}|{s}", .{ filename, desc }) catch "error";
+    return Response.text(out);
+}
+
+test "input parity: Multipart over a real connection" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.post("/upload", multipartHandler);
+
+    const port: u16 = 18125;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [2048]u8 = undefined;
+    const body =
+        "--X\r\n" ++
+        "Content-Disposition: form-data; name=\"desc\"\r\n\r\n" ++
+        "hi\r\n" ++
+        "--X\r\n" ++
+        "Content-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\n" ++
+        "Content-Type: text/plain\r\n\r\n" ++
+        "data\r\n" ++
+        "--X--\r\n";
+    const clen = std.fmt.comptimePrint("{d}", .{body.len});
+    const raw =
+        "POST /upload HTTP/1.1\r\n" ++
+        "Host: x\r\n" ++
+        "Content-Type: multipart/form-data; boundary=X\r\n" ++
+        "Content-Length: " ++ clen ++ "\r\n\r\n" ++
+        body;
+    const r = doRequest(io, port, raw, &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "a.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "hi") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
 fn redirectHandler() Response {
     return Response.redirect(.found, "/next");
 }

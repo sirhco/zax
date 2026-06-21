@@ -4,6 +4,12 @@ All notable changes to zax are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `Multipart` extractor — parse `multipart/form-data` request bodies (file uploads) into a zero-copy list of parts (`mp.field` / `mp.file` / `mp.parts`); bounded by `max_body_size` and a 1024-part cap (malformed → 400, too many parts → 413).
+
 ## [0.8.2] - 2026-06-21
 
 Tooling/infrastructure release — no library API or behavior change.

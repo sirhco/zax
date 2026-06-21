@@ -63,11 +63,35 @@ extractor must come last** (enforced at compile time).
 | `Form(T)` | urlencoded request body → struct fields (must be last) |
 | `Cookies` | request cookies via `.get(name)` |
 | `Bytes` | the raw request body (`[]const u8`, must be last) |
+| `Multipart` | parse `multipart/form-data` request bodies (file uploads) → a zero-copy parts list; `mp.field(name)` (text), `mp.file(name)` (file), `mp.part(name)` (either); must be last |
 | `Files` | serve files: `files.file(path)` / `files.dir(root, requested)` (traversal-safe) |
 
 Handlers return anything that satisfies `IntoResponse`: a `Response`, a `Status`,
 a byte-string, or a custom type with `pub fn intoResponse(self) Response`. A
 returned error becomes a `500`.
+
+### Multipart form data (file uploads)
+
+The `Multipart` extractor parses `multipart/form-data` request bodies into a
+zero-copy parts list, reading directly from the request buffer:
+
+```zig
+fn upload(mp: zax.Multipart, a: zax.Alloc) !zax.Response {
+    const desc = mp.field("desc") orelse "untitled";
+    if (mp.file("upload")) |file| {
+        // file is a zax.MultipartPart{ name, filename, content_type, data }
+        // where data is a []const u8 slice into the request body
+        const body = try std.fmt.allocPrint(a.value, "uploaded {s} ({d} bytes): {s}\n",
+            .{ file.filename, file.data.len, desc });
+        return zax.Response.text(body);
+    }
+    return .{ .status = .bad_request };
+}
+// curl -F "desc=my file" -F "[email protected]" localhost:8080/upload
+```
+
+Errors: malformed multipart framing → `400`, exceeding 1024 parts or `max_body_size` → `413`.
+Each `Part` is valid for the request's lifetime (borrowed slices into the request body).
 
 ## Middleware
 
