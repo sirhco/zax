@@ -92,4 +92,6 @@ test {
     // Pull every module into analysis so their `test` blocks run under
     // `zig build test`.
     std.testing.refAllDecls(@This());
+    // Task 1: multipart.zig not yet re-exported from root; pull it in for tests.
+    _ = @import("extract/multipart.zig");
 }
