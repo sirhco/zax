@@ -23,7 +23,15 @@ env ZAX_BACKEND=evented PAYLOAD_KB="$PAYLOAD_KB" ./zax/zig-out/bin/zax-bench >/d
 pid=$!
 trap 'kill "$pid" 2>/dev/null || true' EXIT
 
-for _ in $(seq 1 50); do curl -fs "http://127.0.0.1:$PORT/large" >/dev/null 2>&1 && break; sleep 0.1; done
+ready=0
+for _ in $(seq 1 50); do
+  if curl -fs "http://127.0.0.1:$PORT/large" >/dev/null 2>&1; then ready=1; break; fi
+  sleep 0.1
+done
+if [ "$ready" -ne 1 ]; then
+  echo "ERROR: zax-ev did not become ready on port $PORT" >&2
+  exit 1
+fi
 
 printf '%-6s %10s\n' "WAVE" "RSS(MB)"
 first_kb=0; last_kb=0
