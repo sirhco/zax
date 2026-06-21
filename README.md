@@ -1,5 +1,7 @@
 # Zax
 
+[![CI](https://github.com/sirhco/zax/actions/workflows/ci.yml/badge.svg)](https://github.com/sirhco/zax/actions/workflows/ci.yml)
+
 An [Axum](https://github.com/tokio-rs/axum)-style HTTP web framework for **Zig 0.16.0**.
 Typed handlers, comptime extractors, a radix router, read-only shared state, and
 graceful shutdown — built from scratch on the new `std.Io` interface.
@@ -536,6 +538,8 @@ keep-alive, middleware, graceful drain, HTTPS via reverse-proxy termination
 standard HTTP status support (the `Status` enum covers all IANA-registered codes;
 `Response.fromCode(u16)` handles non-standard codes; the `zax.Error` set covers
 all common handler-facing statuses).
+
+CI runs `zig build test` on Linux (epoll) and macOS (kqueue) plus a bench compile-check on every push and PR.
 
 Streaming is full-featured: push (`stream`/`sse`) and pull
 (`streamPull`/`ssePull`) bodies, `Transfer-Encoding: chunked` with keep-alive,
