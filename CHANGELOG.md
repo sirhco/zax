@@ -4,7 +4,7 @@ All notable changes to zax are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.1] - 2026-06-20
 
 ### Security
 
@@ -157,6 +157,7 @@ extractor/response parity, routing parity, benchmarking, and observability.
 
 Initial release.
 
+[0.8.1]: https://github.com/sirhco/zax/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/sirhco/zax/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/sirhco/zax/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/sirhco/zax/compare/v0.5.0...v0.6.0
