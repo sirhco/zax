@@ -541,6 +541,8 @@ all common handler-facing statuses).
 
 CI runs `zig build test` on Linux (epoll) and macOS (kqueue) plus a bench compile-check on every push and PR.
 
+**Fuzzing.** `zig build test --fuzz` fuzzes the request-head parser (`parseHead`) and the inbound chunked-body decoder (`decodeInPlace`) with Zig's native fuzzer (no external deps). The same fuzz tests run as a seed-corpus smoke under plain `zig build test`, so CI exercises the harness on every push.
+
 Streaming is full-featured: push (`stream`/`sse`) and pull
 (`streamPull`/`ssePull`) bodies, `Transfer-Encoding: chunked` with keep-alive,
 inbound chunked request-body decoding, and a not-ready backoff + idle cap — on
