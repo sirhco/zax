@@ -4,6 +4,16 @@ All notable changes to zax are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] - 2026-06-21
+
+Tooling/infrastructure release — no library API or behavior change.
+
+### Added
+
+- **Continuous integration** (`.github/workflows/ci.yml`): `zig build test` on Linux (epoll) and macOS (kqueue) plus a benchmark compile-check, on every push and pull request. New `zig build bench-build` step (compile-check the bench exe without running it).
+- **Fuzzing harness**: Zig-native fuzz tests for the request-head parser (`parseHead`) and the inbound chunked-body decoder (`decodeInPlace`) — run with `zig build test --fuzz`; the same tests run as a seed-corpus smoke under plain `zig build test`.
+- **Benchmark tooling**: cross-framework memory (RSS) capture, a large-payload (`PAYLOAD_KB`) scenario, and a `soak.sh` leak check in `benchmarks/cross/`.
+
 ## [0.8.1] - 2026-06-20
 
 ### Security
@@ -157,6 +167,7 @@ extractor/response parity, routing parity, benchmarking, and observability.
 
 Initial release.
 
+[0.8.2]: https://github.com/sirhco/zax/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/sirhco/zax/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/sirhco/zax/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/sirhco/zax/compare/v0.6.0...v0.7.0
