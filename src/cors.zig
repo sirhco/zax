@@ -65,8 +65,7 @@ fn decorate(arena: std.mem.Allocator, r0: Response, comptime config: Cors, allow
         r = try r.withHeader(arena, "access-control-allow-methods", config.methods);
         r = try r.withHeader(arena, "access-control-allow-headers", config.allow_headers);
         if (config.max_age) |ma| {
-            var nbuf: [16]u8 = undefined;
-            const ns = std.fmt.bufPrint(&nbuf, "{d}", .{ma}) catch unreachable;
+            const ns = try std.fmt.allocPrint(arena, "{d}", .{ma});
             r = try r.withHeader(arena, "access-control-max-age", ns);
         }
     } else if (config.expose_headers) |eh| {
@@ -165,9 +164,24 @@ test "cors preflight: 204 + allow-methods/headers, handler not called" {
     try testing.expect(!ran);
     try testing.expectEqual(@import("http/response.zig").Status.no_content, r.status);
     try testing.expectEqualStrings("*", hdr(r, "access-control-allow-origin").?);
-    try testing.expect(hdr(r, "access-control-allow-methods") != null);
-    try testing.expect(hdr(r, "access-control-allow-headers") != null);
+    try testing.expectEqualStrings("GET, POST, PUT, DELETE, OPTIONS", hdr(r, "access-control-allow-methods").?);
+    try testing.expectEqualStrings("Content-Type", hdr(r, "access-control-allow-headers").?);
     try testing.expectEqualStrings("600", hdr(r, "access-control-max-age").?);
+}
+
+test "cors preflight: list miss origin → 204, no access-control-* headers, handler not called" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ran = false;
+    const req = fakeReq(.OPTIONS, &.{
+        .{ .name = "Origin", .value = "https://evil.com" },
+        .{ .name = "Access-Control-Request-Method", .value = "GET" },
+    });
+    const r = try runCors(arena.allocator(), .{ .origins = .{ .list = &.{"https://a.com"} } }, &req, &ran);
+    try testing.expect(!ran);
+    try testing.expectEqual(@import("http/response.zig").Status.no_content, r.status);
+    try testing.expectEqual(@as(?[]const u8, null), hdr(r, "access-control-allow-origin"));
+    try testing.expectEqual(@as(?[]const u8, null), hdr(r, "access-control-allow-methods"));
 }
 
 test "cors: no Origin passes through with no CORS headers" {
