@@ -8,6 +8,17 @@ const ws = @import("../ws.zig");
 const Response = @import("../http/response.zig").Response;
 const classify = @import("../error.zig").classify;
 
+/// True if `list` (a comma-separated HTTP header list) contains `token`,
+/// case-insensitively, after trimming surrounding whitespace from each element.
+fn hasToken(list: []const u8, token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |raw| {
+        const t = std.mem.trim(u8, raw, " \t");
+        if (std.ascii.eqlIgnoreCase(t, token)) return true;
+    }
+    return false;
+}
+
 /// RFC 6455 upgrade handshake extractor. `fromContext` validates the request;
 /// `onUpgrade` attaches the takeover callback to a 101 Response.
 pub const WebSocket = struct {
@@ -19,10 +30,10 @@ pub const WebSocket = struct {
 
     pub fn fromContext(ctx: anytype) error{NotWebSocketUpgrade}!@This() {
         const up = ctx.req.header("upgrade") orelse return error.NotWebSocketUpgrade;
-        if (std.ascii.indexOfIgnoreCase(up, "websocket") == null) return error.NotWebSocketUpgrade;
+        if (!hasToken(up, "websocket")) return error.NotWebSocketUpgrade;
 
         const conn = ctx.req.header("connection") orelse return error.NotWebSocketUpgrade;
-        if (std.ascii.indexOfIgnoreCase(conn, "upgrade") == null) return error.NotWebSocketUpgrade;
+        if (!hasToken(conn, "upgrade")) return error.NotWebSocketUpgrade;
 
         const ver = ctx.req.header("sec-websocket-version") orelse return error.NotWebSocketUpgrade;
         if (!std.mem.eql(u8, ver, "13")) return error.NotWebSocketUpgrade;
@@ -111,4 +122,31 @@ test "classify maps NotWebSocketUpgrade to 426" {
         @import("../http/response.zig").Status.upgrade_required,
         classify(error.NotWebSocketUpgrade).status,
     );
+}
+
+test "WebSocket.fromContext rejects an Upgrade header without the websocket token" {
+    const pairs = [_][2][]const u8{
+        .{ "Upgrade", "not-websocket" }, .{ "Connection", "Upgrade" },
+        .{ "Sec-WebSocket-Version", "13" }, .{ "Sec-WebSocket-Key", "x" },
+    };
+    const req = FakeReq{ .pairs = &pairs };
+    try testing.expectError(error.NotWebSocketUpgrade, WebSocket.fromContext(ctxWith(&req)));
+}
+
+test "WebSocket.fromContext accepts a Connection list and rejects a non-token substring" {
+    // Real browsers send e.g. "Connection: keep-alive, Upgrade" -> accepted.
+    const ok_pairs = [_][2][]const u8{
+        .{ "Upgrade", "websocket" }, .{ "Connection", "keep-alive, Upgrade" },
+        .{ "Sec-WebSocket-Version", "13" }, .{ "Sec-WebSocket-Key", "x" },
+    };
+    const ok_req = FakeReq{ .pairs = &ok_pairs };
+    _ = try WebSocket.fromContext(ctxWith(&ok_req));
+
+    // "upgrade-insecure-requests" contains "upgrade" as a substring but is not the token -> rejected.
+    const bad_pairs = [_][2][]const u8{
+        .{ "Upgrade", "websocket" }, .{ "Connection", "upgrade-insecure-requests" },
+        .{ "Sec-WebSocket-Version", "13" }, .{ "Sec-WebSocket-Key", "x" },
+    };
+    const bad_req = FakeReq{ .pairs = &bad_pairs };
+    try testing.expectError(error.NotWebSocketUpgrade, WebSocket.fromContext(ctxWith(&bad_req)));
 }
