@@ -39,6 +39,7 @@ const extract = @import("extract/extract.zig");
 const middleware = @import("middleware.zig");
 const err_mod = @import("error.zig");
 const observe_mod = @import("observe.zig");
+const ws_mod = @import("ws.zig");
 
 // ---------------------------------------------------------------------------
 // Compile-time-gated latency tracer.
@@ -679,6 +680,37 @@ pub fn App(comptime AppState: type) type {
                 var resp = self.dispatch(io, &parsed.request, &arena, rid);
 
                 const t_disp: i96 = if (comptime build_options.trace_latency) nowNs(io) else 0;
+
+                if (resp.upgrade) |up| {
+                    // Write the 101 handshake by hand (the generic Response writer
+                    // would emit content-length: 0 and connection: close).
+                    w.writeAll("HTTP/1.1 101 Switching Protocols\r\n") catch break;
+                    w.writeAll("Upgrade: websocket\r\n") catch break;
+                    w.writeAll("Connection: Upgrade\r\n") catch break;
+                    w.writeAll("Sec-WebSocket-Accept: ") catch break;
+                    w.writeAll(&up.accept) catch break;
+                    w.writeAll("\r\n\r\n") catch break;
+                    w.flush() catch break;
+
+                    // Hand the socket to the callback. Reuse the connection read
+                    // buffer: drop the request bytes, move any pipelined frame
+                    // bytes to the front, then read frames from there + the socket.
+                    cr.consume(consumed);
+                    cr.compact();
+                    var conn = ws_mod.WsConn{
+                        .io = io,
+                        .socket = stream.socket,
+                        .w = w,
+                        .buf = read_buf,
+                        .start = 0,
+                        .end = cr.buffered().len,
+                        .state_ptr = @ptrCast(&self.state),
+                        .arena = arena.allocator(),
+                        .idle_timeout = idle_to,
+                    };
+                    up.cb(&conn);
+                    break; // takeover done -> close (defer stream.close)
+                }
 
                 if (self.opts.request_id) {
                     resp = resp.withHeader(arena.allocator(), "x-request-id", rid) catch resp;
@@ -3452,6 +3484,76 @@ test "e2e: gzip compresses a large text response when accepted" {
     var rb2: [4096]u8 = undefined;
     const small = doRequest(io, port, "GET /small HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n", &rb2);
     try testing.expect(std.mem.indexOf(u8, small, "content-encoding: gzip") == null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+fn wsEchoHandler(sock: @import("extract/websocket.zig").WebSocket) Response {
+    return sock.onUpgrade(struct {
+        fn run(conn: *ws_mod.WsConn) void {
+            while (conn.read()) |f| conn.send(f.opcode, f.payload) catch break;
+        }
+    }.run);
+}
+
+test "end-to-end: websocket upgrade, handshake, and echo" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ws", wsEchoHandler);
+
+    const port: u16 = 18097;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    // 1. Send the handshake and assert 101 + accept value.
+    const upgrade_req =
+        "GET /ws HTTP/1.1\r\nHost: x\r\n" ++
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    cw.interface.writeAll(upgrade_req) catch unreachable;
+    cw.interface.flush() catch unreachable;
+    while (std.mem.indexOf(u8, cr.interface.buffered(), "\r\n\r\n") == null) {
+        cr.interface.fillMore() catch unreachable;
+    }
+    const head_end = std.mem.indexOf(u8, cr.interface.buffered(), "\r\n\r\n").? + 4;
+    const head = cr.interface.buffered()[0..head_end];
+    try testing.expect(std.mem.indexOf(u8, head, "101 Switching Protocols") != null);
+    try testing.expect(std.mem.indexOf(u8, head, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+    cr.interface.toss(head_end);
+
+    // 2. Send a masked text frame "hi" (zero mask key -> payload bytes unchanged).
+    const text_frame = [_]u8{ 0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 'h', 'i' };
+    cw.interface.writeAll(&text_frame) catch unreachable;
+    cw.interface.flush() catch unreachable;
+
+    // 3. Read the echoed unmasked server frame: 0x81, 0x02, 'h', 'i'.
+    while (cr.interface.buffered().len < 4) cr.interface.fillMore() catch unreachable;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'h', 'i' }, cr.interface.buffered()[0..4]);
+    cr.interface.toss(4);
+
+    // 4. Send a masked close frame; the server ends the loop and closes the socket.
+    const close_frame = [_]u8{ 0x88, 0x80, 0x00, 0x00, 0x00, 0x00 };
+    cw.interface.writeAll(&close_frame) catch unreachable;
+    cw.interface.flush() catch unreachable;
+    // After close, the server closes -> the client read sees EOF (fillMore errors).
+    const eof = blk: {
+        cr.interface.fillMore() catch break :blk true;
+        break :blk cr.interface.buffered().len == 0;
+    };
+    try testing.expect(eof);
 
     app.requestShutdown(io);
     loop_fut.await(io);
