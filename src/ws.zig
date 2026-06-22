@@ -67,20 +67,22 @@ pub fn parseFrame(buf: []u8) ParseError!Parsed {
     const masked = (b1 & 0x80) != 0;
     const len7: u7 = @truncate(b1 & 0x7F);
 
+    // All length checks use the subtraction form (`buf.len - off < N`) to stay
+    // overflow-safe: `off <= buf.len` is guaranteed at each point.
     var off: usize = 2;
     var len: usize = len7;
     if (len7 == 126) {
-        if (buf.len < off + 2) return error.Incomplete;
+        if (buf.len - off < 2) return error.Incomplete;
         len = std.mem.readInt(u16, buf[off..][0..2], .big);
         off += 2;
     } else if (len7 == 127) {
-        if (buf.len < off + 8) return error.Incomplete;
+        if (buf.len - off < 8) return error.Incomplete;
         len = std.mem.readInt(u64, buf[off..][0..8], .big);
         off += 8;
     }
 
     if (!masked) return error.UnmaskedClientFrame;
-    if (buf.len < off + 4) return error.Incomplete;
+    if (buf.len - off < 4) return error.Incomplete;
     const key = buf[off..][0..4].*;
     off += 4;
 
@@ -102,7 +104,7 @@ pub fn parseFrame(buf: []u8) ParseError!Parsed {
 // Test helper: build a masked client frame into `out`, return the used slice.
 fn buildMaskedFrame(out: []u8, fin: bool, opcode: Opcode, key: [4]u8, payload: []const u8) []u8 {
     out[0] = (if (fin) @as(u8, 0x80) else 0) | @as(u8, @intFromEnum(opcode));
-    var i: usize = undefined;
+    var i: usize = 0;
     if (payload.len < 126) {
         out[1] = 0x80 | @as(u8, @intCast(payload.len));
         i = 2;
@@ -162,10 +164,10 @@ test "ws: parseFrame 64-bit length header" {
 test "ws: parseFrame reports Incomplete at each boundary" {
     const key = [4]u8{ 0x10, 0x20, 0x30, 0x40 };
     var buf: [64]u8 = undefined;
-    const frame = buildMaskedFrame(&buf, true, .text, key, "abcdef"); // 6-byte header+key, +6 payload
-    try std.testing.expectError(error.Incomplete, parseFrame(frame[0..1])); // < 2 bytes
+    const frame = buildMaskedFrame(&buf, true, .text, key, "abcdef"); // 2-byte header + 4-byte mask key + 6-byte payload = 12 bytes
+    try std.testing.expectError(error.Incomplete, parseFrame(frame[0..1])); // < 2 bytes: no full header
     try std.testing.expectError(error.Incomplete, parseFrame(frame[0..2])); // header only, no mask key
-    try std.testing.expectError(error.Incomplete, parseFrame(frame[0..4])); // partial mask key
+    try std.testing.expectError(error.Incomplete, parseFrame(frame[0..5])); // partial mask key (3 of 4)
     try std.testing.expectError(error.Incomplete, parseFrame(frame[0..9])); // 3 of 6 payload bytes
 }
 
