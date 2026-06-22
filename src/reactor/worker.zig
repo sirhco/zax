@@ -52,6 +52,8 @@ const transport_mod = @import("transport.zig");
 const request = @import("../http/request.zig");
 const Response = @import("../http/response.zig").Response;
 
+const ws_session = @import("ws_session.zig");
+
 const Conn = conn_mod.Conn;
 const Dispatcher = conn_mod.Dispatcher;
 const monotonicNow = conn_mod.monotonicNow;
@@ -335,7 +337,44 @@ pub const Worker = struct {
 
                     if (ev.hup) {
                         // Peer closed or error.
-                        self.closeSlot(slot_idx, fd);
+                        if (slot.ws != null) {
+                            self.closeWsSlot(slot_idx, fd);
+                        } else {
+                            self.closeSlot(slot_idx, fd);
+                        }
+                        continue;
+                    }
+
+                    // If the slot is in WS mode, route to the session.
+                    if (slot.ws != null) {
+                        const t = sockTransport(fd);
+                        const result = if (ev.writable)
+                            slot.ws.?.onWritable(t)
+                        else
+                            slot.ws.?.onReadable(t);
+                        switch (result) {
+                            .want_read => {
+                                self.poller.mod(fd, @intCast(slot_idx), true, false) catch {
+                                    self.closeWsSlot(slot_idx, fd);
+                                    continue;
+                                };
+                                self.armWsIdle(slot_idx, &slot.conn);
+                            },
+                            .want_write => {
+                                self.poller.mod(fd, @intCast(slot_idx), false, true) catch {
+                                    self.closeWsSlot(slot_idx, fd);
+                                    continue;
+                                };
+                                self.armWsIdle(slot_idx, &slot.conn);
+                            },
+                            .done_close => {
+                                self.closeWsSlot(slot_idx, fd);
+                            },
+                            .want_stream_repoll, .upgraded => {
+                                // Not expected from WsSession; treat as close.
+                                self.closeWsSlot(slot_idx, fd);
+                            },
+                        }
                         continue;
                     }
 
@@ -564,10 +603,41 @@ pub const Worker = struct {
                 self.closeSlot(slot_idx, fd);
             },
             .upgraded => {
-                // Task 6: hand off to ws_session. For now, close the slot.
-                self.closeSlot(slot_idx, fd);
+                const slot = &self.slots[slot_idx];
+                const up = c.ws_upgrade.?;
+                slot.ensureWsOut(self.gpa) catch {
+                    self.closeSlot(slot_idx, fd);
+                    return;
+                };
+                slot.ws = ws_session.WsSession.init(
+                    slot.read_buf, slot.ws_out_buf, up.handler, up.state_ptr, slot.arena.allocator(),
+                );
+                slot.ws.?.bind();
+                slot.ws.?.seed(c.read_buf[c.r_start..c.r_end]);
+                slot.ws.?.onOpen();
+                self.poller.mod(fd, @intCast(slot_idx), true, false) catch {
+                    self.closeWsSlot(slot_idx, fd);
+                    return;
+                };
+                self.armWsIdle(slot_idx, c);
             },
         }
+    }
+
+    fn closeWsSlot(self: *Worker, slot_idx: usize, fd: i32) void {
+        const slot = &self.slots[slot_idx];
+        if (slot.ws) |*sess| sess.onClose();
+        slot.ws = null;
+        self.closeSlot(slot_idx, fd);
+    }
+
+    fn armWsIdle(self: *Worker, slot_idx: usize, c: *Conn) void {
+        if (c.idle_timeout_ms == 0) {
+            self.timer.remove(slot_idx);
+            return;
+        }
+        const deadline = monotonicNow() + @as(i96, c.idle_timeout_ms) * 1_000_000;
+        self.timer.insert(slot_idx, deadline);
     }
 
     fn closeSlot(self: *Worker, slot_idx: usize, fd: i32) void {
@@ -587,6 +657,7 @@ pub const Worker = struct {
         const slot = &self.slots[slot_idx];
         slot.active = false;
         slot.fd = -1;
+        slot.ws = null;
         // Reset arena (retain capacity so the allocator re-uses it).
         _ = slot.arena.reset(.retain_capacity);
         self.free[self.free_len] = slot_idx;
@@ -596,6 +667,7 @@ pub const Worker = struct {
     fn drainAll(self: *Worker) void {
         for (self.slots, 0..) |*slot, i| {
             if (!slot.active) continue;
+            if (slot.ws) |*sess| { sess.onClose(); slot.ws = null; }
             self.poller.del(slot.fd);
             closeFd(slot.fd);
             self.timer.remove(i);
@@ -625,6 +697,8 @@ const Slot = struct {
     fd: i32 = -1,
     active: bool = false,
     free_idx: usize = 0, // index back into Worker.slots (set at alloc time)
+    ws: ?ws_session.WsSession = null,
+    ws_out_buf: []u8 = &.{}, // outbound WS buffer (lazily allocated on upgrade)
 
     // No allocation here — record sizes + init the (lazy) arena. Infallible.
     fn init(gpa: std.mem.Allocator, read_buf_size: usize, write_buf_size: usize) Slot {
@@ -641,9 +715,14 @@ const Slot = struct {
         if (self.write_buf.len == 0) self.write_buf = try gpa.alloc(u8, self.write_size);
     }
 
+    fn ensureWsOut(self: *Slot, gpa: std.mem.Allocator) !void {
+        if (self.ws_out_buf.len == 0) self.ws_out_buf = try gpa.alloc(u8, self.write_size);
+    }
+
     fn deinit(self: *Slot, gpa: std.mem.Allocator) void {
         if (self.read_buf.len != 0) gpa.free(self.read_buf);
         if (self.write_buf.len != 0) gpa.free(self.write_buf);
+        if (self.ws_out_buf.len != 0) gpa.free(self.ws_out_buf);
         self.arena.deinit();
     }
 };
@@ -722,6 +801,13 @@ fn expiredCb(slot_idx: usize) void {
     if (!slot.active) return;
 
     const fd = slot.fd;
+
+    // WS slot: idle timeout → close the session.
+    if (slot.ws != null) {
+        w.closeWsSlot(slot_idx, fd);
+        return;
+    }
+
     const result = slot.conn.onDeadline();
     switch (result) {
         .want_write => {
@@ -752,7 +838,7 @@ fn expiredCb(slot_idx: usize) void {
             }
         },
         .upgraded => {
-            // Task 6: hand off to ws_session. For now, close the slot.
+            // onDeadline on a non-WS conn returning .upgraded is unexpected; close.
             w.closeSlot(slot_idx, fd);
         },
     }

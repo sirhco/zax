@@ -3654,3 +3654,91 @@ test "observe: upgrade request is recorded with status 101" {
     try testing.expectEqual(@as(u16, 101), cap.status);
     try testing.expect(cap.count >= 1);
 }
+
+test "end-to-end (evented): websocket upgrade, handshake, and echo" {
+    if (!evented_supported) return error.SkipZigTest;
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ws", wsEchoHandler);
+
+    const port: u16 = 18099;
+    const addr = net.IpAddress{ .ip4 = .loopback(port) };
+
+    const ServeCtx = struct {
+        app: *TestApp,
+        io: Io,
+        addr: net.IpAddress,
+        err: ?anyerror = null,
+    };
+    var serve_ctx = ServeCtx{ .app = &app, .io = undefined, .addr = addr };
+    var srv_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer srv_threaded.deinit();
+    serve_ctx.io = srv_threaded.io();
+
+    const ServeThread = struct {
+        fn run(ctx: *ServeCtx) void {
+            ctx.app.serveEvented(ctx.io, ctx.addr, .{ .workers = 1 }) catch |e| {
+                ctx.err = e;
+            };
+        }
+    };
+    const srv_thread = try std.Thread.spawn(.{}, ServeThread.run, .{&serve_ctx});
+
+    sevWaitListening(port, 50);
+
+    const cfd = try sevSocket();
+    defer sevCloseFd(cfd);
+    try testing.expect(sevConnect(cfd, port));
+
+    // 1. Send the WebSocket upgrade request.
+    const upgrade_req =
+        "GET /ws HTTP/1.1\r\nHost: x\r\n" ++
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    try sevWrite(cfd, upgrade_req);
+
+    // 2. Read the 101 response head.
+    var head_buf: [1024]u8 = undefined;
+    var head_total: usize = 0;
+    var head_tries: usize = 0;
+    while (std.mem.indexOf(u8, head_buf[0..head_total], "\r\n\r\n") == null) : (head_tries += 1) {
+        if (head_tries > 1000) return error.TestTimeout;
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(std.os.linux.read(@intCast(cfd), head_buf[head_total..].ptr, head_buf.len - head_total))
+        else
+            std.c.read(cfd, head_buf[head_total..].ptr, head_buf.len - head_total);
+        if (n <= 0) return error.UnexpectedEof;
+        head_total += @intCast(n);
+    }
+    const head_end = std.mem.indexOf(u8, head_buf[0..head_total], "\r\n\r\n").? + 4;
+    try testing.expect(std.mem.indexOf(u8, head_buf[0..head_end], "101 Switching Protocols") != null);
+    try testing.expect(std.mem.indexOf(u8, head_buf[0..head_end], "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+
+    // 3. Send a masked text frame "hi" (zero mask key → payload bytes unchanged).
+    const text_frame = [_]u8{ 0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 'h', 'i' };
+    try sevWrite(cfd, &text_frame);
+
+    // 4. Read the echoed unmasked server frame: 0x81, 0x02, 'h', 'i'.
+    var echo_buf: [64]u8 = undefined;
+    var echo_total: usize = 0;
+    var echo_tries: usize = 0;
+    while (echo_total < 4) : (echo_tries += 1) {
+        if (echo_tries > 1000) return error.TestTimeout;
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(std.os.linux.read(@intCast(cfd), echo_buf[echo_total..].ptr, echo_buf.len - echo_total))
+        else
+            std.c.read(cfd, echo_buf[echo_total..].ptr, echo_buf.len - echo_total);
+        if (n <= 0) return error.UnexpectedEof;
+        echo_total += @intCast(n);
+    }
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'h', 'i' }, echo_buf[0..4]);
+
+    // 5. Shutdown.
+    var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer shutdown_threaded.deinit();
+    app.requestShutdown(shutdown_threaded.io());
+    srv_thread.join();
+    try testing.expect(serve_ctx.err == null);
+}
