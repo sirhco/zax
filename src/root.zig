@@ -74,6 +74,8 @@ pub const middleware = @import("middleware.zig");
 pub const Chain = middleware.Chain;
 pub const Cors = @import("cors.zig").Cors;
 pub const cors = @import("cors.zig").cors;
+pub const Compress = @import("compress.zig").Compress;
+pub const compress = @import("compress.zig").compress;
 
 // --- Server (Phase 4) ---
 pub const server = @import("server.zig");
