@@ -6,6 +6,7 @@
 const std = @import("std");
 const Writer = std.Io.Writer;
 const Header = @import("request.zig").Header;
+const SetCookie = @import("set_cookie.zig").SetCookie;
 const sse_mod = @import("sse.zig");
 
 pub const Status = enum(u16) {
@@ -355,6 +356,19 @@ pub const Response = struct {
         var r = self;
         r.headers = list;
         return r;
+    }
+
+    /// Append a `Set-Cookie` header for `cookie` (serialized into `arena`).
+    /// Multiple calls emit multiple `set-cookie` lines (order preserved).
+    pub fn withCookie(self: Response, arena: std.mem.Allocator, cookie: SetCookie) SetCookie.Error!Response {
+        const v = try cookie.serialize(arena);
+        return self.withHeader(arena, "set-cookie", v);
+    }
+
+    /// Append a `Set-Cookie` that clears `name` (empty value, Max-Age=0). `path`
+    /// should match the path the cookie was set with (null omits Path).
+    pub fn expireCookie(self: Response, arena: std.mem.Allocator, name: []const u8, path: ?[]const u8) SetCookie.Error!Response {
+        return self.withCookie(arena, .{ .name = name, .value = "", .max_age = 0, .path = path });
     }
 
     /// Shared head serializer. `content_length` is emitted only when given.
@@ -768,4 +782,40 @@ test "writeHead chunked=false emits connection close" {
     const out = w.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "connection: close\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "transfer-encoding") == null);
+}
+
+test "withCookie appends a set-cookie header before connection" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [256]u8 = undefined;
+    const r = try Response.text("hi").withCookie(arena.allocator(), .{
+        .name = "sid", .value = "abc", .path = "/", .http_only = true,
+    });
+    const out = serialize(&buf, r);
+    const sc_at = std.mem.indexOf(u8, out, "set-cookie: sid=abc; Path=/; HttpOnly\r\n").?;
+    const conn_at = std.mem.indexOf(u8, out, "connection: close\r\n").?;
+    try testing.expect(sc_at < conn_at);
+    try testing.expect(std.mem.endsWith(u8, out, "hi"));
+}
+
+test "two withCookie calls emit two set-cookie lines in order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+    const r = try (try Response.text("x").withCookie(a, .{ .name = "a", .value = "1" }))
+        .withCookie(a, .{ .name = "b", .value = "2" });
+    const out = serialize(&buf, r);
+    const a_at = std.mem.indexOf(u8, out, "set-cookie: a=1\r\n").?;
+    const b_at = std.mem.indexOf(u8, out, "set-cookie: b=2\r\n").?;
+    try testing.expect(a_at < b_at);
+}
+
+test "expireCookie emits empty value with Max-Age=0" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [256]u8 = undefined;
+    const r = try Response.text("bye").expireCookie(arena.allocator(), "sid", "/");
+    const out = serialize(&buf, r);
+    try testing.expect(std.mem.indexOf(u8, out, "set-cookie: sid=; Max-Age=0; Path=/\r\n") != null);
 }
