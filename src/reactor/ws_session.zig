@@ -59,6 +59,7 @@ pub const WsSession = struct {
     /// Readable event: drain anything still pending out (it shouldn't, but be safe),
     /// then read available bytes and pump frames.
     pub fn onReadable(self: *WsSession, t: Transport) StepResult {
+        std.debug.assert(@intFromPtr(self.conn.ctx) == @intFromPtr(self));
         self.cur_t = t;
         defer self.cur_t = null;
 
@@ -68,7 +69,10 @@ pub const WsSession = struct {
         if (self.closing) return .done_close;
 
         // Read more, then pump again.
-        if (self.r_end == self.read_buf.len) return .done_close; // frame larger than buffer
+        // `ws.pump` compacts leftover to the front (r_start := 0) on every return,
+        // so r_start == 0 here; r_end == read_buf.len then means a single incomplete
+        // frame fills the whole buffer and can never complete -> close.
+        if (self.r_end == self.read_buf.len and self.r_start == 0) return .done_close;
         switch (t.read(self.read_buf[self.r_end..])) {
             .ok => |n| {
                 if (n == 0) return .done_close;
@@ -87,6 +91,7 @@ pub const WsSession = struct {
 
     /// Writable event: drain the outbound buffer; resume reading when empty.
     pub fn onWritable(self: *WsSession, t: Transport) StepResult {
+        std.debug.assert(@intFromPtr(self.conn.ctx) == @intFromPtr(self));
         self.cur_t = t;
         defer self.cur_t = null;
         switch (self.drainOut(t)) {
@@ -194,6 +199,7 @@ test "WsSession: backpressured send buffers and drains on writable" {
     const t = ft.transport();
     const r1 = sess.onReadable(t);
     try testing.expectEqual(StepResult.want_write, r1); // remainder buffered
+    try testing.expectEqual(@as(usize, 2), ft.written.items.len); // partial write of the 4-byte echo
     const r2 = sess.onWritable(t); // drain the rest
     try testing.expect(r2 == .want_read or r2 == .done_close);
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'h', 'i' }, ft.written.items);
