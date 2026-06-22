@@ -1039,6 +1039,7 @@ const Alloc = @import("extract/alloc.zig").Alloc;
 const Bytes = @import("extract/bytes.zig").Bytes;
 const Headers = @import("extract/headers.zig").Headers;
 const cors_mod = @import("cors.zig");
+const compress_mod = @import("compress.zig");
 
 const Db = struct { msg: []const u8 };
 const TestApp = App(*const Db);
@@ -3415,6 +3416,42 @@ test "e2e: OPTIONS on GET-only route without CORS still returns 405 with allow h
     try testing.expect(std.mem.indexOf(u8, r, "HTTP/1.1 405") != null);
     try testing.expect(std.mem.indexOf(u8, r, "allow: ") != null);
     try testing.expect(std.mem.indexOf(u8, r, "GET") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+fn bigHandler() Response {
+    return Response.text("x" ** 2000);
+}
+fn smallHandler() Response {
+    return Response.text("hi");
+}
+
+test "e2e: gzip compresses a large text response when accepted" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.use(compress_mod.compress(TestApp.Context, .{}));
+    try app.get("/big", bigHandler);
+    try app.get("/small", smallHandler);
+
+    const port: u16 = 18224;
+    var loop_fut = startTestApp(io, &app, port);
+
+    // Large body + Accept-Encoding: gzip → content-encoding: gzip in response.
+    var rb1: [4096]u8 = undefined;
+    const big = doRequest(io, port, "GET /big HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n", &rb1);
+    try testing.expect(std.mem.indexOf(u8, big, "content-encoding: gzip\r\n") != null);
+
+    // Small body (below min_length) → no content-encoding header.
+    var rb2: [4096]u8 = undefined;
+    const small = doRequest(io, port, "GET /small HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\n\r\n", &rb2);
+    try testing.expect(std.mem.indexOf(u8, small, "content-encoding: gzip") == null);
 
     app.requestShutdown(io);
     loop_fut.await(io);
