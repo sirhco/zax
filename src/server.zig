@@ -765,6 +765,23 @@ pub fn App(comptime AppState: type) type {
                 },
                 .method_not_allowed => |allowed| {
                     const ctx = self.makeCtx(io, req, &.{}, arena, request_id);
+                    if (req.method == .OPTIONS) {
+                        // Auto-preflight: run the global chain so a CORS middleware can
+                        // answer the preflight (it short-circuits to 204 before the
+                        // terminal). If nothing handles it, fall through to the normal 405.
+                        const term = struct {
+                            fn call(_: *const Ctx) anyerror!Response {
+                                return Response.fromStatus(.method_not_allowed);
+                            }
+                        }.call;
+                        const resp = Chn.run(self.mws.items, &term, &ctx) catch |e| return self.renderError(e, &ctx);
+                        if (resp.status == .method_not_allowed) {
+                            var r = self.renderError(err_mod.Error.MethodNotAllowed, &ctx);
+                            r = r.withHeader(ctx.arena, "allow", allowHeader(ctx.arena, allowed)) catch r;
+                            return r;
+                        }
+                        return resp;
+                    }
                     var resp = self.renderError(err_mod.Error.MethodNotAllowed, &ctx);
                     resp = resp.withHeader(ctx.arena, "allow", allowHeader(ctx.arena, allowed)) catch resp;
                     return resp;
@@ -3359,7 +3376,6 @@ test "e2e: cors preflight 204 and actual request gets allow-origin" {
     defer app.deinit();
     try app.use(cors_mod.cors(TestApp.Context, .{ .origins = .any }));
     try app.get("/x", pingHandler);
-    try app.route(.OPTIONS, "/x", pingHandler);
 
     const port: u16 = 18222;
     var loop_fut = startTestApp(io, &app, port);
@@ -3375,6 +3391,30 @@ test "e2e: cors preflight 204 and actual request gets allow-origin" {
     var rb2: [1024]u8 = undefined;
     const act = doRequest(io, port, "GET /x HTTP/1.1\r\nHost: x\r\nOrigin: https://a.com\r\n\r\n", &rb2);
     try testing.expect(std.mem.indexOf(u8, act, "access-control-allow-origin: *\r\n") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "e2e: OPTIONS on GET-only route without CORS still returns 405 with allow header" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    // No CORS middleware — OPTIONS method-mismatch must still yield 405 + allow.
+    try app.get("/x", pingHandler);
+
+    const port: u16 = 18223;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var rb: [1024]u8 = undefined;
+    const r = doRequest(io, port, "OPTIONS /x HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
+    try testing.expect(std.mem.indexOf(u8, r, "HTTP/1.1 405") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "allow: ") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "GET") != null);
 
     app.requestShutdown(io);
     loop_fut.await(io);
