@@ -101,6 +101,22 @@ pub fn parseFrame(buf: []u8) ParseError!Parsed {
     return .{ .frame = .{ .fin = fin, .opcode = opcode, .payload = payload }, .consumed = off + len };
 }
 
+/// Serialize ONE server frame (FIN = 1, unmasked) to `w`: header (with the
+/// minimal 7/16/64-bit length form) + `payload`.
+pub fn writeFrame(w: *std.Io.Writer, opcode: Opcode, payload: []const u8) std.Io.Writer.Error!void {
+    try w.writeByte(0x80 | @as(u8, @intFromEnum(opcode)));
+    if (payload.len < 126) {
+        try w.writeByte(@intCast(payload.len));
+    } else if (payload.len <= 0xFFFF) {
+        try w.writeByte(126);
+        try w.writeInt(u16, @intCast(payload.len), .big);
+    } else {
+        try w.writeByte(127);
+        try w.writeInt(u64, @intCast(payload.len), .big);
+    }
+    try w.writeAll(payload);
+}
+
 // Test helper: build a masked client frame into `out`, return the used slice.
 fn buildMaskedFrame(out: []u8, fin: bool, opcode: Opcode, key: [4]u8, payload: []const u8) []u8 {
     out[0] = (if (fin) @as(u8, 0x80) else 0) | @as(u8, @intFromEnum(opcode));
@@ -215,4 +231,57 @@ test "ws: Opcode.isControl classifies control opcodes" {
     try std.testing.expect(Opcode.close.isControl());
     try std.testing.expect(Opcode.ping.isControl());
     try std.testing.expect(Opcode.pong.isControl());
+}
+
+test "ws: writeFrame small payload emits exact bytes" {
+    var out: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out);
+    try writeFrame(&w, .text, "Hi");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'H', 'i' }, w.buffered());
+}
+
+test "ws: writeFrame 16-bit length header" {
+    var payload: [200]u8 = undefined;
+    @memset(&payload, 0xAB);
+    var out: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out);
+    try writeFrame(&w, .binary, &payload);
+    const bytes = w.buffered();
+    try std.testing.expectEqual(@as(u8, 0x82), bytes[0]); // FIN + binary
+    try std.testing.expectEqual(@as(u8, 126), bytes[1]); // 16-bit form
+    try std.testing.expectEqual(@as(u16, 200), std.mem.readInt(u16, bytes[2..4], .big));
+    try std.testing.expectEqual(@as(usize, 4 + 200), bytes.len);
+}
+
+test "ws: writeFrame 64-bit length header" {
+    const big = 70_000; // > 0xFFFF → 64-bit form
+    const payload = try std.testing.allocator.alloc(u8, big);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0xCD);
+    const out = try std.testing.allocator.alloc(u8, big + 16);
+    defer std.testing.allocator.free(out);
+    var w = std.Io.Writer.fixed(out);
+    try writeFrame(&w, .binary, payload);
+    const bytes = w.buffered();
+    try std.testing.expectEqual(@as(u8, 127), bytes[1]); // 64-bit form
+    try std.testing.expectEqual(@as(u64, big), std.mem.readInt(u64, bytes[2..10], .big));
+    try std.testing.expectEqual(@as(usize, 10 + big), bytes.len);
+}
+
+test "ws: build → parseFrame → writeFrame round-trips the payload" {
+    const original = "round-trip payload \x00\x01\x02 with bytes";
+    const key = [4]u8{ 0xa1, 0xb2, 0xc3, 0xd4 };
+    var inbuf: [128]u8 = undefined;
+    const masked = buildMaskedFrame(&inbuf, true, .binary, key, original);
+    const parsed = try parseFrame(masked);
+    try std.testing.expectEqualStrings(original, parsed.frame.payload);
+
+    var out: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out);
+    try writeFrame(&w, parsed.frame.opcode, parsed.frame.payload);
+    const server_bytes = w.buffered();
+    // server frame: byte0 = 0x80|binary, byte1 = len (unmasked, < 126), then payload
+    try std.testing.expectEqual(@as(u8, 0x82), server_bytes[0]);
+    try std.testing.expectEqual(@as(u8, @intCast(original.len)), server_bytes[1]);
+    try std.testing.expectEqualStrings(original, server_bytes[2..]);
 }
