@@ -1021,6 +1021,7 @@ const Cookies = @import("extract/cookie.zig").Cookies;
 const Alloc = @import("extract/alloc.zig").Alloc;
 const Bytes = @import("extract/bytes.zig").Bytes;
 const Headers = @import("extract/headers.zig").Headers;
+const cors_mod = @import("cors.zig");
 
 const Db = struct { msg: []const u8 };
 const TestApp = App(*const Db);
@@ -3343,6 +3344,37 @@ test "e2e: handler sets a cookie via withCookie" {
     var rb: [1024]u8 = undefined;
     const r = doRequest(io, port, "GET /cookie HTTP/1.1\r\nHost: x\r\n\r\n", &rb);
     try testing.expect(std.mem.indexOf(u8, r, "set-cookie: sid=xyz; HttpOnly\r\n") != null);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
+test "e2e: cors preflight 204 and actual request gets allow-origin" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.use(cors_mod.cors(TestApp.Context, .{ .origins = .any }));
+    try app.get("/x", pingHandler);
+    try app.route(.OPTIONS, "/x", pingHandler);
+
+    const port: u16 = 18222;
+    var loop_fut = startTestApp(io, &app, port);
+
+    // Preflight: OPTIONS with Origin + Access-Control-Request-Method → 204 + allow-methods.
+    var rb1: [1024]u8 = undefined;
+    const pre = doRequest(io, port,
+        "OPTIONS /x HTTP/1.1\r\nHost: x\r\nOrigin: https://a.com\r\nAccess-Control-Request-Method: GET\r\n\r\n", &rb1);
+    try testing.expect(std.mem.indexOf(u8, pre, "HTTP/1.1 204") != null);
+    try testing.expect(std.mem.indexOf(u8, pre, "access-control-allow-methods:") != null);
+
+    // Actual: GET with Origin → access-control-allow-origin: *.
+    var rb2: [1024]u8 = undefined;
+    const act = doRequest(io, port, "GET /x HTTP/1.1\r\nHost: x\r\nOrigin: https://a.com\r\n\r\n", &rb2);
+    try testing.expect(std.mem.indexOf(u8, act, "access-control-allow-origin: *\r\n") != null);
 
     app.requestShutdown(io);
     loop_fut.await(io);
