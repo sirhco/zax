@@ -286,3 +286,22 @@ See [`deploy-https.md`](deploy-https.md).
   Flags via `--`: `--samples`, `--warmup`, `--iters`, `--conns`, `--reqs`. Read the caveats in `README.md`.
   To capture a regression baseline: `zig build bench -- --json > src/bench/baseline.json` (then recommit);
   to gate future runs: `zig build bench -- --check` (exits nonzero on regression; default tolerance 15%).
+
+## WebSocket echo (threaded backend)
+
+```zig
+fn echo(ws: zax.WebSocket) zax.Response {
+    return ws.onUpgrade(struct {
+        fn run(conn: *zax.WsConn) void {
+            while (conn.read()) |frame|
+                conn.send(frame.opcode, frame.payload) catch break;
+        }
+    }.run);
+}
+
+// try app.get("/echo", echo);
+```
+
+The server performs the RFC 6455 handshake and hands `conn` to your callback.
+`conn.read()` yields one frame at a time and returns `null` when the peer sends a
+close frame (or the connection ends); `conn.send` writes a frame back.

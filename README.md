@@ -712,16 +712,30 @@ comparison against `std.http.Server`, http.zig, or non-Zig servers exists yet.
 
 ## WebSocket (in progress)
 
-WebSocket support is landing across several releases. This release ships the
-protocol primitives only — a pure RFC 6455 codec in `zax.ws`, with no
-connection upgrade or handler API yet:
+WebSocket support is landing across several releases. The pure RFC 6455 codec
+(`zax.ws`) and a **threaded connection upgrade + echo/handler API** now ship.
 
-- `zax.ws.acceptKey(key, &out)` — compute the `Sec-WebSocket-Accept` handshake value.
-- `zax.ws.parseFrame(buf)` — decode and unmask one client frame in place.
-- `zax.ws.writeFrame(w, opcode, payload)` — serialize one unmasked server frame.
+Declare an endpoint with the `WebSocket` extractor; `onUpgrade` hands the live
+connection to your callback after the server performs the handshake:
 
-The connection upgrade (101), socket takeover, and an echo/handler API arrive in
-a following release.
+```zig
+fn echo(ws: zax.WebSocket) zax.Response {
+    return ws.onUpgrade(struct {
+        fn run(conn: *zax.WsConn) void {
+            while (conn.read()) |frame| // one frame per read (no reassembly yet)
+                conn.send(frame.opcode, frame.payload) catch break;
+        }
+    }.run);
+}
+// app.get("/echo", echo);
+```
+
+`conn.read()` returns one client frame at a time (unmasked in place) and `null`
+on a close frame, EOF, or protocol error; `conn.send(opcode, payload)` writes one
+server frame; `conn.state(T)` reaches the app state. This release is the threaded
+backend only and single-threaded per connection. Still to come: the evented
+(reactor) backend, fragmentation reassembly, automatic ping/pong and the RFC
+close handshake, configurable frame-size caps, and cross-connection broadcast.
 
 ## Status & limitations
 
