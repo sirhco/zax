@@ -72,6 +72,8 @@ pub const classify = err.classify;
 // --- Middleware ---
 pub const middleware = @import("middleware.zig");
 pub const Chain = middleware.Chain;
+pub const Cors = @import("cors.zig").Cors;
+pub const cors = @import("cors.zig").cors;
 
 // --- Server (Phase 4) ---
 pub const server = @import("server.zig");
