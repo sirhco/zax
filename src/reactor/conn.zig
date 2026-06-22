@@ -17,6 +17,7 @@ const request = @import("../http/request.zig");
 const response_mod = @import("../http/response.zig");
 const transport_mod = @import("transport.zig");
 const chunked_mod = @import("../http/chunked.zig");
+const ws = @import("../ws.zig");
 
 const Response = response_mod.Response;
 
@@ -64,6 +65,11 @@ pub const StepResult = enum {
     /// On timer fire, `onDeadline` re-drives the conn into `.writing`.
     want_stream_repoll,
     done_close,
+    /// The response was a WebSocket upgrade and the 101 has been fully written.
+    /// The worker must switch this slot into WS mode (see reactor/ws_session.zig),
+    /// seeding it with conn.read_buf[r_start..r_end] (pipelined post-handshake bytes)
+    /// and conn.ws_upgrade (the handler + state ptr).
+    upgraded,
 };
 
 // ---------------------------------------------------------------------------
@@ -171,6 +177,10 @@ pub const Conn = struct {
     /// When true, `step` must close after the current write completes
     /// (used when a response overflowed the write buffer or was a stream).
     close_after_write: bool = false,
+
+    /// Set when dispatch returned a WebSocket upgrade. After the 101 is written,
+    /// `step` returns `.upgraded` and the worker reads this.
+    ws_upgrade: ?ws.Upgrade = null,
 
     /// When non-null, the conn is serving a pull-streamed response.
     /// Set by step() when dispatch returns a pull_streamer response; cleared on done/err.
@@ -436,6 +446,27 @@ pub const Conn = struct {
         return self.w_len;
     }
 
+    /// Serialize the 101 WebSocket handshake by hand into `write_buf` (the generic
+    /// Response writer would emit content-length: 0 / connection: close). Sets
+    /// w_len/w_off like serializeResponse.
+    pub fn serializeUpgrade(self: *Conn, accept: [28]u8) error{ResponseTooLarge}!usize {
+        var w = std.Io.Writer.fixed(self.write_buf);
+        const writeAll = struct {
+            fn f(wr: *std.Io.Writer, s: []const u8) error{ResponseTooLarge}!void {
+                wr.writeAll(s) catch return error.ResponseTooLarge;
+            }
+        }.f;
+        try writeAll(&w, "HTTP/1.1 101 Switching Protocols\r\n");
+        try writeAll(&w, "Upgrade: websocket\r\n");
+        try writeAll(&w, "Connection: Upgrade\r\n");
+        try writeAll(&w, "Sec-WebSocket-Accept: ");
+        try writeAll(&w, &accept);
+        try writeAll(&w, "\r\n\r\n");
+        self.w_len = w.end;
+        self.w_off = 0;
+        return self.w_len;
+    }
+
     /// Drive a non-blocking write through `t`.
     ///
     /// When `body_phase` is false (head phase): drains `write_buf[w_off..w_len]`.
@@ -571,6 +602,23 @@ pub const Conn = struct {
 
                             // Dispatch → Response.
                             var resp = d.dispatch(&p.request, self.arena);
+
+                            // WebSocket upgrade: serialize the 101 and signal the worker.
+                            if (resp.upgrade) |up| {
+                                self.ws_upgrade = up;
+                                if (self.serializeUpgrade(up.accept)) |_| {} else |_| {
+                                    // 101 won't fit (absurdly small write_buf) — 500 + close.
+                                    self.ws_upgrade = null;
+                                    var e500 = Response.fromStatus(.internal_server_error);
+                                    e500.keep_alive = false;
+                                    _ = self.serializeResponse(e500) catch {};
+                                    self.close_after_write = true;
+                                    self.state = .writing;
+                                    continue;
+                                }
+                                self.state = .writing; // drain the 101, then signal upgraded
+                                continue;
+                            }
 
                             // Handle pull-streamed responses: true non-blocking streaming.
                             // The legacy push `streamer` keeps buffer-or-500 behavior on
@@ -789,6 +837,10 @@ pub const Conn = struct {
                                 self.w_len = self.pending_body.len;
                                 continue; // loop back to pumpWrite with body_phase=true
                             }
+
+                            // WebSocket: the 101 handshake finished writing — hand off
+                            // to the worker, which switches this slot into WS mode.
+                            if (self.ws_upgrade != null) return .upgraded;
 
                             // Normal (non-streaming) path.
                             // Count this request regardless of keep-alive disposition.
@@ -3032,4 +3084,37 @@ test "conn: oversized HEAD — falls back to 500 and closes" {
     const written = ft.written.items;
     // Must NOT be a 200 OK.
     try testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 200") == null);
+}
+
+test "Conn.step: an upgrade response serializes a 101 and returns .upgraded" {
+    var ft = transport_mod.FakeTransport.init(testing.allocator,
+        &.{"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"});
+    defer ft.deinit();
+    var rbuf: [1024]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var c = Conn.init(&rbuf, &wbuf, &arena);
+
+    // Dispatcher that returns an upgrade Response (mimics the WebSocket extractor).
+    const Disp = struct {
+        var st: u8 = 0;
+        fn onMsg(conn: *ws.WsConn, f: ws.Frame) void { _ = conn; _ = f; }
+        fn dispatchFn(ctx: *anyopaque, req: *const request.Request, ar: *std.heap.ArenaAllocator) Response {
+            _ = ctx; _ = req; _ = ar;
+            var accept: [28]u8 = undefined;
+            _ = ws.acceptKey("dGhlIHNhbXBsZSBub25jZQ==", &accept);
+            var r = Response.fromStatus(.switching_protocols);
+            r.upgrade = .{ .accept = accept, .handler = .{ .on_message = onMsg }, .state_ptr = @ptrCast(&st) };
+            return r;
+        }
+    };
+    const d = Dispatcher{ .ctx = undefined, .dispatchFn = Disp.dispatchFn };
+    const t = ft.transport();
+    const result = c.step(t, d);
+    try testing.expectEqual(StepResult.upgraded, result);
+    try testing.expect(c.ws_upgrade != null);
+    try testing.expect(std.mem.indexOf(u8, ft.written.items, "101 Switching Protocols") != null);
+    try testing.expect(std.mem.indexOf(u8, ft.written.items, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
 }

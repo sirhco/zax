@@ -563,6 +563,10 @@ pub const Worker = struct {
             .done_close => {
                 self.closeSlot(slot_idx, fd);
             },
+            .upgraded => {
+                // Task 6: hand off to ws_session. For now, close the slot.
+                self.closeSlot(slot_idx, fd);
+            },
         }
     }
 
@@ -746,6 +750,10 @@ fn expiredCb(slot_idx: usize) void {
             if (slot.conn.deadline_ns != no_deadline) {
                 w.timer.insert(slot_idx, slot.conn.deadline_ns);
             }
+        },
+        .upgraded => {
+            // Task 6: hand off to ws_session. For now, close the slot.
+            w.closeSlot(slot_idx, fd);
         },
     }
 }
