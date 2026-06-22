@@ -82,6 +82,7 @@ pub const ws = @import("ws.zig");
 pub const WsOpcode = ws.Opcode;
 pub const WsFrame = ws.Frame;
 pub const WsConn = ws.WsConn;
+pub const WebSocket = @import("extract/websocket.zig").WebSocket;
 
 // --- Server (Phase 4) ---
 pub const server = @import("server.zig");

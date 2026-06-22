@@ -70,6 +70,8 @@ pub fn classify(e: anyerror) ErrorInfo {
         error.InvalidEnum => .{ .status = .bad_request, .reason = "invalid parameter" },
         error.InvalidJson => .{ .status = .unprocessable_entity, .reason = "invalid JSON body" },
 
+        error.NotWebSocketUpgrade => .{ .status = .upgrade_required, .reason = "upgrade required" },
+
         else => .{ .status = .internal_server_error, .reason = "internal server error" },
     };
 }

@@ -8,6 +8,7 @@ const Writer = std.Io.Writer;
 const Header = @import("request.zig").Header;
 const SetCookie = @import("set_cookie.zig").SetCookie;
 const sse_mod = @import("sse.zig");
+const ws = @import("../ws.zig");
 
 pub const Status = enum(u16) {
     @"continue" = 100,
@@ -201,6 +202,11 @@ pub const Response = struct {
     /// streaming; the threaded backend loops next()+write(). `body`/`content-length`
     /// are not used. Mutually exclusive with `streamer` (set one or the other).
     pull_streamer: ?PullStreamer = null,
+    /// Set by the `WebSocket` extractor's `onUpgrade` to signal a protocol
+    /// takeover. When present, the threaded server writes the 101 handshake and
+    /// hands the socket to `upgrade.cb` instead of writing this as a normal
+    /// response. Ignored by the generic serializer.
+    upgrade: ?ws.Upgrade = null,
 
     pub fn text(body: []const u8) Response {
         return .{ .body = body };
