@@ -44,7 +44,7 @@ pub const WsSession = struct {
 
     /// Copy pipelined post-handshake bytes into the read buffer.
     pub fn seed(self: *WsSession, bytes: []const u8) void {
-        @memcpy(self.read_buf[0..bytes.len], bytes);
+        std.mem.copyForwards(u8, self.read_buf[0..bytes.len], bytes);
         self.r_start = 0;
         self.r_end = bytes.len;
     }
@@ -181,6 +181,24 @@ test "WsSession: a close frame yields done_close" {
     var sess = WsSession.init(&rbuf, &obuf, .{ .on_message = echoOnMessage }, @ptrCast(&st), arena.allocator());
     sess.bind();
     try testing.expectEqual(StepResult.done_close, sess.onReadable(ft.transport()));
+}
+
+test "WsSession: seed handles a source that overlaps its own read buffer (pipelined frame)" {
+    var rbuf: [64]u8 = undefined;
+    var obuf: [64]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var st: u8 = 0;
+    // Place a known 6-byte payload at offset 10 within rbuf, then seed from that
+    // overlapping sub-slice (simulates conn.read_buf[r_start..r_end] aliasing).
+    const payload = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    @memcpy(rbuf[10..16], &payload);
+    var sess = WsSession.init(&rbuf, &obuf, .{ .on_message = echoOnMessage }, @ptrCast(&st), arena.allocator());
+    sess.bind();
+    sess.seed(rbuf[10..16]); // overlapping source within the same buffer
+    try testing.expectEqual(@as(usize, 0), sess.r_start);
+    try testing.expectEqual(@as(usize, 6), sess.r_end);
+    try testing.expectEqualSlices(u8, &payload, sess.read_buf[0..6]);
 }
 
 test "WsSession: backpressured send buffers and drains on writable" {
