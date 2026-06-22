@@ -712,30 +712,28 @@ comparison against `std.http.Server`, http.zig, or non-Zig servers exists yet.
 
 ## WebSocket (in progress)
 
-WebSocket support is landing across several releases. The pure RFC 6455 codec
-(`zax.ws`) and a **threaded connection upgrade + echo/handler API** now ship.
-
-Declare an endpoint with the `WebSocket` extractor; `onUpgrade` hands the live
-connection to your callback after the server performs the handshake:
+WebSocket runs on **both** server backends — threaded (`app.serve`) and evented
+(`app.serveEvented`). Declare an endpoint with the `WebSocket` extractor and supply
+a handler: `on_message` is required; `on_open` and `on_close` are optional.
 
 ```zig
-fn echo(ws: zax.WebSocket) zax.Response {
-    return ws.onUpgrade(struct {
-        fn run(conn: *zax.WsConn) void {
-            while (conn.read()) |frame| // one frame per read (no reassembly yet)
-                conn.send(frame.opcode, frame.payload) catch break;
-        }
-    }.run);
+fn echo(conn: *zax.WsConn, frame: zax.WsFrame) void {
+    conn.send(frame.opcode, frame.payload) catch {};
 }
-// app.get("/echo", echo);
+
+fn handler(ws: zax.WebSocket) zax.Response {
+    return ws.onUpgrade(.{ .on_message = echo }); // .on_open / .on_close optional
+}
+// app.get("/echo", handler);  -> identical under app.serve and app.serveEvented
 ```
 
-`conn.read()` returns one client frame at a time (unmasked in place) and `null`
-on a close frame, EOF, or protocol error; `conn.send(opcode, payload)` writes one
-server frame; `conn.state(T)` reaches the app state. This release is the threaded
-backend only and single-threaded per connection. Still to come: the evented
-(reactor) backend, fragmentation reassembly, automatic ping/pong and the RFC
-close handshake, configurable frame-size caps, and cross-connection broadcast.
+The server performs the RFC 6455 handshake, then calls your `on_message` once per
+client frame (`conn.send(opcode, payload)` writes a frame back; `conn.state(T)`
+reaches app state; `conn.close()` ends the connection). One frame per callback (no
+reassembly yet); a close frame, EOF, or protocol error ends the connection (firing
+`on_close`). Non-upgrade requests to a WebSocket route get `426 Upgrade Required`.
+Still to come: fragmentation reassembly, automatic ping/pong and the RFC close
+handshake, configurable frame-size caps, and cross-connection broadcast.
 
 ## Status & limitations
 

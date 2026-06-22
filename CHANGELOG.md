@@ -6,8 +6,13 @@ All notable changes to zax are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **WebSocket handler API unified (breaking).** The blocking `while (conn.read())` loop is replaced by a callback handler: `onUpgrade(.{ .on_message = fn, .on_open = ?fn, .on_close = ?fn })`. `WsConn.read()` is removed; `WsConn` now exposes `send`/`close`/`state`. The same handler runs on both `app.serve` and `app.serveEvented`. (Pre-1.0 API change.)
+
 ### Added
 
+- **Evented WebSocket support** — WebSocket handlers now run on the evented (reactor) backend (`app.serveEvented`) as well as the threaded backend, with the same handler. The reactor performs the handshake non-blocking and drives the handler per readable event; `conn.send` is non-blocking with bounded outbound buffering (drained on writable; closes on overflow).
 - **WebSocket threaded upgrade + handler API** (`zax.WebSocket` extractor, `zax.WsConn`) — second WebSocket slice. A handler takes the `WebSocket` extractor and calls `onUpgrade(cb)`; the threaded server validates the RFC 6455 handshake, sends `101 Switching Protocols` with the computed `Sec-WebSocket-Accept`, and hands the socket to `cb` as a `*WsConn`. `conn.read()` decodes and unmasks one client frame at a time (returning `null` on a close frame, EOF, or protocol error); `conn.send(opcode, payload)` writes one server frame; `conn.state(T)` reaches app state. Non-upgrade requests to a WebSocket route get `426 Upgrade Required`. Threaded backend only, single-threaded per connection. Evented support, fragmentation reassembly, automatic ping/pong, the RFC close handshake, and configurable size caps follow in later releases.
 - **WebSocket protocol primitives** (`zax.ws`) — first WebSocket slice: a pure RFC 6455 codec with no server integration yet. `acceptKey` computes the `Sec-WebSocket-Accept` handshake value; `parseFrame` decodes and unmasks one masked client frame in place (zero-copy payload slice), validating control-frame structure and reporting `Incomplete` for partial buffers; `writeFrame` serializes one unmasked server frame with the minimal 7/16/64-bit length form. Connection upgrade, takeover, fragmentation reassembly, and control-frame semantics follow in later releases.
 - Built-in `compress` middleware (`zax.compress(Ctx, config)`) — comptime-configured gzip compression for buffered responses; skips streaming responses, bodies below `min_length` (default 1024 bytes), clients not advertising `gzip` in `Accept-Encoding`, already-encoded responses, non-text content types, and cases where compression yields no size reduction; sets `Content-Encoding: gzip` and `Vary: Accept-Encoding` on compressed responses. Compression level configurable: `.fastest`, `.default`, `.best`.

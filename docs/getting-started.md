@@ -287,21 +287,19 @@ See [`deploy-https.md`](deploy-https.md).
   To capture a regression baseline: `zig build bench -- --json > src/bench/baseline.json` (then recommit);
   to gate future runs: `zig build bench -- --check` (exits nonzero on regression; default tolerance 15%).
 
-## WebSocket echo (threaded backend)
+## WebSocket echo (threaded or evented)
 
 ```zig
-fn echo(ws: zax.WebSocket) zax.Response {
-    return ws.onUpgrade(struct {
-        fn run(conn: *zax.WsConn) void {
-            while (conn.read()) |frame|
-                conn.send(frame.opcode, frame.payload) catch break;
-        }
-    }.run);
+fn echo(conn: *zax.WsConn, frame: zax.WsFrame) void {
+    conn.send(frame.opcode, frame.payload) catch {};
 }
 
-// try app.get("/echo", echo);
+fn handler(ws: zax.WebSocket) zax.Response {
+    return ws.onUpgrade(.{ .on_message = echo });
+}
+
+// try app.get("/echo", handler);  -> works under app.serve and app.serveEvented
 ```
 
-The server performs the RFC 6455 handshake and hands `conn` to your callback.
-`conn.read()` yields one frame at a time and returns `null` when the peer sends a
-close frame (or the connection ends); `conn.send` writes a frame back.
+The server handshakes, then calls `echo` once per client frame. A close frame or
+disconnect ends the connection.
