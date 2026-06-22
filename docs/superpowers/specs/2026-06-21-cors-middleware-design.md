@@ -190,6 +190,25 @@ e2e (`src/server.zig`, loopback; mirror the Headers/forwarded e2e + `doRequest`)
   — send `OPTIONS` with the preflight headers → 204 + Allow-* ; send `GET` with
   `Origin` → Allow-Origin on the response.
 
+## Preflight dispatch (auto-preflight)
+
+**Discovered during implementation:** global middleware (`app.use`) runs only
+*after* a route matches — `server.zig` dispatch returns `405` for a
+method-mismatch (and `404` for no path) **before** invoking the chain
+(`server.zig:766`, comment at `:241`). So an `OPTIONS` preflight to a path
+registered only for `GET` would `405` before the CORS middleware could answer —
+defeating automatic preflight.
+
+**Decision (confirmed with Chris): auto-preflight in dispatch.** In the
+`.method_not_allowed` branch, when `req.method == .OPTIONS`, run the global
+middleware chain with a terminal handler that returns `405`. The CORS middleware
+short-circuits the preflight (returns `204`) before reaching the terminal, so
+preflight works with no `OPTIONS` route registered. If the chain falls through
+(no CORS, or non-preflight `OPTIONS`), the response is still the normal `405`
+(re-render `MethodNotAllowed` + `Allow` header) — existing behavior preserved.
+This is scoped to `OPTIONS` only; non-`OPTIONS` 405s keep the cheap
+short-circuit. (A general pre-routing middleware hook remains future work.)
+
 ## Docs
 
 - `README.md` (middleware section): document `cors` + `Cors` config, the

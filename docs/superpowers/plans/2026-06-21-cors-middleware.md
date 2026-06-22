@@ -276,6 +276,67 @@ test "e2e: cors preflight 204 and actual request gets allow-origin" {
 
 ---
 
+### Task 2b: auto-preflight in dispatch
+
+**Discovered during Task 2:** global `app.use` middleware runs only after a route
+matches; the `.method_not_allowed` branch returns `405` before the chain
+(`src/server.zig:766`). So an `OPTIONS` preflight to a path with no `OPTIONS`
+route `405`s before CORS can answer. This task makes preflight work without a
+registered `OPTIONS` route.
+
+**Files:**
+- Modify: `src/server.zig` (`dispatch`, the `.method_not_allowed` branch ~line 766; add a unit/e2e test; revise the Task 2 e2e to NOT register an `OPTIONS` route)
+
+**Interfaces:**
+- Consumes: `zax.cors` (Task 1), `Chn.run`, `makeCtx`, `allowHeader`, `Response.fromStatus`.
+
+- [ ] **Step 1: Change the `.method_not_allowed` branch** in `dispatch` so OPTIONS runs the chain:
+
+```zig
+.method_not_allowed => |allowed| {
+    const ctx = self.makeCtx(io, req, &.{}, arena, request_id);
+    if (req.method == .OPTIONS) {
+        // Auto-preflight: run the global chain so a CORS middleware can
+        // answer the preflight (it short-circuits to 204 before the
+        // terminal). If nothing handles it, fall through to the normal 405.
+        const term = struct {
+            fn call(_: *const Ctx) anyerror!Response {
+                return Response.fromStatus(.method_not_allowed);
+            }
+        }.call;
+        const resp = Chn.run(self.mws.items, &term, &ctx) catch |e| return self.renderError(e, &ctx);
+        if (resp.status == .method_not_allowed) {
+            var r = self.renderError(err_mod.Error.MethodNotAllowed, &ctx);
+            r = r.withHeader(ctx.arena, "allow", allowHeader(ctx.arena, allowed)) catch r;
+            return r;
+        }
+        return resp;
+    }
+    var resp = self.renderError(err_mod.Error.MethodNotAllowed, &ctx);
+    resp = resp.withHeader(ctx.arena, "allow", allowHeader(ctx.arena, allowed)) catch resp;
+    return resp;
+},
+```
+Confirm `Response`, `Ctx`, `Chn`, `allowHeader`, `err_mod` are all in scope in `dispatch` (they are — see the existing branch). Keep the non-OPTIONS path byte-for-byte unchanged.
+
+- [ ] **Step 2: e2e — auto-preflight without an OPTIONS route.** Revise the Task 2 e2e (`"e2e: cors preflight..."`) so it registers ONLY a `GET /x` route (NO `app.options`/`OPTIONS` route). Assert the preflight still returns `204` + `access-control-allow-methods:` purely via the middleware:
+
+```zig
+// app.use(zax.cors(<Ctx>, .{ .origins = .any }));  app.get("/x", handler);  (no OPTIONS route)
+const pre = doRequest(io, port,
+    "OPTIONS /x HTTP/1.1\r\nHost: x\r\nOrigin: https://a.com\r\nAccess-Control-Request-Method: GET\r\n\r\n", &rb1);
+try testing.expect(std.mem.indexOf(u8, pre, "HTTP/1.1 204") != null);
+try testing.expect(std.mem.indexOf(u8, pre, "access-control-allow-methods:") != null);
+```
+
+- [ ] **Step 3: e2e/unit — OPTIONS 405 preserved without CORS.** Add a test: a GET-only route, NO cors middleware, `OPTIONS /x` → still `405` with an `allow:` header (existing behavior unbroken).
+
+- [ ] **Step 4: Gate** — `zig build test --summary all` green.
+
+- [ ] **Step 5: Commit** — `feat(server): auto-preflight — run global chain on OPTIONS 405 so CORS answers`.
+
+---
+
 ### Task 3: docs
 
 **Files:**
