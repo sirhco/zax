@@ -722,7 +722,7 @@ fn echo(conn: *zax.WsConn, frame: zax.WsFrame) void {
 }
 
 fn handler(ws: zax.WebSocket) zax.Response {
-    return ws.onUpgrade(.{ .on_message = echo }); // .on_open / .on_close optional
+    return ws.onUpgrade(.{ .on_message = echo }); // zax.WsHandler{}: on_message required, on_open/on_close optional
 }
 // app.get("/echo", handler);  -> identical under app.serve and app.serveEvented
 ```

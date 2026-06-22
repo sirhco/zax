@@ -740,6 +740,8 @@ pub fn App(comptime AppState: type) type {
                         const pr = ws_mod.pump(read_buf, &start, &end, &conn, up.handler);
                         if (pr == .closed) break;
                         if (sink.closed) break;
+                        // ws.pump compacts leftover to the front (start := 0), so a full
+                        // buffer here means a single incomplete frame exceeds read_buf -> stop.
                         if (end == read_buf.len) break; // frame larger than buffer -> stop
                         // Blocking read more bytes into read_buf[end..].
                         const msg = stream.socket.receiveTimeout(io, read_buf[end..], idle_to) catch break;
