@@ -46,6 +46,7 @@ pub fn cors(comptime Ctx: type, comptime config: Cors) middleware.Chain(Ctx).Mid
 /// should be emitted (no Origin, or allowlist miss).
 fn resolveAllowOrigin(comptime config: Cors, origin: ?[]const u8) ?[]const u8 {
     const o = origin orelse return null;
+    if (std.mem.indexOfAny(u8, o, "\r\n") != null) return null; // never reflect a CRLF-bearing origin
     switch (config.origins) {
         .any => return if (config.credentials) o else "*",
         .list => |allowed| {
@@ -191,6 +192,15 @@ test "cors: no Origin passes through with no CORS headers" {
     const req = fakeReq(.GET, &.{});
     const r = try runCors(arena.allocator(), .{ .origins = .any }, &req, &ran);
     try testing.expect(ran);
+    try testing.expectEqual(@as(?[]const u8, null), hdr(r, "access-control-allow-origin"));
+}
+
+test "cors any+credentials: CRLF-bearing origin → no CORS headers (injection guard)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ran = false;
+    const req = fakeReq(.GET, &.{.{ .name = "Origin", .value = "https://a.com\nX-Injected: 1" }});
+    const r = try runCors(arena.allocator(), .{ .origins = .any, .credentials = true }, &req, &ran);
     try testing.expectEqual(@as(?[]const u8, null), hdr(r, "access-control-allow-origin"));
 }
 
