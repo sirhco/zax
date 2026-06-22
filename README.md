@@ -710,6 +710,19 @@ the monotonic clock's resolution (p50 may print `0.0 us`). The micro ns/op
 figures (amortized over millions of iterations) are the trustworthy ones. No
 comparison against `std.http.Server`, http.zig, or non-Zig servers exists yet.
 
+## WebSocket (in progress)
+
+WebSocket support is landing across several releases. This release ships the
+protocol primitives only — a pure RFC 6455 codec in `zax.ws`, with no
+connection upgrade or handler API yet:
+
+- `zax.ws.acceptKey(key, &out)` — compute the `Sec-WebSocket-Accept` handshake value.
+- `zax.ws.parseFrame(buf)` — decode and unmask one client frame in place.
+- `zax.ws.writeFrame(w, opcode, payload)` — serialize one unmasked server frame.
+
+The connection upgrade (101), socket takeover, and an echo/handler API arrive in
+a following release.
+
 ## Status & limitations
 
 A focused HTTP/1.1 framework. **Shipped:** routing, comptime extractors,
