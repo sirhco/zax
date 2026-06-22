@@ -391,6 +391,18 @@ test "ws: WsConn.read returns null on a protocol error (unmasked client frame)" 
     try std.testing.expectEqual(@as(?Frame, null), conn.read());
 }
 
+test "ws: WsConn.read returns null when a frame cannot fit in the buffer" {
+    // Header claims a 1000-byte masked payload, but buf is only 8 bytes, so the
+    // frame can never complete: parseFrame returns Incomplete, compact is a no-op
+    // (start==0), end==buf.len -> read() returns null without touching the socket.
+    var buf = [_]u8{ 0x82, 0x80 | 126, 0x03, 0xE8, 0, 0, 0, 0 }; // FIN+binary, masked, len7=126, u16=1000
+    var st: u8 = 0;
+    var conn = WsConn{ .io = undefined, .socket = undefined, .w = undefined, .buf = &buf,
+        .start = 0, .end = buf.len, .state_ptr = @ptrCast(&st),
+        .arena = std.testing.allocator, .idle_timeout = undefined };
+    try std.testing.expectEqual(@as(?Frame, null), conn.read());
+}
+
 test "ws: WsConn.send writes an unmasked server frame" {
     var out: [16]u8 = undefined;
     var w = std.Io.Writer.fixed(&out);

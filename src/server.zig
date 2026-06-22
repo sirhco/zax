@@ -708,6 +708,9 @@ pub fn App(comptime AppState: type) type {
                         .arena = arena.allocator(),
                         .idle_timeout = idle_to,
                     };
+                    // Record the upgrade request (status 101) now: the request completes
+                    // at the handshake, so duration_ns covers handshake-to-takeover only,
+                    // not the long-lived WebSocket session that up.cb runs next.
                     if (self.observers.items.len > 0) {
                         const dur: u64 = @intCast(@max(@as(i96, 0), nowNs(io) - t0));
                         const rec = observe_mod.AccessRecord{
