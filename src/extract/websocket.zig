@@ -24,6 +24,8 @@ fn hasToken(list: []const u8, token: []const u8) bool {
 pub const WebSocket = struct {
     /// Sec-WebSocket-Key (borrows request memory; consumed only in `onUpgrade`).
     key: []const u8,
+    /// App-state pointer captured from `ctx.state`; forwarded into `ws.Upgrade`.
+    state_ptr: *anyopaque,
 
     pub const zax_is_extractor = true;
     pub const zax_is_body = false;
@@ -39,14 +41,14 @@ pub const WebSocket = struct {
         if (!std.mem.eql(u8, ver, "13")) return error.NotWebSocketUpgrade;
 
         const key = ctx.req.header("sec-websocket-key") orelse return error.NotWebSocketUpgrade;
-        return .{ .key = key };
+        return .{ .key = key, .state_ptr = @ptrCast(ctx.state) };
     }
 
-    pub fn onUpgrade(self: @This(), cb: ws.Handler) Response {
+    pub fn onUpgrade(self: @This(), handler: ws.Handler) Response {
         var accept: [28]u8 = undefined;
         _ = ws.acceptKey(self.key, &accept);
         var r = Response.fromStatus(.switching_protocols);
-        r.upgrade = .{ .accept = accept, .cb = cb };
+        r.upgrade = .{ .accept = accept, .handler = handler, .state_ptr = self.state_ptr };
         return r;
     }
 };
@@ -63,9 +65,10 @@ const FakeReq = struct {
     }
 };
 
-fn ctxWith(req: *const FakeReq) struct { req: *const FakeReq } {
-    return .{ .req = req };
+fn ctxWith(req: *const FakeReq) struct { req: *const FakeReq, state: *u8 } {
+    return .{ .req = req, .state = &dummy_state };
 }
+var dummy_state: u8 = 0;
 
 const valid_pairs = [_][2][]const u8{
     .{ "Upgrade", "websocket" },
@@ -108,10 +111,10 @@ test "WebSocket.fromContext rejects a non-13 version" {
 test "WebSocket.onUpgrade builds a 101 with the RFC accept value" {
     const req = FakeReq{ .pairs = &valid_pairs };
     const w = try WebSocket.fromContext(ctxWith(&req));
-    const dummy = struct {
-        fn run(_: *ws.WsConn) void {}
-    }.run;
-    const resp = w.onUpgrade(dummy);
+    const H = struct {
+        fn onMsg(conn: *ws.WsConn, f: ws.Frame) void { _ = conn; _ = f; }
+    };
+    const resp = w.onUpgrade(.{ .on_message = H.onMsg });
     try testing.expectEqual(@import("../http/response.zig").Status.switching_protocols, resp.status);
     try testing.expect(resp.upgrade != null);
     try testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &resp.upgrade.?.accept);
