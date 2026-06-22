@@ -263,6 +263,40 @@ answered with `204` and the appropriate `Allow-*` headers; the handler is not
 called.  Because zax runs the global middleware chain even when no `OPTIONS`
 route is registered, preflight **just works** — no need to add `OPTIONS` routes.
 
+### Built-in: gzip compression
+
+`zax.compress(comptime Ctx: type, comptime config: zax.Compress)` returns a
+global middleware that gzip-compresses eligible buffered responses.  Register it
+with `app.use`:
+
+```zig
+const App = zax.App(*const Db);
+
+var app = try App.init(init.gpa, &db, .{});
+try app.use(zax.compress(App.Context, .{}));
+```
+
+**`zax.Compress` config fields** (all comptime, all have defaults):
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `level` | `Level` | `.default` | Compression level: `.fastest`, `.default`, `.best` |
+| `min_length` | `usize` | `1024` | Skip bodies smaller than this many bytes |
+
+**A response is compressed only when all of the following hold:**
+
+- The response is buffered (not a streamed/SSE response).
+- The body is at least `min_length` bytes.
+- The client `Accept-Encoding` header includes `gzip` and does not disable it (`gzip;q=0`).
+- No `Content-Encoding` header is already present on the response.
+- The `Content-Type` is text-like: `text/*`, `application/json`,
+  `application/javascript`, `application/xml`, `image/svg+xml`, or any type
+  ending in `+xml`.
+- Compression actually reduces the body size (no-gain responses are passed through unmodified).
+
+On success, `Content-Encoding: gzip` and `Vary: Accept-Encoding` are added to
+the response.  gzip is the only supported encoding.
+
 ## Observability
 
 `app.observe(obs)` registers an `zax.Observer` that fires after every routed
