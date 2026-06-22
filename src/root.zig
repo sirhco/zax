@@ -80,6 +80,7 @@ pub const compress = @import("compress.zig").compress;
 // --- WebSocket (Phase 5) ---
 pub const ws = @import("ws.zig");
 pub const WsOpcode = ws.Opcode;
+pub const WsFrame = ws.Frame;
 
 // --- Server (Phase 4) ---
 pub const server = @import("server.zig");
