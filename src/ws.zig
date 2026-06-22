@@ -117,73 +117,79 @@ pub fn writeFrame(w: *std.Io.Writer, opcode: Opcode, payload: []const u8) std.Io
     try w.writeAll(payload);
 }
 
-/// The server-side callback invoked after a successful upgrade. Runs on the
-/// connection's own thread and owns the socket for its lifetime.
-pub const Handler = *const fn (conn: *WsConn) void;
-
-/// Carried on a `Response` to signal "take over this connection". Built by
-/// `WebSocket.onUpgrade`; consumed by the server's `handleConn`.
-pub const Upgrade = struct {
-    accept: [28]u8, // precomputed Sec-WebSocket-Accept (by value — no borrow)
-    cb: Handler,
+/// Lifecycle + message callbacks. `on_message` required; `on_open`/`on_close`
+/// optional. They run on the connection's owning context (threaded: its thread;
+/// evented: the worker thread — must NOT block).
+pub const Handler = struct {
+    on_open: ?*const fn (conn: *WsConn) void = null,
+    on_message: *const fn (conn: *WsConn, frame: Frame) void,
+    on_close: ?*const fn (conn: *WsConn) void = null,
 };
 
-/// A live, taken-over WebSocket connection. Single-threaded: only the callback's
-/// thread touches it. Reads one frame per `read()` over `buf`, recv'ing more from
-/// the socket as needed; `payload` borrows `buf` until the next `read()`.
+pub const SendError = error{WriteFailed};
+
+/// Carried on a Response to signal takeover; consumed by each backend's takeover
+/// path. `state_ptr` is the app-state pointer captured by the extractor.
+pub const Upgrade = struct {
+    accept: [28]u8,
+    handler: Handler,
+    state_ptr: *anyopaque,
+};
+
+/// Backend-agnostic connection handle. One type, two backends: the vtable
+/// supplies threaded (blocking writeFrame+flush) or evented (non-blocking,
+/// buffered) send/close.
 pub const WsConn = struct {
-    io: std.Io,
-    socket: std.Io.net.Socket,
-    w: *std.Io.Writer,
-    buf: []u8, // staging buffer; max frame size == buf.len
-    start: usize = 0, // unconsumed window [start, end)
-    end: usize = 0,
+    ctx: *anyopaque,
+    vtable: *const VTable,
+    /// The app-state pointer (the router's AppState, which must be a pointer).
     state_ptr: *anyopaque,
     arena: std.mem.Allocator,
-    idle_timeout: std.Io.Timeout,
 
-    fn compact(self: *WsConn) void {
-        if (self.start == 0) return;
-        const len = self.end - self.start;
-        std.mem.copyForwards(u8, self.buf[0..len], self.buf[self.start..self.end]);
-        self.start = 0;
-        self.end = len;
+    pub const VTable = struct {
+        send: *const fn (ctx: *anyopaque, opcode: Opcode, payload: []const u8) SendError!void,
+        close: *const fn (ctx: *anyopaque) void,
+    };
+
+    pub fn send(self: *WsConn, opcode: Opcode, payload: []const u8) SendError!void {
+        return self.vtable.send(self.ctx, opcode, payload);
     }
-
-    /// Next frame, or null on a close frame / EOF / parse-or-read error. The
-    /// returned `payload` borrows `buf` and is valid only until the next read().
-    pub fn read(self: *WsConn) ?Frame {
-        while (true) {
-            if (self.end > self.start) {
-                if (parseFrame(self.buf[self.start..self.end])) |parsed| {
-                    self.start += parsed.consumed;
-                    if (parsed.frame.opcode == .close) return null;
-                    return parsed.frame;
-                } else |e| switch (e) {
-                    error.Incomplete => {}, // fall through to recv
-                    else => return null, // protocol error -> end the loop
-                }
-            }
-            self.compact();
-            if (self.end == self.buf.len) return null; // frame larger than buffer
-            const msg = self.socket.receiveTimeout(self.io, self.buf[self.end..], self.idle_timeout) catch return null;
-            if (msg.data.len == 0) return null; // EOF
-            self.end += msg.data.len;
-        }
+    pub fn close(self: *WsConn) void {
+        self.vtable.close(self.ctx);
     }
-
-    /// Serialize one unmasked server frame and flush.
-    pub fn send(self: *WsConn, opcode: Opcode, payload: []const u8) std.Io.Writer.Error!void {
-        try writeFrame(self.w, opcode, payload);
-        try self.w.flush();
-    }
-
-    /// App state, type-erased. `T` MUST be the app-state type the router is
-    /// parameterized by (typically a pointer, e.g. `*Db`).
+    /// App state. `T` MUST be the app-state pointer type (e.g. `*Db`).
     pub fn state(self: *WsConn, comptime T: type) T {
-        return @as(*T, @ptrCast(@alignCast(self.state_ptr))).*;
+        return @ptrCast(@alignCast(self.state_ptr));
     }
 };
+
+pub const PumpResult = enum { need_more, closed };
+
+/// Parse complete client frames from `buf[start..end]`, calling
+/// `handler.on_message(conn, frame)` per data frame and advancing `start`.
+/// Returns `.closed` on a close frame or any parse error; otherwise `.need_more`
+/// with leftover bytes compacted to the front (start=0, end=leftover.len).
+/// Unmask is in place: each `frame.payload` borrows `buf` only until the next
+/// iteration. Ping/pong are delivered to `on_message` (no auto-pong this slice).
+pub fn pump(buf: []u8, start: *usize, end: *usize, conn: *WsConn, handler: Handler) PumpResult {
+    while (start.* < end.*) {
+        const parsed = parseFrame(buf[start.*..end.*]) catch |e| switch (e) {
+            error.Incomplete => break, // need more bytes
+            else => return .closed, // protocol error -> end
+        };
+        start.* += parsed.consumed;
+        if (parsed.frame.opcode == .close) return .closed;
+        handler.on_message(conn, parsed.frame);
+    }
+    // Compact leftover to the front so the caller can append more bytes.
+    const leftover = end.* - start.*;
+    if (start.* != 0 and leftover != 0) {
+        std.mem.copyForwards(u8, buf[0..leftover], buf[start.*..end.*]);
+    }
+    start.* = 0;
+    end.* = leftover;
+    return .need_more;
+}
 
 // Test helper: build a masked client frame into `out`, return the used slice.
 fn buildMaskedFrame(out: []u8, fin: bool, opcode: Opcode, key: [4]u8, payload: []const u8) []u8 {
@@ -354,72 +360,113 @@ test "ws: build → parseFrame → writeFrame round-trips the payload" {
     try std.testing.expectEqualStrings(original, server_bytes[2..]);
 }
 
-test "ws: WsConn.read returns a buffered masked text frame" {
+const TestSink = struct {
+    sent: std.ArrayListUnmanaged(u8) = .empty,
+    closed: bool = false,
+    gpa: std.mem.Allocator,
+
+    const vtable = WsConn.VTable{ .send = sendFn, .close = closeFn };
+
+    fn sendFn(ctx: *anyopaque, opcode: Opcode, payload: []const u8) SendError!void {
+        const self: *TestSink = @ptrCast(@alignCast(ctx));
+        var scratch: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&scratch);
+        writeFrame(&w, opcode, payload) catch return error.WriteFailed;
+        self.sent.appendSlice(self.gpa, w.buffered()) catch return error.WriteFailed;
+    }
+    fn closeFn(ctx: *anyopaque) void {
+        const self: *TestSink = @ptrCast(@alignCast(ctx));
+        self.closed = true;
+    }
+};
+
+test "ws: pump dispatches one masked text frame to on_message" {
+    const Capture = struct {
+        var last: []const u8 = "";
+        var count: usize = 0;
+        fn onMsg(conn: *WsConn, f: Frame) void {
+            _ = conn;
+            last = f.payload;
+            count += 1;
+        }
+    };
+    Capture.count = 0;
     var buf: [64]u8 = undefined;
     const key = [4]u8{ 1, 2, 3, 4 };
     const frame = buildMaskedFrame(&buf, true, .text, key, "hello");
-    var st: u8 = 0;
-    var conn = WsConn{ .io = undefined, .socket = undefined, .w = undefined, .buf = &buf,
-        .start = 0, .end = frame.len, .state_ptr = @ptrCast(&st),
-        .arena = std.testing.allocator, .idle_timeout = undefined };
-    const f = conn.read() orelse return error.TestUnexpectedResult;
-    try std.testing.expect(f.fin);
-    try std.testing.expectEqual(Opcode.text, f.opcode);
-    try std.testing.expectEqualStrings("hello", f.payload);
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
+    var dummy_state: u8 = 0;
+    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vtable,
+        .state_ptr = @ptrCast(&dummy_state), .arena = std.testing.allocator };
+    var start: usize = 0;
+    var end: usize = frame.len;
+    const r = pump(&buf, &start, &end, &conn, .{ .on_message = Capture.onMsg });
+    try std.testing.expectEqual(PumpResult.need_more, r);
+    try std.testing.expectEqual(@as(usize, 1), Capture.count);
+    try std.testing.expectEqualStrings("hello", Capture.last);
+    try std.testing.expectEqual(@as(usize, 0), end); // fully consumed
 }
 
-test "ws: WsConn.read returns two pipelined frames then null on close" {
+test "ws: pump returns closed on a close frame and stops" {
+    const Capture = struct {
+        var count: usize = 0;
+        fn onMsg(conn: *WsConn, f: Frame) void { _ = conn; _ = f; count += 1; }
+    };
+    Capture.count = 0;
     var buf: [128]u8 = undefined;
     const key = [4]u8{ 9, 9, 9, 9 };
-    const f1 = buildMaskedFrame(buf[0..], true, .text, key, "aa");
-    const f2 = buildMaskedFrame(buf[f1.len..], true, .close, key, "");
+    const f1len = buildMaskedFrame(buf[0..], true, .text, key, "aa").len;
+    const closelen = buildMaskedFrame(buf[f1len..], true, .close, key, "").len;
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
     var st: u8 = 0;
-    var conn = WsConn{ .io = undefined, .socket = undefined, .w = undefined, .buf = &buf,
-        .start = 0, .end = f1.len + f2.len, .state_ptr = @ptrCast(&st),
-        .arena = std.testing.allocator, .idle_timeout = undefined };
-    const a = conn.read() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("aa", a.payload);
-    try std.testing.expectEqual(@as(?Frame, null), conn.read()); // close frame -> null, no recv
+    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vtable, .state_ptr = @ptrCast(&st), .arena = std.testing.allocator };
+    var start: usize = 0;
+    var end: usize = f1len + closelen;
+    const r = pump(&buf, &start, &end, &conn, .{ .on_message = Capture.onMsg });
+    try std.testing.expectEqual(PumpResult.closed, r);
+    try std.testing.expectEqual(@as(usize, 1), Capture.count); // "aa" delivered, close stops
 }
 
-test "ws: WsConn.read returns null on a protocol error (unmasked client frame)" {
-    var buf = [_]u8{ 0x81, 0x03, 'a', 'b', 'c' }; // FIN+text, mask bit 0, len 3
+test "ws: pump returns need_more and preserves a partial frame" {
+    const Capture = struct {
+        var count: usize = 0;
+        fn onMsg(conn: *WsConn, f: Frame) void { _ = conn; _ = f; count += 1; }
+    };
+    Capture.count = 0;
+    var buf: [64]u8 = undefined;
+    const key = [4]u8{ 1, 1, 1, 1 };
+    const frame = buildMaskedFrame(&buf, true, .text, key, "hello world");
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
     var st: u8 = 0;
-    var conn = WsConn{ .io = undefined, .socket = undefined, .w = undefined, .buf = &buf,
-        .start = 0, .end = buf.len, .state_ptr = @ptrCast(&st),
-        .arena = std.testing.allocator, .idle_timeout = undefined };
-    try std.testing.expectEqual(@as(?Frame, null), conn.read());
+    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vtable, .state_ptr = @ptrCast(&st), .arena = std.testing.allocator };
+    var start: usize = 0;
+    var end: usize = frame.len - 3; // 3 payload bytes short
+    const r = pump(&buf, &start, &end, &conn, .{ .on_message = Capture.onMsg });
+    try std.testing.expectEqual(PumpResult.need_more, r);
+    try std.testing.expectEqual(@as(usize, 0), Capture.count);
+    try std.testing.expectEqual(@as(usize, frame.len - 3), end); // leftover preserved at front
+    try std.testing.expectEqual(@as(usize, 0), start);
 }
 
-test "ws: WsConn.read returns null when a frame cannot fit in the buffer" {
-    // Header claims a 1000-byte masked payload, but buf is only 8 bytes, so the
-    // frame can never complete: parseFrame returns Incomplete, compact is a no-op
-    // (start==0), end==buf.len -> read() returns null without touching the socket.
-    var buf = [_]u8{ 0x82, 0x80 | 126, 0x03, 0xE8, 0, 0, 0, 0 }; // FIN+binary, masked, len7=126, u16=1000
+test "ws: WsConn.send and close route through the vtable" {
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
     var st: u8 = 0;
-    var conn = WsConn{ .io = undefined, .socket = undefined, .w = undefined, .buf = &buf,
-        .start = 0, .end = buf.len, .state_ptr = @ptrCast(&st),
-        .arena = std.testing.allocator, .idle_timeout = undefined };
-    try std.testing.expectEqual(@as(?Frame, null), conn.read());
-}
-
-test "ws: WsConn.send writes an unmasked server frame" {
-    var out: [16]u8 = undefined;
-    var w = std.Io.Writer.fixed(&out);
-    var st: u8 = 0;
-    var conn = WsConn{ .io = undefined, .socket = undefined, .w = &w, .buf = &.{},
-        .start = 0, .end = 0, .state_ptr = @ptrCast(&st),
-        .arena = std.testing.allocator, .idle_timeout = undefined };
+    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vtable, .state_ptr = @ptrCast(&st), .arena = std.testing.allocator };
     try conn.send(.text, "Hi");
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'H', 'i' }, w.buffered());
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'H', 'i' }, sink.sent.items);
+    conn.close();
+    try std.testing.expect(sink.closed);
 }
 
 test "ws: WsConn.state returns the app-state pointer" {
     const Db = struct { n: u8 };
     var db = Db{ .n = 7 };
-    var sp: *Db = &db;
-    var conn = WsConn{ .io = undefined, .socket = undefined, .w = undefined, .buf = &.{},
-        .start = 0, .end = 0, .state_ptr = @ptrCast(&sp),
-        .arena = std.testing.allocator, .idle_timeout = undefined };
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
+    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vtable, .state_ptr = @ptrCast(&db), .arena = std.testing.allocator };
     try std.testing.expectEqual(@as(*Db, &db), conn.state(*Db));
 }
