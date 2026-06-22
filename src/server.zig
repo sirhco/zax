@@ -708,6 +708,18 @@ pub fn App(comptime AppState: type) type {
                         .arena = arena.allocator(),
                         .idle_timeout = idle_to,
                     };
+                    if (self.observers.items.len > 0) {
+                        const dur: u64 = @intCast(@max(@as(i96, 0), nowNs(io) - t0));
+                        const rec = observe_mod.AccessRecord{
+                            .method = parsed.request.method,
+                            .path = parsed.request.path,
+                            .status = resp.status.code(),
+                            .duration_ns = dur,
+                            .bytes = 0,
+                            .request_id = rid,
+                        };
+                        for (self.observers.items) |obs| obs.func(obs.context, rec);
+                    }
                     up.cb(&conn);
                     break; // takeover done -> close (defer stream.close)
                 }
@@ -3525,7 +3537,9 @@ test "end-to-end: websocket upgrade, handshake, and echo" {
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
     cw.interface.writeAll(upgrade_req) catch unreachable;
     cw.interface.flush() catch unreachable;
-    while (std.mem.indexOf(u8, cr.interface.buffered(), "\r\n\r\n") == null) {
+    var tries1: usize = 0;
+    while (std.mem.indexOf(u8, cr.interface.buffered(), "\r\n\r\n") == null) : (tries1 += 1) {
+        if (tries1 > 1000) return error.TestTimeout;
         cr.interface.fillMore() catch unreachable;
     }
     const head_end = std.mem.indexOf(u8, cr.interface.buffered(), "\r\n\r\n").? + 4;
@@ -3540,7 +3554,11 @@ test "end-to-end: websocket upgrade, handshake, and echo" {
     cw.interface.flush() catch unreachable;
 
     // 3. Read the echoed unmasked server frame: 0x81, 0x02, 'h', 'i'.
-    while (cr.interface.buffered().len < 4) cr.interface.fillMore() catch unreachable;
+    var tries2: usize = 0;
+    while (cr.interface.buffered().len < 4) : (tries2 += 1) {
+        if (tries2 > 1000) return error.TestTimeout;
+        cr.interface.fillMore() catch unreachable;
+    }
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'h', 'i' }, cr.interface.buffered()[0..4]);
     cr.interface.toss(4);
 
@@ -3557,4 +3575,57 @@ test "end-to-end: websocket upgrade, handshake, and echo" {
 
     app.requestShutdown(io);
     loop_fut.await(io);
+}
+
+test "observe: upgrade request is recorded with status 101" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ws", wsEchoHandler);
+
+    var cap = ObsCapture{};
+    try app.observe(.{ .context = &cap, .func = obsCapture });
+
+    const port: u16 = 18098;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    const upgrade_req =
+        "GET /ws HTTP/1.1\r\nHost: x\r\n" ++
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    cw.interface.writeAll(upgrade_req) catch unreachable;
+    cw.interface.flush() catch unreachable;
+
+    // Wait for 101 response head.
+    var tries: usize = 0;
+    while (std.mem.indexOf(u8, cr.interface.buffered(), "\r\n\r\n") == null) : (tries += 1) {
+        if (tries > 1000) return error.TestTimeout;
+        cr.interface.fillMore() catch unreachable;
+    }
+
+    // Send a close frame to end the WS session cleanly.
+    const close_frame = [_]u8{ 0x88, 0x80, 0x00, 0x00, 0x00, 0x00 };
+    cw.interface.writeAll(&close_frame) catch unreachable;
+    cw.interface.flush() catch unreachable;
+    // Drain until EOF so the server has finished the handler before we check.
+    while (true) cr.interface.fillMore() catch break;
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+
+    // Observer must have recorded the upgrade as status 101.
+    try testing.expectEqual(@as(u16, 101), cap.status);
+    try testing.expect(cap.count >= 1);
 }
