@@ -8,6 +8,7 @@ All notable changes to zax are documented here. The format is based on
 
 ### Added
 
+- Built-in `cors` middleware (`zax.cors(Ctx, config)`) — comptime-configured `Access-Control-*` headers; supports wildcard (`.any`) and exact-match allowlist (`.list`) origin policies; reflects the concrete origin with `Vary: Origin` when using `.list` or when `credentials = true`; configurable `methods`, `allow_headers`, `expose_headers`, `credentials`, and `max_age`. Auto-preflight: `OPTIONS` requests are answered with `204` and allow-headers without registering an `OPTIONS` route (dispatch runs the global chain for unrouted OPTIONS preflights).
 - `Headers` extractor — zero-copy, case-insensitive access to every request header via `.get(name)`, `.has(name)`, `.getAll(arena, name)` (all values, arena-allocated slice), `.all()`, and `.count()`.
 - `Multipart` extractor — parse `multipart/form-data` request bodies (file uploads) into a zero-copy list of parts (`mp.field` / `mp.file` / `mp.parts`); bounded by `max_body_size` and a 1024-part cap (malformed → 400, too many parts → 413).
 - `SetCookie` / `Response.withCookie` / `Response.expireCookie` — build and append `Set-Cookie` response headers (RFC 6265); supports `Max-Age`, `Domain`, `Path`, `Secure`, `HttpOnly`, and `SameSite` (`Strict`/`Lax`/`None`); name and value validated at serialize time (invalid name → `error.InvalidCookieName`, invalid value → `error.InvalidCookieValue`); value emitted raw (symmetric with the `Cookies` read extractor).

@@ -221,6 +221,48 @@ const v1 = api.group("/v1", .{&requestId});
 try v1.post("/items", createItem);     // POST /api/v1/items
 ```
 
+### Built-in: CORS
+
+`zax.cors(comptime Ctx: type, comptime config: zax.Cors)` returns a global
+middleware that attaches `Access-Control-*` headers and answers `OPTIONS`
+preflight requests with `204 No Content`.  Register it with `app.use`:
+
+```zig
+const Api = zax.App(*const Db);
+
+var app = try Api.init(init.gpa, &db, .{});
+try app.use(zax.cors(Api.Context, .{
+    .origins = .{ .list = &.{ "https://example.com", "https://app.example.com" } },
+    .credentials = true,
+    .max_age = 86400,
+}));
+```
+
+**`zax.Cors` config fields** (all comptime, all have defaults):
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `origins` | `Origins` | `.any` | `.any` → wildcard; `.list` → exact-match allowlist |
+| `methods` | `[]const u8` | `"GET, POST, PUT, DELETE, OPTIONS"` | `Access-Control-Allow-Methods` |
+| `allow_headers` | `[]const u8` | `"Content-Type"` | `Access-Control-Allow-Headers` |
+| `expose_headers` | `?[]const u8` | `null` | `Access-Control-Expose-Headers` (omitted when null) |
+| `credentials` | `bool` | `false` | emit `Access-Control-Allow-Credentials: true` |
+| `max_age` | `?u32` | `null` | `Access-Control-Max-Age` in seconds (omitted when null) |
+
+**Origin policies:**
+
+- `.any` — emits `Access-Control-Allow-Origin: *`.  When `credentials = true`,
+  the concrete request `Origin` is reflected instead (browsers require a specific
+  origin with credentialed requests), and `Vary: Origin` is added.
+- `.list = &.{ "https://a.com", … }` — exact-matches the request `Origin`
+  against the list.  On match, the origin is reflected and `Vary: Origin` is
+  added.  On miss (or no `Origin` header), no CORS headers are emitted.
+
+**Preflight:** `OPTIONS` requests that carry `Access-Control-Request-Method` are
+answered with `204` and the appropriate `Allow-*` headers; the handler is not
+called.  Because zax runs the global middleware chain even when no `OPTIONS`
+route is registered, preflight **just works** — no need to add `OPTIONS` routes.
+
 ## Observability
 
 `app.observe(obs)` registers an `zax.Observer` that fires after every routed
