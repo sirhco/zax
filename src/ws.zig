@@ -117,6 +117,74 @@ pub fn writeFrame(w: *std.Io.Writer, opcode: Opcode, payload: []const u8) std.Io
     try w.writeAll(payload);
 }
 
+/// The server-side callback invoked after a successful upgrade. Runs on the
+/// connection's own thread and owns the socket for its lifetime.
+pub const Handler = *const fn (conn: *WsConn) void;
+
+/// Carried on a `Response` to signal "take over this connection". Built by
+/// `WebSocket.onUpgrade`; consumed by the server's `handleConn`.
+pub const Upgrade = struct {
+    accept: [28]u8, // precomputed Sec-WebSocket-Accept (by value — no borrow)
+    cb: Handler,
+};
+
+/// A live, taken-over WebSocket connection. Single-threaded: only the callback's
+/// thread touches it. Reads one frame per `read()` over `buf`, recv'ing more from
+/// the socket as needed; `payload` borrows `buf` until the next `read()`.
+pub const WsConn = struct {
+    io: std.Io,
+    socket: std.Io.net.Socket,
+    w: *std.Io.Writer,
+    buf: []u8, // staging buffer; max frame size == buf.len
+    start: usize = 0, // unconsumed window [start, end)
+    end: usize = 0,
+    state_ptr: *anyopaque,
+    arena: std.mem.Allocator,
+    idle_timeout: std.Io.Timeout,
+
+    fn compact(self: *WsConn) void {
+        if (self.start == 0) return;
+        const len = self.end - self.start;
+        std.mem.copyForwards(u8, self.buf[0..len], self.buf[self.start..self.end]);
+        self.start = 0;
+        self.end = len;
+    }
+
+    /// Next frame, or null on a close frame / EOF / parse-or-read error. The
+    /// returned `payload` borrows `buf` and is valid only until the next read().
+    pub fn read(self: *WsConn) ?Frame {
+        while (true) {
+            if (self.end > self.start) {
+                if (parseFrame(self.buf[self.start..self.end])) |parsed| {
+                    self.start += parsed.consumed;
+                    if (parsed.frame.opcode == .close) return null;
+                    return parsed.frame;
+                } else |e| switch (e) {
+                    error.Incomplete => {}, // fall through to recv
+                    else => return null, // protocol error -> end the loop
+                }
+            }
+            self.compact();
+            if (self.end == self.buf.len) return null; // frame larger than buffer
+            const msg = self.socket.receiveTimeout(self.io, self.buf[self.end..], self.idle_timeout) catch return null;
+            if (msg.data.len == 0) return null; // EOF
+            self.end += msg.data.len;
+        }
+    }
+
+    /// Serialize one unmasked server frame and flush.
+    pub fn send(self: *WsConn, opcode: Opcode, payload: []const u8) std.Io.Writer.Error!void {
+        try writeFrame(self.w, opcode, payload);
+        try self.w.flush();
+    }
+
+    /// App state, type-erased. `T` MUST be the app-state type the router is
+    /// parameterized by (typically a pointer, e.g. `*Db`).
+    pub fn state(self: *WsConn, comptime T: type) T {
+        return @as(*T, @ptrCast(@alignCast(self.state_ptr))).*;
+    }
+};
+
 // Test helper: build a masked client frame into `out`, return the used slice.
 fn buildMaskedFrame(out: []u8, fin: bool, opcode: Opcode, key: [4]u8, payload: []const u8) []u8 {
     out[0] = (if (fin) @as(u8, 0x80) else 0) | @as(u8, @intFromEnum(opcode));
@@ -284,4 +352,62 @@ test "ws: build → parseFrame → writeFrame round-trips the payload" {
     try std.testing.expectEqual(@as(u8, 0x82), server_bytes[0]);
     try std.testing.expectEqual(@as(u8, @intCast(original.len)), server_bytes[1]);
     try std.testing.expectEqualStrings(original, server_bytes[2..]);
+}
+
+test "ws: WsConn.read returns a buffered masked text frame" {
+    var buf: [64]u8 = undefined;
+    const key = [4]u8{ 1, 2, 3, 4 };
+    const frame = buildMaskedFrame(&buf, true, .text, key, "hello");
+    var st: u8 = 0;
+    var conn = WsConn{ .io = undefined, .socket = undefined, .w = undefined, .buf = &buf,
+        .start = 0, .end = frame.len, .state_ptr = @ptrCast(&st),
+        .arena = std.testing.allocator, .idle_timeout = undefined };
+    const f = conn.read() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(f.fin);
+    try std.testing.expectEqual(Opcode.text, f.opcode);
+    try std.testing.expectEqualStrings("hello", f.payload);
+}
+
+test "ws: WsConn.read returns two pipelined frames then null on close" {
+    var buf: [128]u8 = undefined;
+    const key = [4]u8{ 9, 9, 9, 9 };
+    const f1 = buildMaskedFrame(buf[0..], true, .text, key, "aa");
+    const f2 = buildMaskedFrame(buf[f1.len..], true, .close, key, "");
+    var st: u8 = 0;
+    var conn = WsConn{ .io = undefined, .socket = undefined, .w = undefined, .buf = &buf,
+        .start = 0, .end = f1.len + f2.len, .state_ptr = @ptrCast(&st),
+        .arena = std.testing.allocator, .idle_timeout = undefined };
+    const a = conn.read() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("aa", a.payload);
+    try std.testing.expectEqual(@as(?Frame, null), conn.read()); // close frame -> null, no recv
+}
+
+test "ws: WsConn.read returns null on a protocol error (unmasked client frame)" {
+    var buf = [_]u8{ 0x81, 0x03, 'a', 'b', 'c' }; // FIN+text, mask bit 0, len 3
+    var st: u8 = 0;
+    var conn = WsConn{ .io = undefined, .socket = undefined, .w = undefined, .buf = &buf,
+        .start = 0, .end = buf.len, .state_ptr = @ptrCast(&st),
+        .arena = std.testing.allocator, .idle_timeout = undefined };
+    try std.testing.expectEqual(@as(?Frame, null), conn.read());
+}
+
+test "ws: WsConn.send writes an unmasked server frame" {
+    var out: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out);
+    var st: u8 = 0;
+    var conn = WsConn{ .io = undefined, .socket = undefined, .w = &w, .buf = &.{},
+        .start = 0, .end = 0, .state_ptr = @ptrCast(&st),
+        .arena = std.testing.allocator, .idle_timeout = undefined };
+    try conn.send(.text, "Hi");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'H', 'i' }, w.buffered());
+}
+
+test "ws: WsConn.state returns the app-state pointer" {
+    const Db = struct { n: u8 };
+    var db = Db{ .n = 7 };
+    var sp: *Db = &db;
+    var conn = WsConn{ .io = undefined, .socket = undefined, .w = undefined, .buf = &.{},
+        .start = 0, .end = 0, .state_ptr = @ptrCast(&sp),
+        .arena = std.testing.allocator, .idle_timeout = undefined };
+    try std.testing.expectEqual(@as(*Db, &db), conn.state(*Db));
 }

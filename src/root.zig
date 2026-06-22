@@ -81,6 +81,7 @@ pub const compress = @import("compress.zig").compress;
 pub const ws = @import("ws.zig");
 pub const WsOpcode = ws.Opcode;
 pub const WsFrame = ws.Frame;
+pub const WsConn = ws.WsConn;
 
 // --- Server (Phase 4) ---
 pub const server = @import("server.zig");
