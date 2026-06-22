@@ -692,25 +692,34 @@ pub fn App(comptime AppState: type) type {
                     w.writeAll("\r\n\r\n") catch break;
                     w.flush() catch break;
 
-                    // Hand the socket to the callback. Reuse the connection read
-                    // buffer: drop the request bytes, move any pipelined frame
-                    // bytes to the front, then read frames from there + the socket.
+                    // Threaded WsConn: send = blocking writeFrame+flush; close = flag.
+                    const ThreadedSink = struct {
+                        writer: *std.Io.Writer,
+                        closed: bool = false,
+                        const vt = ws_mod.WsConn.VTable{ .send = sendFn, .close = closeFn };
+                        fn sendFn(ctx: *anyopaque, opcode: ws_mod.Opcode, payload: []const u8) ws_mod.SendError!void {
+                            const s: *@This() = @ptrCast(@alignCast(ctx));
+                            ws_mod.writeFrame(s.writer, opcode, payload) catch return error.WriteFailed;
+                            s.writer.flush() catch return error.WriteFailed;
+                        }
+                        fn closeFn(ctx: *anyopaque) void {
+                            const s: *@This() = @ptrCast(@alignCast(ctx));
+                            s.closed = true;
+                        }
+                    };
+                    var sink = ThreadedSink{ .writer = w };
+                    var conn = ws_mod.WsConn{ .ctx = &sink, .vtable = &ThreadedSink.vt,
+                        .state_ptr = up.state_ptr, .arena = arena.allocator() };
+
+                    // Seed the frame buffer with any pipelined post-handshake bytes.
                     cr.consume(consumed);
                     cr.compact();
-                    var conn = ws_mod.WsConn{
-                        .io = io,
-                        .socket = stream.socket,
-                        .w = w,
-                        .buf = read_buf,
-                        .start = 0,
-                        .end = cr.buffered().len,
-                        .state_ptr = @ptrCast(&self.state),
-                        .arena = arena.allocator(),
-                        .idle_timeout = idle_to,
-                    };
+                    var start: usize = 0;
+                    var end: usize = cr.buffered().len;
+
                     // Record the upgrade request (status 101) now: the request completes
                     // at the handshake, so duration_ns covers handshake-to-takeover only,
-                    // not the long-lived WebSocket session that up.cb runs next.
+                    // not the long-lived WebSocket session that follows.
                     if (self.observers.items.len > 0) {
                         const dur: u64 = @intCast(@max(@as(i96, 0), nowNs(io) - t0));
                         const rec = observe_mod.AccessRecord{
@@ -723,8 +732,22 @@ pub fn App(comptime AppState: type) type {
                         };
                         for (self.observers.items) |obs| obs.func(obs.context, rec);
                     }
-                    up.cb(&conn);
-                    break; // takeover done -> close (defer stream.close)
+
+                    if (up.handler.on_open) |f| f(&conn);
+
+                    // Framework-driven read loop: read -> pump -> on_message.
+                    while (!sink.closed) {
+                        const pr = ws_mod.pump(read_buf, &start, &end, &conn, up.handler);
+                        if (pr == .closed) break;
+                        if (sink.closed) break;
+                        if (end == read_buf.len) break; // frame larger than buffer -> stop
+                        // Blocking read more bytes into read_buf[end..].
+                        const msg = stream.socket.receiveTimeout(io, read_buf[end..], idle_to) catch break;
+                        if (msg.data.len == 0) break; // EOF
+                        end += msg.data.len;
+                    }
+                    if (up.handler.on_close) |f| f(&conn);
+                    break; // -> defer stream.close
                 }
 
                 if (self.opts.request_id) {
@@ -3504,12 +3527,11 @@ test "e2e: gzip compresses a large text response when accepted" {
     loop_fut.await(io);
 }
 
+fn wsEchoOnMessage(conn: *ws_mod.WsConn, frame: ws_mod.Frame) void {
+    conn.send(frame.opcode, frame.payload) catch {};
+}
 fn wsEchoHandler(sock: @import("extract/websocket.zig").WebSocket) Response {
-    return sock.onUpgrade(struct {
-        fn run(conn: *ws_mod.WsConn) void {
-            while (conn.read()) |f| conn.send(f.opcode, f.payload) catch break;
-        }
-    }.run);
+    return sock.onUpgrade(.{ .on_message = wsEchoOnMessage });
 }
 
 test "end-to-end: websocket upgrade, handshake, and echo" {

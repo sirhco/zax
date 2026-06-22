@@ -41,7 +41,7 @@ pub const WebSocket = struct {
         if (!std.mem.eql(u8, ver, "13")) return error.NotWebSocketUpgrade;
 
         const key = ctx.req.header("sec-websocket-key") orelse return error.NotWebSocketUpgrade;
-        return .{ .key = key, .state_ptr = @ptrCast(ctx.state) };
+        return .{ .key = key, .state_ptr = @ptrCast(@constCast(ctx.state)) };
     }
 
     pub fn onUpgrade(self: @This(), handler: ws.Handler) Response {
