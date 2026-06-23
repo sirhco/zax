@@ -158,6 +158,7 @@ pub fn StoreT(comptime config: RateLimit) type {
         /// Saturating ceil-to-u64: avoids illegal behaviour when `x` is +Inf
         /// (which can occur with a pathologically tiny `refill_per_sec`).
         fn ceilToU64(x: f64) u64 {
+            if (!std.math.isFinite(x)) return std.math.maxInt(u64); // non-finite (NaN/Inf) → saturate; unreachable in current call sites
             const c = @ceil(x);
             if (c >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) return std.math.maxInt(u64);
             return @intFromFloat(c);
