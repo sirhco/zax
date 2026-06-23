@@ -31,7 +31,8 @@ jobs:
       - run: zig build bench-build
       - name: Build examples
         run: |
+          set -e
           for d in examples/*/; do
             echo "== building $d =="
-            (cd "$d" && zig build)
+            (cd "$d" && zig build) || { echo "FAILED: $d"; exit 1; }
           done
