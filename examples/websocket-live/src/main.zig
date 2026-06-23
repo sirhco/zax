@@ -8,7 +8,8 @@
 const std = @import("std");
 const zax = @import("zax");
 
-/// Per-connection message counter. Lock-free: a plain atomic counter needs no mutex.
+/// Global message counter shared across all connections (app state). Lock-free:
+/// a plain atomic counter needs no lock.
 const Counter = struct {
     n: std.atomic.Value(usize) = .init(0),
 };
@@ -25,6 +26,12 @@ fn ws(sock: zax.WebSocket) zax.Response {
     return sock.onUpgrade(.{ .on_message = onMessage });
 }
 
+fn stats(s: zax.State(*Counter), a: zax.Alloc) !zax.Response {
+    const n = s.value.n.load(.monotonic);
+    const body = try std.fmt.allocPrint(a.value, "messages echoed: {d}\n", .{n});
+    return zax.Response.text(body);
+}
+
 fn home() zax.Response {
     return zax.Response.text("connect a WebSocket to /ws (it echoes messages)\n");
 }
@@ -34,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
     var app = try Api.init(init.gpa, &counter, .{});
     defer app.deinit();
     try app.get("/", home);
+    try app.get("/stats", stats);
     try app.get("/ws", ws);
 
     // Parse the optional "evented" arg via the iterator API (Zig 0.16 Juicy Main).
