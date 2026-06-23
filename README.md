@@ -1,4 +1,12 @@
-# Zax
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/zax-icon-velocity-dark.svg">
+    <img src="assets/zax-icon-velocity-light.svg" height="96" alt="zax">
+  </picture>
+</p>
+<p align="center">
+  <img src="assets/zax-wordmark.svg" height="40" alt="zax">
+</p>
 
 [![CI](https://github.com/sirhco/zax/actions/workflows/ci.yml/badge.svg)](https://github.com/sirhco/zax/actions/workflows/ci.yml)
 
@@ -8,6 +16,20 @@ graceful shutdown — built from scratch on the new `std.Io` interface.
 
 **New here?** Read [`docs/getting-started.md`](docs/getting-started.md) and run the
 standalone consumer in [`examples/hello-service/`](examples/hello-service).
+
+## Examples
+
+Runnable, self-contained apps under [`examples/`](examples) — each is its own package
+that depends on this repo, so `cd examples/<name> && zig build run` just works. See the
+[examples cookbook](docs/examples.md) for walkthroughs.
+
+| Example | Demonstrates |
+| --- | --- |
+| [`hello-service`](examples/hello-service) | Minimal app: `State`, `Path`, `Query`, `Json`, middleware |
+| [`todo-api`](examples/todo-api) | REST/CRUD JSON API, mutable `State` + `Mutex`, metrics + access log |
+| [`auth-sessions`](examples/auth-sessions) | Cookie sessions + a guard middleware (401 on missing/invalid) |
+| [`file-upload`](examples/file-upload) | `multipart/form-data` uploads + static file serving |
+| [`websocket-live`](examples/websocket-live) | WebSocket echo on both `serve` and `serveEvented` |
 
 ```zig
 const zax = @import("zax");

@@ -5,3 +5,7 @@ zig-out/
 # bench trace artifacts
 trace-*.log
 **/trace-*.log
+
+# Example app build artifacts
+examples/*/.zig-cache/
+examples/*/zig-out/
