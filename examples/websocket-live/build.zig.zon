@@ -1,0 +1,16 @@
+.{
+    .name = .websocket_live,
+    .version = "0.0.0",
+    .fingerprint = 0xa7da162770887191,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Depend on Zax via a local path so this example tracks the repo.
+        // A real consumer would run `zig fetch --save git+https://…/zax`.
+        .zax = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
