@@ -251,6 +251,7 @@ pub fn pump(buf: []u8, start: *usize, end: *usize, conn: *WsConn, handler: Handl
                     handler.on_message(conn, .{ .fin = true, .opcode = r.msg_opcode, .payload = r.msg_buf.?[0..r.msg_len] });
                     r.fragmenting = false;
                     r.msg_len = 0;
+                    r.msg_opcode = .text;
                 }
             },
             .text, .binary => {
@@ -540,7 +541,7 @@ test "ws: pump reassembles a two-frame fragmented message" {
     try std.testing.expectEqual(Opcode.text, MsgCapture.last_opcode);
 }
 
-test "ws: pump auto-ponds a ping and still reassembles" {
+test "ws: pump auto-pongs a ping and still reassembles" {
     MsgCapture.reset();
     var buf: [128]u8 = undefined;
     const key = [4]u8{ 2, 2, 2, 2 };
