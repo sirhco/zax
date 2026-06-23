@@ -101,6 +101,8 @@ pub fn StoreT(comptime config: RateLimit) type {
 
         /// Linear scan; returns pointer to matching slot or null.
         /// Caller must hold the lock.
+        /// Note: key_len == 0 marks an empty slot — the middleware's shared-bucket sentinel
+        /// must therefore be non-empty (see the "\x00" use in mw).
         pub fn find(self: *Self, key: []const u8) ?*Slot {
             const k = truncated(key);
             for (&self.slots) |*slot| {
@@ -119,7 +121,7 @@ pub fn StoreT(comptime config: RateLimit) type {
         pub fn claim(self: *Self, key: []const u8, now: i128) *Slot {
             const k = truncated(key);
 
-            // First pass: find an empty slot.
+            // First pass: find an empty slot (key_len == 0 marks empty).
             for (&self.slots) |*slot| {
                 if (slot.key_len == 0) {
                     initSlot(slot, k, now);
@@ -216,7 +218,9 @@ pub fn rateLimit(comptime Ctx: type, comptime config: RateLimit) middleware.Chai
             const Self = @This();
             const key = extractKey(Ctx, config, ctx);
             if (key == null and config.on_missing == .bypass) return next.run();
-            const k = key orelse "\x00"; // .shared bucket — non-empty sentinel so key_len != 0
+            // .shared bucket uses non-empty sentinel "\x00" — a key of length 0 would collide with
+            // StoreT's empty-slot marker (key_len == 0), causing shared requests to always get a fresh bucket.
+            const k = key orelse "\x00";
             const d = Self.store.check(k, nowNs());
             if (!d.allow) return try rlDeny(config, ctx.arena, d);
             const r = try next.run();
@@ -239,10 +243,12 @@ fn extractKey(comptime Ctx: type, comptime config: RateLimit, ctx: *const Ctx) ?
         // First hop of a comma-separated XFF list, trimmed of whitespace.
         const comma = std.mem.indexOfScalar(u8, v, ',') orelse v.len;
         const hop = std.mem.trim(u8, v[0..comma], " \t");
+        // len > 0 prevents returning an empty key, which would collide with the empty-slot marker.
         if (hop.len > 0) return hop;
     }
     if (ctx.req.header(config.fallback_header)) |v| {
         const trimmed = std.mem.trim(u8, v, " \t");
+        // len > 0 prevents returning an empty key, which would collide with the empty-slot marker.
         if (trimmed.len > 0) return trimmed;
     }
     return null;
@@ -476,7 +482,7 @@ const cfgB_bypass: RateLimit = .{ .capacity = 1, .refill_per_sec = 0.001, .max_k
 test "rl untrusted + shared: still rate-limited on shared (empty) key" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    // trust_forwarded=false → key=null → shared bucket "".
+    // trust_forwarded=false → key=null → shared bucket "\x00".
     const req = fakeReq(.GET, &.{});
 
     // First: allow (shared bucket gets claimed).
