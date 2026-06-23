@@ -76,6 +76,7 @@ pub const Cors = @import("cors.zig").Cors;
 pub const cors = @import("cors.zig").cors;
 pub const Compress = @import("compress.zig").Compress;
 pub const compress = @import("compress.zig").compress;
+pub const RateLimit = @import("ratelimit.zig").RateLimit;
 
 // --- WebSocket (Phase 5) ---
 pub const ws = @import("ws.zig");
