@@ -3618,6 +3618,88 @@ test "end-to-end: websocket upgrade, handshake, and echo" {
     loop_fut.await(io);
 }
 
+test "end-to-end: websocket fragmentation, ping, and close (threaded)" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ws", wsEchoHandler);
+
+    const port: u16 = 18100;
+    var loop_fut = startTestApp(io, &app, port);
+
+    var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    defer cs.close(io);
+    var rb: [4096]u8 = undefined;
+    var cr = cs.reader(io, &rb);
+    var wb: [512]u8 = undefined;
+    var cw = cs.writer(io, &wb);
+
+    // 1. Send the handshake and assert 101 + accept value.
+    const upgrade_req =
+        "GET /ws HTTP/1.1\r\nHost: x\r\n" ++
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    cw.interface.writeAll(upgrade_req) catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var tries1: usize = 0;
+    while (std.mem.indexOf(u8, cr.interface.buffered(), "\r\n\r\n") == null) : (tries1 += 1) {
+        if (tries1 > 1000) return error.TestTimeout;
+        cr.interface.fillMore() catch unreachable;
+    }
+    const head_end = std.mem.indexOf(u8, cr.interface.buffered(), "\r\n\r\n").? + 4;
+    const head = cr.interface.buffered()[0..head_end];
+    try testing.expect(std.mem.indexOf(u8, head, "101 Switching Protocols") != null);
+    try testing.expect(std.mem.indexOf(u8, head, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+    cr.interface.toss(head_end);
+
+    // 2. Fragmented message: text fin=0 "Hel" + continuation fin=1 "lo" -> echoed whole "Hello".
+    const frag1 = [_]u8{ 0x01, 0x83, 0x00, 0x00, 0x00, 0x00, 'H', 'e', 'l' }; // opcode text(0x1), fin=0
+    const frag2 = [_]u8{ 0x80, 0x82, 0x00, 0x00, 0x00, 0x00, 'l', 'o' };       // opcode continuation(0x0), fin=1
+    cw.interface.writeAll(&frag1) catch unreachable;
+    cw.interface.writeAll(&frag2) catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var t1: usize = 0;
+    while (cr.interface.buffered().len < 7) : (t1 += 1) {
+        if (t1 > 1000) return error.TestTimeout;
+        cr.interface.fillMore() catch unreachable;
+    }
+    // server echoes the whole message as one text frame: 0x81, 0x05, "Hello"
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x05, 'H', 'e', 'l', 'l', 'o' }, cr.interface.buffered()[0..7]);
+    cr.interface.toss(7);
+
+    // 3. Ping -> pong. masked ping (0x89) "pq" -> server sends pong (0x8A) "pq".
+    const ping = [_]u8{ 0x89, 0x82, 0x00, 0x00, 0x00, 0x00, 'p', 'q' };
+    cw.interface.writeAll(&ping) catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var t2: usize = 0;
+    while (cr.interface.buffered().len < 4) : (t2 += 1) {
+        if (t2 > 1000) return error.TestTimeout;
+        cr.interface.fillMore() catch unreachable;
+    }
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x8A, 0x02, 'p', 'q' }, cr.interface.buffered()[0..4]);
+    cr.interface.toss(4);
+
+    // 4. Close -> close-reply then EOF. masked close (0x88) with code 1000.
+    const close = [_]u8{ 0x88, 0x82, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8 };
+    cw.interface.writeAll(&close) catch unreachable;
+    cw.interface.flush() catch unreachable;
+    var t3: usize = 0;
+    while (cr.interface.buffered().len < 4) : (t3 += 1) {
+        if (t3 > 1000) return error.TestTimeout;
+        cr.interface.fillMore() catch unreachable;
+    }
+    // server echoes a close frame (0x88) with the same code, then closes.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xE8 }, cr.interface.buffered()[0..4]);
+
+    app.requestShutdown(io);
+    loop_fut.await(io);
+}
+
 test "observe: upgrade request is recorded with status 101" {
     var threaded = Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -3752,6 +3834,130 @@ test "end-to-end (evented): websocket upgrade, handshake, and echo" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'h', 'i' }, echo_buf[0..4]);
 
     // 5. Shutdown.
+    var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer shutdown_threaded.deinit();
+    app.requestShutdown(shutdown_threaded.io());
+    srv_thread.join();
+    try testing.expect(serve_ctx.err == null);
+}
+
+test "end-to-end (evented): websocket fragmentation, ping, and close" {
+    if (!evented_supported) return error.SkipZigTest;
+
+    var db = Db{ .msg = "pong" };
+    var app = try TestApp.init(testing.allocator, &db, .{});
+    defer app.deinit();
+    try app.get("/ws", wsEchoHandler);
+
+    const port: u16 = 18101;
+    const addr = net.IpAddress{ .ip4 = .loopback(port) };
+
+    const ServeCtx = struct {
+        app: *TestApp,
+        io: Io,
+        addr: net.IpAddress,
+        err: ?anyerror = null,
+    };
+    var serve_ctx = ServeCtx{ .app = &app, .io = undefined, .addr = addr };
+    var srv_threaded = Io.Threaded.init(testing.allocator, .{});
+    defer srv_threaded.deinit();
+    serve_ctx.io = srv_threaded.io();
+
+    const ServeThread = struct {
+        fn run(ctx: *ServeCtx) void {
+            ctx.app.serveEvented(ctx.io, ctx.addr, .{ .workers = 1 }) catch |e| {
+                ctx.err = e;
+            };
+        }
+    };
+    const srv_thread = try std.Thread.spawn(.{}, ServeThread.run, .{&serve_ctx});
+
+    sevWaitListening(port, 50);
+
+    const cfd = try sevSocket();
+    defer sevCloseFd(cfd);
+    try testing.expect(sevConnect(cfd, port));
+
+    // 1. Send the WebSocket upgrade request.
+    const upgrade_req =
+        "GET /ws HTTP/1.1\r\nHost: x\r\n" ++
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    try sevWrite(cfd, upgrade_req);
+
+    // 2. Read the 101 response head.
+    var head_buf: [1024]u8 = undefined;
+    var head_total: usize = 0;
+    var head_tries: usize = 0;
+    while (std.mem.indexOf(u8, head_buf[0..head_total], "\r\n\r\n") == null) : (head_tries += 1) {
+        if (head_tries > 1000) return error.TestTimeout;
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(std.os.linux.read(@intCast(cfd), head_buf[head_total..].ptr, head_buf.len - head_total))
+        else
+            std.c.read(cfd, head_buf[head_total..].ptr, head_buf.len - head_total);
+        if (n <= 0) return error.UnexpectedEof;
+        head_total += @intCast(n);
+    }
+    const head_end = std.mem.indexOf(u8, head_buf[0..head_total], "\r\n\r\n").? + 4;
+    try testing.expect(std.mem.indexOf(u8, head_buf[0..head_end], "101 Switching Protocols") != null);
+    try testing.expect(std.mem.indexOf(u8, head_buf[0..head_end], "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+
+    // 3. Fragmented message: text fin=0 "Hel" + continuation fin=1 "lo" -> echoed whole "Hello".
+    const frag1 = [_]u8{ 0x01, 0x83, 0x00, 0x00, 0x00, 0x00, 'H', 'e', 'l' }; // opcode text(0x1), fin=0
+    const frag2 = [_]u8{ 0x80, 0x82, 0x00, 0x00, 0x00, 0x00, 'l', 'o' };       // opcode continuation(0x0), fin=1
+    try sevWrite(cfd, &frag1);
+    try sevWrite(cfd, &frag2);
+    var frag_buf: [64]u8 = undefined;
+    var frag_total: usize = 0;
+    var t1: usize = 0;
+    while (frag_total < 7) : (t1 += 1) {
+        if (t1 > 1000) return error.TestTimeout;
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(std.os.linux.read(@intCast(cfd), frag_buf[frag_total..].ptr, frag_buf.len - frag_total))
+        else
+            std.c.read(cfd, frag_buf[frag_total..].ptr, frag_buf.len - frag_total);
+        if (n <= 0) return error.UnexpectedEof;
+        frag_total += @intCast(n);
+    }
+    // server echoes the whole message as one text frame: 0x81, 0x05, "Hello"
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x05, 'H', 'e', 'l', 'l', 'o' }, frag_buf[0..7]);
+
+    // 4. Ping -> pong. masked ping (0x89) "pq" -> server sends pong (0x8A) "pq".
+    const ping = [_]u8{ 0x89, 0x82, 0x00, 0x00, 0x00, 0x00, 'p', 'q' };
+    try sevWrite(cfd, &ping);
+    var pong_buf: [64]u8 = undefined;
+    var pong_total: usize = 0;
+    var t2: usize = 0;
+    while (pong_total < 4) : (t2 += 1) {
+        if (t2 > 1000) return error.TestTimeout;
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(std.os.linux.read(@intCast(cfd), pong_buf[pong_total..].ptr, pong_buf.len - pong_total))
+        else
+            std.c.read(cfd, pong_buf[pong_total..].ptr, pong_buf.len - pong_total);
+        if (n <= 0) return error.UnexpectedEof;
+        pong_total += @intCast(n);
+    }
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x8A, 0x02, 'p', 'q' }, pong_buf[0..4]);
+
+    // 5. Close -> close-reply then EOF. masked close (0x88) with code 1000.
+    const close = [_]u8{ 0x88, 0x82, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8 };
+    try sevWrite(cfd, &close);
+    var close_buf: [64]u8 = undefined;
+    var close_total: usize = 0;
+    var t3: usize = 0;
+    while (close_total < 4) : (t3 += 1) {
+        if (t3 > 1000) return error.TestTimeout;
+        const n: isize = if (builtin.os.tag == .linux)
+            @bitCast(std.os.linux.read(@intCast(cfd), close_buf[close_total..].ptr, close_buf.len - close_total))
+        else
+            std.c.read(cfd, close_buf[close_total..].ptr, close_buf.len - close_total);
+        if (n <= 0) return error.UnexpectedEof;
+        close_total += @intCast(n);
+    }
+    // server echoes a close frame (0x88) with the same code, then closes.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xE8 }, close_buf[0..4]);
+
+    // 6. Shutdown.
     var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
     defer shutdown_threaded.deinit();
     app.requestShutdown(shutdown_threaded.io());
