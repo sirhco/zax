@@ -1,0 +1,17 @@
+.{
+    .name = .auth_sessions,
+    .version = "0.0.0",
+    .fingerprint = 0xbe9a1a95f927a670, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Depend on Zax. This example uses a local path so it tracks this repo;
+        // a real consumer would run `zig fetch --save git+https://…/zax` which
+        // writes a `.url` + `.hash` entry here instead.
+        .zax = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
