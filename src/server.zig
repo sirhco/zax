@@ -169,6 +169,10 @@ pub const Options = struct {
     /// produced no data for this long; 0 = disabled. Hard-close (truncate,
     /// no chunked terminator).
     stream_idle_timeout_ms: u32 = 0,
+    /// Maximum reassembled WebSocket message size (bytes). A message exceeding this
+    /// is rejected with a 1009 close. A single frame is separately bounded by
+    /// `read_buffer_size`.
+    ws_max_message_size: usize = 1 << 20,
 };
 
 /// Options for the evented backend (`serveEvented`).
@@ -528,6 +532,7 @@ pub fn App(comptime AppState: type) type {
                 .tcp_nodelay = self.opts.tcp_nodelay,
                 .stream_repoll_ms = opts.stream_repoll_ms,
                 .stream_idle_timeout_ms = opts.stream_idle_timeout_ms,
+                .ws_max_message_size = self.opts.ws_max_message_size,
             };
 
             // Init workers.  Track counts separately so the single cleanup path
@@ -733,11 +738,12 @@ pub fn App(comptime AppState: type) type {
                         for (self.observers.items) |obs| obs.func(obs.context, rec);
                     }
 
+                    var reasm = ws_mod.Reassembler{ .arena = arena.allocator(), .max_message_size = self.opts.ws_max_message_size };
                     if (up.handler.on_open) |f| f(&conn);
 
                     // Framework-driven read loop: read -> pump -> on_message.
                     while (!sink.closed) {
-                        const pr = ws_mod.pump(read_buf, &start, &end, &conn, up.handler);
+                        const pr = ws_mod.pump(read_buf, &start, &end, &conn, up.handler, &reasm);
                         if (pr == .closed) break;
                         if (sink.closed) break;
                         // ws.pump compacts leftover to the front (start := 0), so a full

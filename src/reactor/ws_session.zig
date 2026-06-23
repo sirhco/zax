@@ -20,18 +20,20 @@ pub const WsSession = struct {
     o_start: usize = 0,
     o_end: usize = 0,
     handler: ws.Handler,
+    reasm: ws.Reassembler,
     conn: ws.WsConn,
     cur_t: ?Transport = null, // set for the duration of onReadable/onWritable so send() can write
     closing: bool = false,
 
     const vtable = ws.WsConn.VTable{ .send = sendFn, .close = closeFn };
 
-    pub fn init(read_buf: []u8, out_buf: []u8, handler: ws.Handler, state_ptr: *anyopaque, arena: std.mem.Allocator) WsSession {
+    pub fn init(read_buf: []u8, out_buf: []u8, handler: ws.Handler, state_ptr: *anyopaque, arena: std.mem.Allocator, max_message_size: usize) WsSession {
         var s = WsSession{
             .read_buf = read_buf,
             .out_buf = out_buf,
             .handler = handler,
             .conn = undefined,
+            .reasm = .{ .arena = arena, .max_message_size = max_message_size },
         };
         s.conn = ws.WsConn{ .ctx = undefined, .vtable = &vtable, .state_ptr = state_ptr, .arena = arena };
         return s;
@@ -64,8 +66,10 @@ pub const WsSession = struct {
         defer self.cur_t = null;
 
         // First, try any already-buffered frames (pipelined / seeded).
-        if (ws.pump(self.read_buf, &self.r_start, &self.r_end, &self.conn, self.handler) == .closed)
+        if (ws.pump(self.read_buf, &self.r_start, &self.r_end, &self.conn, self.handler, &self.reasm) == .closed) {
+            _ = self.drainOut(t); // best-effort flush of the close-reply
             return .done_close;
+        }
         if (self.closing) return .done_close;
 
         // Read more, then pump again.
@@ -77,8 +81,10 @@ pub const WsSession = struct {
             .ok => |n| {
                 if (n == 0) return .done_close;
                 self.r_end += n;
-                if (ws.pump(self.read_buf, &self.r_start, &self.r_end, &self.conn, self.handler) == .closed)
+                if (ws.pump(self.read_buf, &self.r_start, &self.r_end, &self.conn, self.handler, &self.reasm) == .closed) {
+                    _ = self.drainOut(t); // best-effort flush of the close-reply
                     return .done_close;
+                }
             },
             .would_block => {}, // nothing new; fall through
             .closed => return .done_close,
@@ -160,7 +166,7 @@ test "WsSession: a masked frame arriving in one read is echoed unmasked" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var st: u8 = 0;
-    var sess = WsSession.init(&rbuf, &obuf, .{ .on_message = echoOnMessage }, @ptrCast(&st), arena.allocator());
+    var sess = WsSession.init(&rbuf, &obuf, .{ .on_message = echoOnMessage }, @ptrCast(&st), arena.allocator(), 1 << 20);
     sess.bind();
     const t = ft.transport();
     const r = sess.onReadable(t); // read the frame, echo it; next read -> closed handled separately
@@ -178,7 +184,7 @@ test "WsSession: a close frame yields done_close" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var st: u8 = 0;
-    var sess = WsSession.init(&rbuf, &obuf, .{ .on_message = echoOnMessage }, @ptrCast(&st), arena.allocator());
+    var sess = WsSession.init(&rbuf, &obuf, .{ .on_message = echoOnMessage }, @ptrCast(&st), arena.allocator(), 1 << 20);
     sess.bind();
     try testing.expectEqual(StepResult.done_close, sess.onReadable(ft.transport()));
 }
@@ -193,7 +199,7 @@ test "WsSession: seed handles a source that overlaps its own read buffer (pipeli
     // overlapping sub-slice (simulates conn.read_buf[r_start..r_end] aliasing).
     const payload = [_]u8{ 1, 2, 3, 4, 5, 6 };
     @memcpy(rbuf[10..16], &payload);
-    var sess = WsSession.init(&rbuf, &obuf, .{ .on_message = echoOnMessage }, @ptrCast(&st), arena.allocator());
+    var sess = WsSession.init(&rbuf, &obuf, .{ .on_message = echoOnMessage }, @ptrCast(&st), arena.allocator(), 1 << 20);
     sess.bind();
     sess.seed(rbuf[10..16]); // overlapping source within the same buffer
     try testing.expectEqual(@as(usize, 0), sess.r_start);
@@ -212,7 +218,7 @@ test "WsSession: backpressured send buffers and drains on writable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var st: u8 = 0;
-    var sess = WsSession.init(&rbuf, &obuf, .{ .on_message = echoOnMessage }, @ptrCast(&st), arena.allocator());
+    var sess = WsSession.init(&rbuf, &obuf, .{ .on_message = echoOnMessage }, @ptrCast(&st), arena.allocator(), 1 << 20);
     sess.bind();
     const t = ft.transport();
     const r1 = sess.onReadable(t);

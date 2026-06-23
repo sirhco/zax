@@ -82,6 +82,7 @@ pub const WorkerOpts = struct {
     /// 0 = system default (no override).  Useful in tests to force write
     /// stalls on loopback where the default send buffer is too large.
     sndbuf_override: u32 = 0,
+    ws_max_message_size: usize = 1 << 20,
 };
 
 // Whether this platform has a functional reactor backend.
@@ -610,7 +611,7 @@ pub const Worker = struct {
                     return;
                 };
                 slot.ws = ws_session.WsSession.init(
-                    slot.read_buf, slot.ws_out_buf, up.handler, up.state_ptr, slot.arena.allocator(),
+                    slot.read_buf, slot.ws_out_buf, up.handler, up.state_ptr, slot.arena.allocator(), self.opts.ws_max_message_size,
                 );
                 slot.ws.?.bind();
                 slot.ws.?.seed(c.read_buf[c.r_start..c.r_end]);
