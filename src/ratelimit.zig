@@ -555,3 +555,65 @@ test "rl fallback: no XFF, x-real-ip present (trusted) → keys on it" {
     try testing.expectEqual(@import("http/response.zig").Status.too_many_requests, r2.status);
     try testing.expect(hdr(r2, "retry-after") != null);
 }
+
+// ---------------------------------------------------------------------------
+// Integration test: two middlewares composed in one Chain
+// ---------------------------------------------------------------------------
+// Config E: distinct capacity=1, refill_per_sec=0.002 → unique comptime
+// instantiation, own static store, isolated from all other tests above.
+const cfgE: RateLimit = .{ .capacity = 1, .refill_per_sec = 0.002, .max_keys = 8, .key_max_len = 32 };
+
+/// Trivial post-processing middleware: appends "x-test: ok" after calling next.
+fn markerMw(ctx: *const TestCtx, next: *middleware.Chain(TestCtx).Next) anyerror!Response {
+    var r = try next.run();
+    r = try r.withHeader(ctx.arena, "x-test", "ok");
+    return r;
+}
+
+test "rl composition: rateLimit + marker middleware in one Chain" {
+    const C = middleware.Chain(TestCtx);
+    const rl = rateLimit(TestCtx, cfgE);
+
+    // --- Allow path: unique key "10.9.0.1" (not used by any other test) ---
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var ran = false;
+        const req = fakeReq(.GET, &.{.{ .name = "x-forwarded-for", .value = "10.9.0.1" }});
+        var ctx = TestCtx{ .req = &req, .arena = arena.allocator(), .trust_forwarded = true, .ran = &ran };
+        const mws = [_]C.Middleware{ rl, markerMw };
+        const r = try C.run(&mws, &okHandler, &ctx);
+
+        // Handler must have run.
+        try testing.expect(ran);
+        // Marker middleware header present.
+        try testing.expectEqualStrings("ok", hdr(r, "x-test").?);
+        // Rate-limit decoration headers present.
+        try testing.expect(hdr(r, "x-ratelimit-limit") != null);
+        try testing.expect(hdr(r, "x-ratelimit-remaining") != null);
+        try testing.expect(hdr(r, "x-ratelimit-reset") != null);
+    }
+
+    // --- Deny path: key "10.9.0.2" — drain then deny ---
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const req = fakeReq(.GET, &.{.{ .name = "x-forwarded-for", .value = "10.9.0.2" }});
+
+        // First request: drains the 1-token bucket.
+        var ran1 = false;
+        var ctx1 = TestCtx{ .req = &req, .arena = arena.allocator(), .trust_forwarded = true, .ran = &ran1 };
+        const mws = [_]C.Middleware{ rl, markerMw };
+        _ = try C.run(&mws, &okHandler, &ctx1);
+        try testing.expect(ran1);
+
+        // Second request: rateLimit short-circuits before markerMw and handler.
+        var ran2 = false;
+        var ctx2 = TestCtx{ .req = &req, .arena = arena.allocator(), .trust_forwarded = true, .ran = &ran2 };
+        const r2 = try C.run(&mws, &okHandler, &ctx2);
+        try testing.expectEqual(@import("http/response.zig").Status.too_many_requests, r2.status);
+        try testing.expect(!ran2);
+        // Short-circuit: markerMw never ran, so x-test is absent.
+        try testing.expectEqual(@as(?[]const u8, null), hdr(r2, "x-test"));
+    }
+}
