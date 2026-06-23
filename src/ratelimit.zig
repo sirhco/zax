@@ -1,12 +1,14 @@
-//! Token-bucket rate limiter — data layer (Task 1).
+//! Token-bucket rate limiter — data layer (Task 1) + middleware factory (Task 2).
 //!
 //! Zero heap allocation; state lives in a static array baked into each
 //! comptime instantiation of `StoreT`. Spinlock mirrors `src/observe.zig`.
 //! Monotonic clock mirrors `src/reactor/conn.zig` (local copy, not an import).
-//! Task 2 will add the `rateLimit` middleware factory on top of this layer.
+//! `rateLimit(Ctx, config)` wraps the data layer into a `Chain(Ctx)` middleware.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const middleware = @import("middleware.zig");
+const Response = @import("http/response.zig").Response;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -194,6 +196,81 @@ pub fn StoreT(comptime config: RateLimit) type {
 }
 
 // ---------------------------------------------------------------------------
+// Middleware factory
+// ---------------------------------------------------------------------------
+
+/// Returns a `Chain(Ctx)` middleware that enforces `config`'s token-bucket
+/// rate limit.  Key extraction requires `ctx.req` (a `*const Request` with a
+/// `.header(name)` method) and `ctx.trust_forwarded: bool`.
+/// Each distinct comptime `config` value has its own independent static store.
+pub fn rateLimit(comptime Ctx: type, comptime config: RateLimit) middleware.Chain(Ctx).Middleware {
+    if (config.refill_per_sec <= 0) @compileError("rateLimit: refill_per_sec must be > 0");
+    if (config.max_keys == 0) @compileError("rateLimit: max_keys must be > 0");
+    if (config.key_max_len > std.math.maxInt(u16)) @compileError("rateLimit: key_max_len must be <= 65535");
+
+    const Next = middleware.Chain(Ctx).Next;
+    const Impl = struct {
+        var store: StoreT(config) = .{};
+
+        fn mw(ctx: *const Ctx, next: *Next) anyerror!Response {
+            const Self = @This();
+            const key = extractKey(Ctx, config, ctx);
+            if (key == null and config.on_missing == .bypass) return next.run();
+            const k = key orelse "\x00"; // .shared bucket — non-empty sentinel so key_len != 0
+            const d = Self.store.check(k, nowNs());
+            if (!d.allow) return try rlDeny(config, ctx.arena, d);
+            const r = try next.run();
+            return try rlDecorate(config, ctx.arena, r, d);
+        }
+    };
+    return Impl.mw;
+}
+
+// ---------------------------------------------------------------------------
+// Key extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the rate-limit key from `ctx`.
+/// Returns null when forwarded headers are not trusted, or when no usable
+/// header is present (caller decides: bypass or shared bucket).
+fn extractKey(comptime Ctx: type, comptime config: RateLimit, ctx: *const Ctx) ?[]const u8 {
+    if (!ctx.trust_forwarded) return null;
+    if (ctx.req.header(config.header)) |v| {
+        // First hop of a comma-separated XFF list, trimmed of whitespace.
+        const comma = std.mem.indexOfScalar(u8, v, ',') orelse v.len;
+        const hop = std.mem.trim(u8, v[0..comma], " \t");
+        if (hop.len > 0) return hop;
+    }
+    if (ctx.req.header(config.fallback_header)) |v| {
+        const trimmed = std.mem.trim(u8, v, " \t");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Header decoration helpers
+// ---------------------------------------------------------------------------
+
+/// Append the three `x-ratelimit-*` headers to `r` and return it.
+fn rlDecorate(comptime config: RateLimit, arena: std.mem.Allocator, r0: Response, d: Decision) !Response {
+    var r = try r0.withHeader(arena, "x-ratelimit-limit", try std.fmt.allocPrint(arena, "{d}", .{config.capacity}));
+    r = try r.withHeader(arena, "x-ratelimit-remaining", try std.fmt.allocPrint(arena, "{d}", .{d.remaining}));
+    r = try r.withHeader(arena, "x-ratelimit-reset", try std.fmt.allocPrint(arena, "{d}", .{d.reset_s}));
+    return r;
+}
+
+/// Build a 429 response with `x-ratelimit-*` and `retry-after` headers.
+fn rlDeny(comptime config: RateLimit, arena: std.mem.Allocator, d: Decision) !Response {
+    var r = Response.fromStatus(.too_many_requests);
+    r = try r.withHeader(arena, "x-ratelimit-limit", try std.fmt.allocPrint(arena, "{d}", .{config.capacity}));
+    r = try r.withHeader(arena, "x-ratelimit-remaining", try std.fmt.allocPrint(arena, "{d}", .{d.remaining}));
+    r = try r.withHeader(arena, "x-ratelimit-reset", try std.fmt.allocPrint(arena, "{d}", .{d.reset_s}));
+    r = try r.withHeader(arena, "retry-after", try std.fmt.allocPrint(arena, "{d}", .{d.retry_after_s}));
+    return r;
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -308,4 +385,167 @@ test "clock-backwards: now < last_refill_ns gives no extra tokens and no panic" 
     const d = store.check("k", t_past);
     try std.testing.expect(!d.allow);
     try std.testing.expectEqual(@as(u32, 0), d.remaining);
+}
+
+// ---------------------------------------------------------------------------
+// Middleware tests (cors harness style)
+// ---------------------------------------------------------------------------
+// NOTE on shared static store: each distinct comptime config value produces a
+// unique StoreT instantiation with its own static `var store`. Tests in THIS
+// file share the static store across test runs when they use the same config.
+// To prevent earlier tests from draining a later test's bucket:
+//   - Each test uses a DISTINCT IP key (e.g. "10.0.0.1", "10.0.0.2", …), or
+//   - Tests use distinct configs (different capacity / refill / max_keys).
+// The configs below are crafted to keep keys isolated.
+
+const testing = std.testing;
+const Request = @import("http/request.zig").Request;
+const Header = @import("http/request.zig").Header;
+const Method = @import("http/request.zig").Method;
+
+const TestCtx = struct {
+    req: *const Request,
+    arena: std.mem.Allocator,
+    trust_forwarded: bool,
+    ran: *bool,
+};
+
+fn fakeReq(method: Method, headers: []const Header) Request {
+    return .{ .method = method, .target = "/", .path = "/", .query = "", .version_minor = 1, .headers = headers, .body = "" };
+}
+
+fn okHandler(ctx: *const TestCtx) anyerror!Response {
+    ctx.ran.* = true;
+    return Response.text("ok");
+}
+
+fn hdr(r: Response, name: []const u8) ?[]const u8 {
+    for (r.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    return null;
+}
+
+fn runRl(arena: std.mem.Allocator, comptime config: RateLimit, req: *const Request, trust: bool, ran: *bool) !Response {
+    const C = middleware.Chain(TestCtx);
+    var ctx = TestCtx{ .req = req, .arena = arena, .trust_forwarded = trust, .ran = ran };
+    const mws = [_]C.Middleware{rateLimit(TestCtx, config)};
+    return C.run(&mws, &okHandler, &ctx);
+}
+
+// Config A: capacity=1, tiny refill — used for allow/deny tests.
+// Each test uses a unique XFF IP so the shared static store doesn't interfere.
+const cfgA: RateLimit = .{ .capacity = 1, .refill_per_sec = 0.001, .max_keys = 16, .key_max_len = 32 };
+
+test "rl allow: first request runs handler; response carries x-ratelimit-* headers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ran = false;
+    // Use unique key "10.1.0.1" for this test.
+    const req = fakeReq(.GET, &.{.{ .name = "x-forwarded-for", .value = "10.1.0.1" }});
+    const r = try runRl(arena.allocator(), cfgA, &req, true, &ran);
+    try testing.expect(ran);
+    try testing.expect(hdr(r, "x-ratelimit-limit") != null);
+    try testing.expect(hdr(r, "x-ratelimit-remaining") != null);
+    try testing.expect(hdr(r, "x-ratelimit-reset") != null);
+    try testing.expectEqualStrings("1", hdr(r, "x-ratelimit-limit").?);
+}
+
+test "rl deny: second request (same key) → 429, retry-after present, handler not called" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Use unique key "10.1.0.2" for this test (drain + deny in sequence).
+    const req = fakeReq(.GET, &.{.{ .name = "x-forwarded-for", .value = "10.1.0.2" }});
+
+    // First request: allow (drains the 1-token bucket).
+    var ran1 = false;
+    _ = try runRl(arena.allocator(), cfgA, &req, true, &ran1);
+    try testing.expect(ran1);
+
+    // Second request: deny.
+    var ran2 = false;
+    const r2 = try runRl(arena.allocator(), cfgA, &req, true, &ran2);
+    try testing.expect(!ran2);
+    try testing.expectEqual(@import("http/response.zig").Status.too_many_requests, r2.status);
+    try testing.expect(hdr(r2, "retry-after") != null);
+    try testing.expect(hdr(r2, "x-ratelimit-limit") != null);
+}
+
+// Config B: untrusted → shared or bypass.
+const cfgB_shared: RateLimit = .{ .capacity = 1, .refill_per_sec = 0.001, .max_keys = 4, .key_max_len = 32, .on_missing = .shared };
+const cfgB_bypass: RateLimit = .{ .capacity = 1, .refill_per_sec = 0.001, .max_keys = 4, .key_max_len = 32, .on_missing = .bypass };
+
+test "rl untrusted + shared: still rate-limited on shared (empty) key" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // trust_forwarded=false → key=null → shared bucket "".
+    const req = fakeReq(.GET, &.{});
+
+    // First: allow (shared bucket gets claimed).
+    var ran1 = false;
+    _ = try runRl(arena.allocator(), cfgB_shared, &req, false, &ran1);
+    try testing.expect(ran1);
+
+    // Second: deny (shared bucket drained).
+    var ran2 = false;
+    const r2 = try runRl(arena.allocator(), cfgB_shared, &req, false, &ran2);
+    try testing.expect(!ran2);
+    try testing.expectEqual(@import("http/response.zig").Status.too_many_requests, r2.status);
+}
+
+test "rl untrusted + bypass: passes through, NO x-ratelimit-* headers, handler ran" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const req = fakeReq(.GET, &.{});
+    var ran = false;
+    const r = try runRl(arena.allocator(), cfgB_bypass, &req, false, &ran);
+    try testing.expect(ran);
+    try testing.expectEqual(@as(?[]const u8, null), hdr(r, "x-ratelimit-limit"));
+    try testing.expectEqual(@as(?[]const u8, null), hdr(r, "x-ratelimit-remaining"));
+    try testing.expectEqual(@as(?[]const u8, null), hdr(r, "x-ratelimit-reset"));
+}
+
+// Config C: XFF first-hop isolation test.
+const cfgC: RateLimit = .{ .capacity = 2, .refill_per_sec = 0.001, .max_keys = 16, .key_max_len = 32 };
+
+test "rl XFF first-hop: different second hops but same first hop share a bucket" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Both requests have first hop "1.2.3.4" (different second hops).
+    const req1 = fakeReq(.GET, &.{.{ .name = "x-forwarded-for", .value = "1.2.3.4, 5.6.7.8" }});
+    const req2 = fakeReq(.GET, &.{.{ .name = "x-forwarded-for", .value = "1.2.3.4, 9.9.9.9" }});
+
+    var ran1 = false;
+    _ = try runRl(arena.allocator(), cfgC, &req1, true, &ran1);
+    try testing.expect(ran1);
+
+    var ran2 = false;
+    _ = try runRl(arena.allocator(), cfgC, &req2, true, &ran2);
+    try testing.expect(ran2); // capacity=2, still has a token
+
+    // Third request with same first hop → deny.
+    var ran3 = false;
+    const r3 = try runRl(arena.allocator(), cfgC, &req1, true, &ran3);
+    try testing.expect(!ran3);
+    try testing.expectEqual(@import("http/response.zig").Status.too_many_requests, r3.status);
+}
+
+// Config D: fallback header test.
+const cfgD: RateLimit = .{ .capacity = 1, .refill_per_sec = 0.001, .max_keys = 8, .key_max_len = 32 };
+
+test "rl fallback: no XFF, x-real-ip present (trusted) → keys on it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // No XFF, but x-real-ip is set.
+    const req = fakeReq(.GET, &.{.{ .name = "x-real-ip", .value = "192.0.2.5" }});
+
+    var ran1 = false;
+    const r1 = try runRl(arena.allocator(), cfgD, &req, true, &ran1);
+    try testing.expect(ran1);
+    try testing.expectEqualStrings("1", hdr(r1, "x-ratelimit-limit").?);
+
+    // Second request (same x-real-ip) → deny.
+    var ran2 = false;
+    const r2 = try runRl(arena.allocator(), cfgD, &req, true, &ran2);
+    try testing.expect(!ran2);
+    try testing.expectEqual(@import("http/response.zig").Status.too_many_requests, r2.status);
+    try testing.expect(hdr(r2, "retry-after") != null);
 }
