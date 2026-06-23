@@ -710,7 +710,7 @@ the monotonic clock's resolution (p50 may print `0.0 us`). The micro ns/op
 figures (amortized over millions of iterations) are the trustworthy ones. No
 comparison against `std.http.Server`, http.zig, or non-Zig servers exists yet.
 
-## WebSocket (in progress)
+## WebSocket
 
 WebSocket runs on **both** server backends — threaded (`app.serve`) and evented
 (`app.serveEvented`). Declare an endpoint with the `WebSocket` extractor and supply

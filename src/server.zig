@@ -3965,12 +3965,18 @@ test "end-to-end (evented): websocket fragmentation, ping, and close" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xE8 }, close_buf[0..4]);
 
     // After the close-reply, the server closes the connection -> EOF (read returns 0).
-    var eof_buf: [1]u8 = undefined;
-    const eof_n: isize = if (builtin.os.tag == .linux)
-        @bitCast(std.os.linux.read(@intCast(cfd), eof_buf[0..].ptr, 1))
-    else
-        std.c.read(cfd, eof_buf[0..].ptr, 1);
-    if (eof_n > 0) return error.TestUnexpectedResult; // server kept socket open
+    // Bounded retry so a server regression (no close) fails fast instead of hanging.
+    var t4: usize = 0;
+    while (true) : (t4 += 1) {
+        if (t4 > 1000) return error.TestTimeout;
+        var eof_buf: [1]u8 = undefined;
+        const eof_n: isize = if (builtin.os.tag == .linux)
+            @bitCast(std.os.linux.read(@intCast(cfd), eof_buf[0..].ptr, 1))
+        else
+            std.c.read(cfd, eof_buf[0..].ptr, 1);
+        if (eof_n > 0) return error.TestUnexpectedResult; // server kept socket open
+        break; // eof_n == 0 -> EOF, as expected
+    }
 
     // 6. Shutdown.
     var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});

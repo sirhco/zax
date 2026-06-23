@@ -658,6 +658,24 @@ test "ws: pump rejects a new data frame mid-fragment with 1002" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xEA }, sink.sent.items); // 1002
 }
 
+test "ws: pump rejects a reserved control opcode with 1002" {
+    MsgCapture.reset();
+    var buf: [32]u8 = undefined;
+    const key = [4]u8{ 8, 8, 8, 8 };
+    // 0xB is a reserved control opcode (fin=1, small payload) — must close with 1002.
+    const frame = buildMaskedFrame(&buf, true, @as(Opcode, @enumFromInt(0xB)), key, "hi");
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
+    var conn = makeConn(&sink);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var r = makeReasm(ar.allocator(), 1 << 20);
+    var start: usize = 0;
+    var end: usize = frame.len;
+    try std.testing.expectEqual(PumpResult.closed, pump(&buf, &start, &end, &conn, .{ .on_message = MsgCapture.onMsg }, &r));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xEA }, sink.sent.items); // 1002 = 0x03EA
+}
+
 test "ws: WsConn.send and close route through the vtable" {
     var sink = TestSink{ .gpa = std.testing.allocator };
     defer sink.sent.deinit(std.testing.allocator);
