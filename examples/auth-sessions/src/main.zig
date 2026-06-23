@@ -42,10 +42,16 @@ const Sessions = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         // Demo token: not cryptographically strong — a real app would use a CSPRNG.
+        // NOTE: map.count()-based derivation is also not collision-safe under concurrent
+        // logins (two goroutines at the same count produce identical tokens).  Use a
+        // CSPRNG (e.g. std.crypto.random.bytes) in any real application.
         var buf: [16]u8 = undefined;
         for (&buf, 0..) |*b, i| b.* = "0123456789abcdef"[(self.map.count() + i) % 16];
         const token = try self.gpa.dupe(u8, &buf);
-        try self.map.put(self.gpa, token, try self.gpa.dupe(u8, user));
+        errdefer self.gpa.free(token);
+        const user_copy = try self.gpa.dupe(u8, user);
+        errdefer self.gpa.free(user_copy);
+        try self.map.put(self.gpa, token, user_copy);
         return token;
     }
 
@@ -93,8 +99,8 @@ fn login(s: zax.State(*Sessions), a: zax.Alloc, body: zax.Json(Creds)) !zax.Resp
 }
 
 fn me(cookies: zax.Cookies, s: zax.State(*Sessions), a: zax.Alloc) !zax.Response {
-    const token = cookies.get("session").?; // guard guarantees presence
-    const user = (try s.value.userFor(a.value, token)).?;
+    const token = cookies.get("session") orelse return zax.Response.fromStatus(.unauthorized);
+    const user = (try s.value.userFor(a.value, token)) orelse return zax.Response.fromStatus(.unauthorized);
     const body = try std.fmt.allocPrint(a.value, "you are: {s}\n", .{user});
     return zax.Response.text(body);
 }
