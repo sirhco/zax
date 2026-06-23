@@ -1,6 +1,6 @@
 //! todo-api — a REST/CRUD JSON API on zax. Demonstrates mutable shared state
-//! (App(*Store) + a Mutex), the Json/Path/State extractors, JSON responses with
-//! real status codes, and observability (metrics + access log).
+//! (App(*Store) + an atomic spinlock), the Json/Path/State extractors, JSON
+//! responses with real status codes, and observability (metrics + access log).
 //!
 //!   zig build run    # serve on http://127.0.0.1:8082
 //!   zig build test   # unit-test the store + handlers
@@ -12,7 +12,7 @@ const Todo = struct { id: u32, title: []const u8, done: bool };
 const NewTodo = struct { title: []const u8 };
 const Patch = struct { title: ?[]const u8 = null, done: ?bool = null };
 
-/// In-memory store. Mutated by handlers on multiple threads → guarded by a Mutex.
+/// In-memory store. Mutated by handlers on multiple threads → guarded by an atomic spinlock.
 /// Methods copy results OUT into the caller's request arena under the lock, so the
 /// handler serializes JSON lock-free and immune to concurrent mutation.
 /// In Zig 0.16 `std.Thread.Mutex` was removed; `std.Io.Mutex.lock` requires an
@@ -56,6 +56,7 @@ const Store = struct {
         self.mu.lock();
         defer self.mu.unlock();
         const owned = try self.gpa.dupe(u8, title); // store-owned copy (request body is request-scoped)
+        errdefer self.gpa.free(owned);
         const t = Todo{ .id = self.next_id, .title = owned, .done = false };
         try self.items.append(self.gpa, t);
         self.next_id += 1;
@@ -148,8 +149,8 @@ pub fn main(init: std.process.Init) !void {
     // AccessLogger requires a *std.Io.Writer. Build a file writer for stderr
     // (std.Io.File.Writer wraps std.Io.Writer as its `interface` field) then
     // point AccessLogger at that interface.
-    var log_buf: [512]u8 = undefined;
-    var stderr_fw = std.Io.File.writer(std.Io.File.stderr(), init.io, &log_buf);
+    var log_buf: [256]u8 = undefined;
+    var stderr_fw: std.Io.File.Writer = .init(.stderr(), init.io, &log_buf);
     var access = zax.AccessLogger{ .writer = &stderr_fw.interface };
     try app.observe(access.observer());
     try app.observe(global_metrics.observer());

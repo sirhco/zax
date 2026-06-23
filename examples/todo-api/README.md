@@ -1,7 +1,7 @@
 # todo-api
 
 A REST/CRUD JSON API on [zax](../..). Demonstrates mutable shared state
-(`App(*Store)` guarded by a `std.Thread.Mutex`), the `Json` / `Path` / `State`
+(`App(*Store)` guarded by an atomic spinlock), the `Json` / `Path` / `State`
 extractors, JSON responses with real status codes (201/204/404), and
 observability (an access log + Prometheus `/metrics`).
 
@@ -25,6 +25,6 @@ curl -s localhost:8082/metrics
 
 ## How it works
 
-The `Store` holds the data behind a mutex; each method copies its result into the
+The `Store` holds the data behind an atomic spinlock; each method copies its result into the
 request arena under the lock, so handlers serialize JSON without holding the lock and
 are immune to concurrent mutation. State reaches handlers via `zax.State(*Store)`.
