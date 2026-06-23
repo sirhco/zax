@@ -3599,7 +3599,15 @@ test "end-to-end: websocket upgrade, handshake, and echo" {
     const close_frame = [_]u8{ 0x88, 0x80, 0x00, 0x00, 0x00, 0x00 };
     cw.interface.writeAll(&close_frame) catch unreachable;
     cw.interface.flush() catch unreachable;
-    // After close, the server closes -> the client read sees EOF (fillMore errors).
+    // The server replies with an (empty) close frame before closing.
+    var triesC: usize = 0;
+    while (cr.interface.buffered().len < 2) : (triesC += 1) {
+        if (triesC > 1000) return error.TestTimeout;
+        cr.interface.fillMore() catch break;
+    }
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x00 }, cr.interface.buffered()[0..2]);
+    cr.interface.toss(2);
+    // Then the server closes -> EOF.
     const eof = blk: {
         cr.interface.fillMore() catch break :blk true;
         break :blk cr.interface.buffered().len == 0;
