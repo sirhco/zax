@@ -3695,6 +3695,13 @@ test "end-to-end: websocket fragmentation, ping, and close (threaded)" {
     }
     // server echoes a close frame (0x88) with the same code, then closes.
     try testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xE8 }, cr.interface.buffered()[0..4]);
+    cr.interface.toss(4);
+    // After the close-reply, the server closes -> EOF.
+    const eof = blk: {
+        cr.interface.fillMore() catch break :blk true;
+        break :blk cr.interface.buffered().len == 0;
+    };
+    try testing.expect(eof);
 
     app.requestShutdown(io);
     loop_fut.await(io);
@@ -3956,6 +3963,14 @@ test "end-to-end (evented): websocket fragmentation, ping, and close" {
     }
     // server echoes a close frame (0x88) with the same code, then closes.
     try testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xE8 }, close_buf[0..4]);
+
+    // After the close-reply, the server closes the connection -> EOF (read returns 0).
+    var eof_buf: [1]u8 = undefined;
+    const eof_n: isize = if (builtin.os.tag == .linux)
+        @bitCast(std.os.linux.read(@intCast(cfd), eof_buf[0..].ptr, 1))
+    else
+        std.c.read(cfd, eof_buf[0..].ptr, 1);
+    if (eof_n > 0) return error.TestUnexpectedResult; // server kept socket open
 
     // 6. Shutdown.
     var shutdown_threaded = Io.Threaded.init(testing.allocator, .{});
