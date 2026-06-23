@@ -14,7 +14,14 @@
 - Each example mirrors `examples/hello-service/`: `build.zig.zon` (path-dep `.zax = .{ .path = "../.." }`), `build.zig` (consumer wiring with `run` + `test` steps), `src/main.zig`, `README.md`.
 - **`build.zig.zon` fingerprint:** each new package needs a unique `.fingerprint`. Create the `.zon` WITHOUT a `.fingerprint` line, run `zig build` once — Zig errors with `recommended: .fingerprint = 0x...` — paste that exact value in. (Do NOT copy hello-service's fingerprint; it must be unique.)
 - **Entry point:** `pub fn main(init: std.process.Init) !void` (zax's "Juicy Main"); use `init.gpa` + `init.io`. Serve with `try app.serve(init.io, .{ .ip4 = .loopback(PORT) })` (or `app.serveEvented`).
-- **Mutable shared state:** `todo-api` and `auth-sessions` use `App(*Store)` with a `std.Thread.Mutex` inside the store; store methods copy data OUT into the request arena under the lock so the handler serializes lock-free, immune to concurrent mutation.
+- **Mutable shared state:** `todo-api`/`auth-sessions`/`websocket-live` use `App(*Store)` with an in-struct lock; methods copy data OUT into the request arena under the lock so handlers serialize lock-free, immune to concurrent mutation. **Zig 0.16 REMOVED `std.Thread.Mutex`** (replacement `std.Io.Mutex` needs an `Io` param) — use a tiny atomic **spinlock**, the exact pattern `src/observe.zig` uses; each such example defines and uses it (NOT `std.Thread.Mutex`):
+  ```zig
+  const Spinlock = struct {
+      locked: std.atomic.Value(bool) = .init(false),
+      fn lock(self: *Spinlock) void { while (self.locked.swap(true, .acquire)) std.atomic.spinLoopHint(); }
+      fn unlock(self: *Spinlock) void { self.locked.store(false, .release); }
+  };
+  ```
 - **Verification per example:** `cd examples/<name> && zig build` (compile gate) and `zig build test` (handler unit tests). These are separate build graphs — they do NOT run the library suite and have no shared-port concerns.
 - Each example's `.zig-cache/` and `zig-out/` are git-ignored (root `.gitignore`).
 - **Assets:** `assets/zax-icon-velocity-dark.svg`, `assets/zax-icon-velocity-light.svg`, `assets/zax-wordmark.svg` exist.
