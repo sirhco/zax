@@ -165,21 +165,116 @@ pub const WsConn = struct {
 
 pub const PumpResult = enum { need_more, closed };
 
-/// Parse complete client frames from `buf[start..end]`, calling
-/// `handler.on_message(conn, frame)` per data frame and advancing `start`.
-/// Returns `.closed` on a close frame or any parse error; otherwise `.need_more`
-/// with leftover bytes compacted to the front (start=0, end=leftover.len).
-/// Unmask is in place: each `frame.payload` borrows `buf` only until the next
-/// iteration. Ping/pong are delivered to `on_message` (no auto-pong this slice).
-pub fn pump(buf: []u8, start: *usize, end: *usize, conn: *WsConn, handler: Handler) PumpResult {
+/// Per-connection reassembly state + control-frame policy. Owned by each backend
+/// (one per upgraded connection). The single-frame message path never touches the
+/// accumulator (zero-copy); only fragmented messages allocate `msg_buf` (lazily,
+/// once, sized to `max_message_size`, reused).
+pub const Reassembler = struct {
+    arena: std.mem.Allocator,
+    max_message_size: usize,
+    msg_buf: ?[]u8 = null,
+    msg_len: usize = 0,
+    msg_opcode: Opcode = .text,
+    fragmenting: bool = false,
+};
+
+/// Send a framework-initiated close with a 2-byte big-endian status code.
+fn sendCloseCode(conn: *WsConn, code: u16) void {
+    var payload: [2]u8 = undefined;
+    std.mem.writeInt(u16, &payload, code, .big);
+    conn.send(.close, &payload) catch {};
+}
+
+/// Reply to a peer close: echo their close payload (which carries their code) when
+/// present, else send an empty close. Best-effort.
+fn sendClose(conn: *WsConn, payload: []const u8) void {
+    conn.send(.close, if (payload.len >= 2) payload else "") catch {};
+}
+
+/// Append `payload` to the reassembly buffer; false if it would exceed the cap or
+/// the buffer cannot be allocated.
+fn appendFragment(r: *Reassembler, payload: []const u8) bool {
+    if (r.msg_len + payload.len > r.max_message_size) return false;
+    if (r.msg_buf == null) {
+        r.msg_buf = r.arena.alloc(u8, r.max_message_size) catch return false;
+    }
+    @memcpy(r.msg_buf.?[r.msg_len..][0..payload.len], payload);
+    r.msg_len += payload.len;
+    return true;
+}
+
+/// Parse complete client frames from `buf[start..end]`, joining continuation frames
+/// into whole messages (delivered to `on_message` with `fin = true`), auto-responding
+/// to control frames (ping→pong, close→close-reply), and enforcing `r.max_message_size`.
+/// Returns `.closed` on a close frame, protocol error, or over-cap (after sending the
+/// appropriate close frame); else `.need_more` with leftover compacted to the front.
+/// Single-frame `fin = 1` messages are delivered zero-copy (payload borrows `buf`).
+pub fn pump(buf: []u8, start: *usize, end: *usize, conn: *WsConn, handler: Handler, r: *Reassembler) PumpResult {
     while (start.* < end.*) {
         const parsed = parseFrame(buf[start.*..end.*]) catch |e| switch (e) {
             error.Incomplete => break, // need more bytes
-            else => return .closed, // protocol error -> end
+            else => {
+                sendCloseCode(conn, 1002); // protocol error
+                return .closed;
+            },
         };
         start.* += parsed.consumed;
-        if (parsed.frame.opcode == .close) return .closed;
-        handler.on_message(conn, parsed.frame);
+        const f = parsed.frame;
+
+        if (f.opcode.isControl()) {
+            switch (f.opcode) {
+                .ping => conn.send(.pong, f.payload) catch {},
+                .pong => {}, // ignore
+                .close => {
+                    sendClose(conn, f.payload);
+                    return .closed;
+                },
+                else => { // unknown control opcode (0xB–0xF) — fail the connection
+                    sendCloseCode(conn, 1002);
+                    return .closed;
+                },
+            }
+            continue;
+        }
+
+        switch (f.opcode) {
+            .continuation => {
+                if (!r.fragmenting) {
+                    sendCloseCode(conn, 1002); // continuation with no message in progress
+                    return .closed;
+                }
+                if (!appendFragment(r, f.payload)) {
+                    sendCloseCode(conn, 1009); // message too big
+                    return .closed;
+                }
+                if (f.fin) {
+                    handler.on_message(conn, .{ .fin = true, .opcode = r.msg_opcode, .payload = r.msg_buf.?[0..r.msg_len] });
+                    r.fragmenting = false;
+                    r.msg_len = 0;
+                }
+            },
+            .text, .binary => {
+                if (r.fragmenting) {
+                    sendCloseCode(conn, 1002); // new data frame mid-message
+                    return .closed;
+                }
+                if (f.fin) {
+                    handler.on_message(conn, f); // single-frame message: zero-copy
+                } else {
+                    r.msg_opcode = f.opcode;
+                    r.msg_len = 0;
+                    r.fragmenting = true;
+                    if (!appendFragment(r, f.payload)) {
+                        sendCloseCode(conn, 1009);
+                        return .closed;
+                    }
+                }
+            },
+            else => { // unknown data opcode (0x3–0x7)
+                sendCloseCode(conn, 1002);
+                return .closed;
+            },
+        }
     }
     // Compact leftover to the front so the caller can append more bytes.
     const leftover = end.* - start.*;
@@ -360,16 +455,15 @@ test "ws: build → parseFrame → writeFrame round-trips the payload" {
     try std.testing.expectEqualStrings(original, server_bytes[2..]);
 }
 
+// Test sink: records every frame sent through the WsConn vtable, as raw bytes.
 const TestSink = struct {
     sent: std.ArrayListUnmanaged(u8) = .empty,
     closed: bool = false,
     gpa: std.mem.Allocator,
-
-    const vtable = WsConn.VTable{ .send = sendFn, .close = closeFn };
-
+    const vt = WsConn.VTable{ .send = sendFn, .close = closeFn };
     fn sendFn(ctx: *anyopaque, opcode: Opcode, payload: []const u8) SendError!void {
         const self: *TestSink = @ptrCast(@alignCast(ctx));
-        var scratch: [256]u8 = undefined;
+        var scratch: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&scratch);
         writeFrame(&w, opcode, payload) catch return error.WriteFailed;
         self.sent.appendSlice(self.gpa, w.buffered()) catch return error.WriteFailed;
@@ -380,82 +474,194 @@ const TestSink = struct {
     }
 };
 
-test "ws: pump dispatches one masked text frame to on_message" {
-    const Capture = struct {
-        var last: []const u8 = "";
-        var count: usize = 0;
-        fn onMsg(conn: *WsConn, f: Frame) void {
-            _ = conn;
-            last = f.payload;
-            count += 1;
-        }
-    };
-    Capture.count = 0;
+// Capture for on_message: records the last delivered message + a count.
+const MsgCapture = struct {
+    var last: [256]u8 = undefined;
+    var last_len: usize = 0;
+    var last_opcode: Opcode = .text;
+    var count: usize = 0;
+    fn reset() void {
+        count = 0;
+        last_len = 0;
+    }
+    fn onMsg(conn: *WsConn, f: Frame) void {
+        _ = conn;
+        @memcpy(last[0..f.payload.len], f.payload);
+        last_len = f.payload.len;
+        last_opcode = f.opcode;
+        count += 1;
+    }
+};
+
+fn makeConn(sink: *TestSink) WsConn {
+    return .{ .ctx = sink, .vtable = &TestSink.vt, .state_ptr = @ptrCast(sink), .arena = std.testing.allocator };
+}
+
+fn makeReasm(arena: std.mem.Allocator, cap: usize) Reassembler {
+    return .{ .arena = arena, .max_message_size = cap };
+}
+
+test "ws: pump delivers a single-frame text message (zero-copy)" {
+    MsgCapture.reset();
     var buf: [64]u8 = undefined;
     const key = [4]u8{ 1, 2, 3, 4 };
     const frame = buildMaskedFrame(&buf, true, .text, key, "hello");
     var sink = TestSink{ .gpa = std.testing.allocator };
     defer sink.sent.deinit(std.testing.allocator);
-    var dummy_state: u8 = 0;
-    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vtable,
-        .state_ptr = @ptrCast(&dummy_state), .arena = std.testing.allocator };
+    var conn = makeConn(&sink);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var r = makeReasm(ar.allocator(), 1 << 20);
     var start: usize = 0;
     var end: usize = frame.len;
-    const r = pump(&buf, &start, &end, &conn, .{ .on_message = Capture.onMsg });
-    try std.testing.expectEqual(PumpResult.need_more, r);
-    try std.testing.expectEqual(@as(usize, 1), Capture.count);
-    try std.testing.expectEqualStrings("hello", Capture.last);
-    try std.testing.expectEqual(@as(usize, 0), end); // fully consumed
+    try std.testing.expectEqual(PumpResult.need_more, pump(&buf, &start, &end, &conn, .{ .on_message = MsgCapture.onMsg }, &r));
+    try std.testing.expectEqual(@as(usize, 1), MsgCapture.count);
+    try std.testing.expectEqualStrings("hello", MsgCapture.last[0..MsgCapture.last_len]);
+    try std.testing.expectEqual(@as(?[]u8, null), r.msg_buf); // accumulator never allocated
 }
 
-test "ws: pump returns closed on a close frame and stops" {
-    const Capture = struct {
-        var count: usize = 0;
-        fn onMsg(conn: *WsConn, f: Frame) void { _ = conn; _ = f; count += 1; }
-    };
-    Capture.count = 0;
+test "ws: pump reassembles a two-frame fragmented message" {
+    MsgCapture.reset();
     var buf: [128]u8 = undefined;
     const key = [4]u8{ 9, 9, 9, 9 };
-    const f1len = buildMaskedFrame(buf[0..], true, .text, key, "aa").len;
-    const closelen = buildMaskedFrame(buf[f1len..], true, .close, key, "").len;
+    const f1 = buildMaskedFrame(buf[0..], false, .text, key, "Hel"); // fin=0 text
+    const f2len = buildMaskedFrame(buf[f1.len..], true, .continuation, key, "lo").len; // fin=1 continuation
     var sink = TestSink{ .gpa = std.testing.allocator };
     defer sink.sent.deinit(std.testing.allocator);
-    var st: u8 = 0;
-    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vtable, .state_ptr = @ptrCast(&st), .arena = std.testing.allocator };
+    var conn = makeConn(&sink);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var r = makeReasm(ar.allocator(), 1 << 20);
     var start: usize = 0;
-    var end: usize = f1len + closelen;
-    const r = pump(&buf, &start, &end, &conn, .{ .on_message = Capture.onMsg });
-    try std.testing.expectEqual(PumpResult.closed, r);
-    try std.testing.expectEqual(@as(usize, 1), Capture.count); // "aa" delivered, close stops
+    var end: usize = f1.len + f2len;
+    try std.testing.expectEqual(PumpResult.need_more, pump(&buf, &start, &end, &conn, .{ .on_message = MsgCapture.onMsg }, &r));
+    try std.testing.expectEqual(@as(usize, 1), MsgCapture.count);
+    try std.testing.expectEqualStrings("Hello", MsgCapture.last[0..MsgCapture.last_len]);
+    try std.testing.expectEqual(Opcode.text, MsgCapture.last_opcode);
 }
 
-test "ws: pump returns need_more and preserves a partial frame" {
-    const Capture = struct {
-        var count: usize = 0;
-        fn onMsg(conn: *WsConn, f: Frame) void { _ = conn; _ = f; count += 1; }
-    };
-    Capture.count = 0;
-    var buf: [64]u8 = undefined;
-    const key = [4]u8{ 1, 1, 1, 1 };
-    const frame = buildMaskedFrame(&buf, true, .text, key, "hello world");
+test "ws: pump auto-ponds a ping and still reassembles" {
+    MsgCapture.reset();
+    var buf: [128]u8 = undefined;
+    const key = [4]u8{ 2, 2, 2, 2 };
+    // text fin=0 "ab", ping "pq", continuation fin=1 "cd"
+    const a = buildMaskedFrame(buf[0..], false, .text, key, "ab");
+    const b = buildMaskedFrame(buf[a.len..], true, .ping, key, "pq");
+    const c = buildMaskedFrame(buf[a.len + b.len ..], true, .continuation, key, "cd");
     var sink = TestSink{ .gpa = std.testing.allocator };
     defer sink.sent.deinit(std.testing.allocator);
-    var st: u8 = 0;
-    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vtable, .state_ptr = @ptrCast(&st), .arena = std.testing.allocator };
+    var conn = makeConn(&sink);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var r = makeReasm(ar.allocator(), 1 << 20);
     var start: usize = 0;
-    var end: usize = frame.len - 3; // 3 payload bytes short
-    const r = pump(&buf, &start, &end, &conn, .{ .on_message = Capture.onMsg });
-    try std.testing.expectEqual(PumpResult.need_more, r);
-    try std.testing.expectEqual(@as(usize, 0), Capture.count);
-    try std.testing.expectEqual(@as(usize, frame.len - 3), end); // leftover preserved at front
-    try std.testing.expectEqual(@as(usize, 0), start);
+    var end: usize = a.len + b.len + c.len;
+    _ = pump(&buf, &start, &end, &conn, .{ .on_message = MsgCapture.onMsg }, &r);
+    try std.testing.expectEqual(@as(usize, 1), MsgCapture.count);
+    try std.testing.expectEqualStrings("abcd", MsgCapture.last[0..MsgCapture.last_len]);
+    // A pong (0x8A) with payload "pq" was sent.
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x8A, 0x02, 'p', 'q' }, sink.sent.items);
+}
+
+test "ws: pump drops a pong and delivers nothing" {
+    MsgCapture.reset();
+    var buf: [32]u8 = undefined;
+    const key = [4]u8{ 3, 3, 3, 3 };
+    const frame = buildMaskedFrame(&buf, true, .pong, key, "x");
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
+    var conn = makeConn(&sink);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var r = makeReasm(ar.allocator(), 1 << 20);
+    var start: usize = 0;
+    var end: usize = frame.len;
+    try std.testing.expectEqual(PumpResult.need_more, pump(&buf, &start, &end, &conn, .{ .on_message = MsgCapture.onMsg }, &r));
+    try std.testing.expectEqual(@as(usize, 0), MsgCapture.count);
+    try std.testing.expectEqual(@as(usize, 0), sink.sent.items.len);
+}
+
+test "ws: pump replies to a close and returns closed" {
+    MsgCapture.reset();
+    var buf: [32]u8 = undefined;
+    const key = [4]u8{ 4, 4, 4, 4 };
+    // close with a 2-byte code 1000 (0x03E8)
+    const frame = buildMaskedFrame(&buf, true, .close, key, &[_]u8{ 0x03, 0xE8 });
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
+    var conn = makeConn(&sink);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var r = makeReasm(ar.allocator(), 1 << 20);
+    var start: usize = 0;
+    var end: usize = frame.len;
+    try std.testing.expectEqual(PumpResult.closed, pump(&buf, &start, &end, &conn, .{ .on_message = MsgCapture.onMsg }, &r));
+    try std.testing.expectEqual(@as(usize, 0), MsgCapture.count);
+    // A close (0x88) echoing the 2-byte code was sent.
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xE8 }, sink.sent.items);
+}
+
+test "ws: pump closes with 1009 when reassembly exceeds the cap" {
+    MsgCapture.reset();
+    var buf: [128]u8 = undefined;
+    const key = [4]u8{ 5, 5, 5, 5 };
+    // cap = 4; "Hel" (3) then continuation "loo" (3) -> 6 > 4 -> 1009
+    const f1 = buildMaskedFrame(buf[0..], false, .text, key, "Hel");
+    const f2len = buildMaskedFrame(buf[f1.len..], true, .continuation, key, "loo").len;
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
+    var conn = makeConn(&sink);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var r = makeReasm(ar.allocator(), 4);
+    var start: usize = 0;
+    var end: usize = f1.len + f2len;
+    try std.testing.expectEqual(PumpResult.closed, pump(&buf, &start, &end, &conn, .{ .on_message = MsgCapture.onMsg }, &r));
+    try std.testing.expectEqual(@as(usize, 0), MsgCapture.count);
+    // A close (0x88) with code 1009 (0x03F1) was sent.
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xF1 }, sink.sent.items);
+}
+
+test "ws: pump rejects an orphan continuation with 1002" {
+    MsgCapture.reset();
+    var buf: [32]u8 = undefined;
+    const key = [4]u8{ 6, 6, 6, 6 };
+    const frame = buildMaskedFrame(&buf, true, .continuation, key, "x"); // no message in progress
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
+    var conn = makeConn(&sink);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var r = makeReasm(ar.allocator(), 1 << 20);
+    var start: usize = 0;
+    var end: usize = frame.len;
+    try std.testing.expectEqual(PumpResult.closed, pump(&buf, &start, &end, &conn, .{ .on_message = MsgCapture.onMsg }, &r));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xEA }, sink.sent.items); // 1002 = 0x03EA
+}
+
+test "ws: pump rejects a new data frame mid-fragment with 1002" {
+    MsgCapture.reset();
+    var buf: [64]u8 = undefined;
+    const key = [4]u8{ 7, 7, 7, 7 };
+    const f1 = buildMaskedFrame(buf[0..], false, .text, key, "ab"); // fin=0
+    const f2len = buildMaskedFrame(buf[f1.len..], true, .text, key, "cd").len; // new data frame, not continuation
+    var sink = TestSink{ .gpa = std.testing.allocator };
+    defer sink.sent.deinit(std.testing.allocator);
+    var conn = makeConn(&sink);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var r = makeReasm(ar.allocator(), 1 << 20);
+    var start: usize = 0;
+    var end: usize = f1.len + f2len;
+    try std.testing.expectEqual(PumpResult.closed, pump(&buf, &start, &end, &conn, .{ .on_message = MsgCapture.onMsg }, &r));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x02, 0x03, 0xEA }, sink.sent.items); // 1002
 }
 
 test "ws: WsConn.send and close route through the vtable" {
     var sink = TestSink{ .gpa = std.testing.allocator };
     defer sink.sent.deinit(std.testing.allocator);
     var st: u8 = 0;
-    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vtable, .state_ptr = @ptrCast(&st), .arena = std.testing.allocator };
+    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vt, .state_ptr = @ptrCast(&st), .arena = std.testing.allocator };
     try conn.send(.text, "Hi");
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x02, 'H', 'i' }, sink.sent.items);
     conn.close();
@@ -467,6 +673,6 @@ test "ws: WsConn.state returns the app-state pointer" {
     var db = Db{ .n = 7 };
     var sink = TestSink{ .gpa = std.testing.allocator };
     defer sink.sent.deinit(std.testing.allocator);
-    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vtable, .state_ptr = @ptrCast(&db), .arena = std.testing.allocator };
+    var conn = WsConn{ .ctx = &sink, .vtable = &TestSink.vt, .state_ptr = @ptrCast(&db), .arena = std.testing.allocator };
     try std.testing.expectEqual(@as(*Db, &db), conn.state(*Db));
 }
