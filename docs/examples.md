@@ -28,8 +28,7 @@ Key file: [`src/main.zig`](../examples/hello-service/src/main.zig).
 ## [todo-api](../examples/todo-api)
 
 A REST/CRUD JSON API. Shows **mutable shared state** done safely: `App(*Store)` with an
-atomic spinlock (`std.Thread.Mutex` was removed in Zig 0.16; the spinlock replicates the
-same `std.atomic.Value(bool)` + `cmpxchgWeak` pattern used inside the zax library).
+atomic spinlock (`std.atomic.Value(bool)` + `cmpxchgWeak`; `std.Thread.Mutex` was removed in Zig 0.16).
 Store methods copy results into the request arena under the lock so handlers serialize
 JSON lock-free and immune to concurrent mutation.
 
@@ -51,8 +50,7 @@ A `Chain` middleware (`requireAuth`) reads the `Cookies` extractor and short-cir
 with `401` when the session is missing or invalid; it is attached per-route with
 `app.getWith("/me", .{&requireAuth}, me)`.
 
-Sessions are stored in a `StringHashMap` behind the same atomic spinlock pattern as
-`todo-api` — `std.Thread.Mutex` was removed in Zig 0.16.
+Sessions are stored in a `StringHashMap` behind the same atomic spinlock pattern as `todo-api`.
 
 ```
 cd examples/auth-sessions && zig build run   # http://127.0.0.1:8083

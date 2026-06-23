@@ -26,7 +26,7 @@ that depends on this repo, so `cd examples/<name> && zig build run` just works. 
 | Example | Demonstrates |
 | --- | --- |
 | [`hello-service`](examples/hello-service) | Minimal app: `State`, `Path`, `Query`, `Json`, middleware |
-| [`todo-api`](examples/todo-api) | REST/CRUD JSON API, mutable `State` + `Mutex`, metrics + access log |
+| [`todo-api`](examples/todo-api) | REST/CRUD JSON API, mutable `State` + atomic spinlock, metrics + access log |
 | [`auth-sessions`](examples/auth-sessions) | Cookie sessions + a guard middleware (401 on missing/invalid) |
 | [`file-upload`](examples/file-upload) | `multipart/form-data` uploads + static file serving |
 | [`websocket-live`](examples/websocket-live) | WebSocket echo on both `serve` and `serveEvented` |
