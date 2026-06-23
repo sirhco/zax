@@ -319,6 +319,41 @@ try app.use(zax.compress(App.Context, .{}));
 On success, `Content-Encoding: gzip` and `Vary: Accept-Encoding` are added to
 the response.  gzip is the only supported encoding.
 
+### Built-in: rate limiting
+
+`zax.rateLimit(comptime Ctx: type, comptime config: zax.RateLimit)` returns a
+global middleware that enforces a token-bucket rate limit per client.  Register
+it with `app.use`:
+
+```zig
+const App = zax.App(*const Db);
+
+var app = try App.init(init.gpa, &db, .{});
+try app.use(zax.rateLimit(App.Context, .{ .capacity = 60, .refill_per_sec = 1.0 }));
+```
+
+**`zax.RateLimit` config fields** (all comptime, all have defaults):
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `capacity` | `u32` | `60` | Bucket ceiling and burst limit; reported as `x-ratelimit-limit` |
+| `refill_per_sec` | `f64` | `1.0` | Sustained refill rate in tokens per second |
+| `max_keys` | `usize` | `1024` | Static slot-table size; when full, the lowest-tokens key is evicted |
+| `key_max_len` | `usize` | `64` | Keys longer than this are truncated (64 covers IPv6) |
+| `header` | `[]const u8` | `"x-forwarded-for"` | Primary header for client IP; first comma-separated hop is used |
+| `fallback_header` | `[]const u8` | `"x-real-ip"` | Fallback header when `header` is absent |
+| `on_missing` | `enum { shared, bypass }` | `.shared` | When no key is derivable: `.shared` = one coarse shared bucket; `.bypass` = no limiting |
+
+**Behavior:**
+
+- **Token bucket:** each client starts with `capacity` tokens (the burst ceiling).  One token is consumed per request.  Tokens refill at `refill_per_sec` per second up to `capacity`.
+- **Response headers on every allowed request:** `x-ratelimit-limit` (capacity), `x-ratelimit-remaining` (tokens left after this request), `x-ratelimit-reset` (seconds until the bucket refills to capacity).
+- **Throttled requests** return `429 Too Many Requests` with those three headers plus `retry-after` (seconds to wait).
+- **Key derivation** uses `header` (first hop before the first comma, whitespace-trimmed) then `fallback_header`, but **only when `ctx.trust_forwarded` is `true`**.  When forwarded headers are not trusted, or when neither header yields a usable value, `on_missing` governs: `.shared` applies a single shared bucket to all such requests; `.bypass` passes them through without limiting.
+- **Static storage:** the slot table (`max_keys` entries) is baked into the comptime type — zero heap allocation.  Access is guarded by an atomic spinlock.  When the table is full the slot with the fewest tokens is evicted to make room.
+- **Key truncation:** keys longer than `key_max_len` are silently truncated before lookup.  The default of 64 bytes is sufficient for any IPv6 address.
+- **Comptime memoization caveat:** two `rateLimit` calls with identical `(Ctx, config)` arguments may share one static store.  To guarantee independent buckets per mount point (e.g., different limits for `/api` vs `/admin`), use distinct `config` values.
+
 ## Observability
 
 `app.observe(obs)` registers an `zax.Observer` that fires after every routed
