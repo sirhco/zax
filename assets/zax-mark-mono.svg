@@ -1,0 +1,7 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Zax mark">
+  <g transform="skewX(-9)" transform-origin="128 128">
+    <path d="M74 82 H182 L74 174 H182"
+          fill="none" stroke="currentColor" stroke-width="34"
+          stroke-linejoin="miter" stroke-linecap="butt" stroke-miterlimit="8"/>
+  </g>
+</svg>

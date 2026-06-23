@@ -1,0 +1,21 @@
+<svg width="400" height="200" viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Zax wordmark">
+  <defs>
+    <linearGradient id="zaxWord" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FBB13C"/>
+      <stop offset="0.55" stop-color="#F7A41D"/>
+      <stop offset="1" stop-color="#E8590C"/>
+    </linearGradient>
+  </defs>
+  <g transform="skewX(-9)" transform-origin="200 100"
+     fill="none" stroke="url(#zaxWord)" stroke-width="24"
+     stroke-linejoin="miter" stroke-linecap="butt" stroke-miterlimit="8">
+    <!-- Z -->
+    <path d="M48 50 H136 L48 150 H136"/>
+    <!-- A -->
+    <path d="M158 150 L204 50 L250 150"/>
+    <path d="M176 116 H232"/>
+    <!-- X -->
+    <path d="M276 50 L362 150"/>
+    <path d="M362 50 L276 150"/>
+  </g>
+</svg>
