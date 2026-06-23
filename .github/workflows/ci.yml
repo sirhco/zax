@@ -29,3 +29,9 @@ jobs:
         with:
           version: 0.16.0
       - run: zig build bench-build
+      - name: Build examples
+        run: |
+          for d in examples/*/; do
+            echo "== building $d =="
+            (cd "$d" && zig build)
+          done
