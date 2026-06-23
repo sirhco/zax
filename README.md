@@ -728,12 +728,14 @@ fn handler(ws: zax.WebSocket) zax.Response {
 ```
 
 The server performs the RFC 6455 handshake, then calls your `on_message` once per
-client frame (`conn.send(opcode, payload)` writes a frame back; `conn.state(T)`
-reaches app state; `conn.close()` ends the connection). One frame per callback (no
-reassembly yet); a close frame, EOF, or protocol error ends the connection (firing
-`on_close`). Non-upgrade requests to a WebSocket route get `426 Upgrade Required`.
-Still to come: fragmentation reassembly, automatic ping/pong and the RFC close
-handshake, configurable frame-size caps, and cross-connection broadcast.
+**whole message** — continuation frames are reassembled for you, so `msg.payload` is
+the complete message (`msg.opcode` is `.text` or `.binary`). The framework handles
+control frames itself: it replies to pings with pongs and performs the close
+handshake; those never reach `on_message`. Reassembled messages are bounded by
+`ws_max_message_size` (default 1 MiB); a larger message is rejected with a `1009`
+close. `conn.send(opcode, payload)` writes a message back; `conn.state(T)` reaches
+app state; `conn.close()` ends the connection. WebSocket is feature-complete for the
+core protocol; cross-connection broadcast is a future addition.
 
 ## Status & limitations
 

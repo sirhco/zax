@@ -301,5 +301,8 @@ fn handler(ws: zax.WebSocket) zax.Response {
 // try app.get("/echo", handler);  -> works under app.serve and app.serveEvented
 ```
 
+`on_message` receives complete messages — fragmentation is reassembled for you, and
+pings/pongs and the close handshake are handled automatically.
+
 The server handshakes, then calls `echo` once per client frame. A close frame or
 disconnect ends the connection.

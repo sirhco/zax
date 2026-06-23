@@ -6,12 +6,9 @@ All notable changes to zax are documented here. The format is based on
 
 ## [Unreleased]
 
-### Changed
-
-- **WebSocket handler API unified (breaking).** The blocking `while (conn.read())` loop is replaced by a callback handler: `onUpgrade(.{ .on_message = fn, .on_open = ?fn, .on_close = ?fn })`. `WsConn.read()` is removed; `WsConn` now exposes `send`/`close`/`state`. The same handler runs on both `app.serve` and `app.serveEvented`. (Pre-1.0 API change.)
-
 ### Added
 
+- **WebSocket fragmentation, control frames, and message cap** — `on_message` now receives whole reassembled messages (continuation frames joined). The framework auto-replies to pings with pongs and performs the RFC 6455 close handshake (no longer raw TCP close). Reassembled messages are bounded by the new `ws_max_message_size` option (default 1 MiB); over-cap → `1009` close, protocol violations → `1002` close. Single-frame messages stay zero-copy. Both backends. WebSocket core protocol is now feature-complete.
 - **Evented WebSocket support** — WebSocket handlers now run on the evented (reactor) backend (`app.serveEvented`) as well as the threaded backend, with the same handler. The reactor performs the handshake non-blocking and drives the handler per readable event; `conn.send` is non-blocking with bounded outbound buffering (drained on writable; closes on overflow).
 - **WebSocket threaded upgrade + handler API** (`zax.WebSocket` extractor, `zax.WsConn`) — second WebSocket slice. A handler takes the `WebSocket` extractor and calls `onUpgrade(cb)`; the server validates the RFC 6455 handshake, sends `101 Switching Protocols` with the computed `Sec-WebSocket-Accept`, and runs a per-connection handler that receives client frames and can send frames back. `conn.send(opcode, payload)` writes one server frame; `conn.state(T)` reaches app state. Non-upgrade requests to a WebSocket route get `426 Upgrade Required`. Single-threaded per connection. Evented support, fragmentation reassembly, automatic ping/pong, the RFC close handshake, and configurable size caps follow in later releases.
 - **WebSocket protocol primitives** (`zax.ws`) — first WebSocket slice: a pure RFC 6455 codec with no server integration yet. `acceptKey` computes the `Sec-WebSocket-Accept` handshake value; `parseFrame` decodes and unmasks one masked client frame in place (zero-copy payload slice), validating control-frame structure and reporting `Incomplete` for partial buffers; `writeFrame` serializes one unmasked server frame with the minimal 7/16/64-bit length form. Connection upgrade, takeover, fragmentation reassembly, and control-frame semantics follow in later releases.
@@ -20,6 +17,11 @@ All notable changes to zax are documented here. The format is based on
 - `Headers` extractor — zero-copy, case-insensitive access to every request header via `.get(name)`, `.has(name)`, `.getAll(arena, name)` (all values, arena-allocated slice), `.all()`, and `.count()`.
 - `Multipart` extractor — parse `multipart/form-data` request bodies (file uploads) into a zero-copy list of parts (`mp.field` / `mp.file` / `mp.parts`); bounded by `max_body_size` and a 1024-part cap (malformed → 400, too many parts → 413).
 - `SetCookie` / `Response.withCookie` / `Response.expireCookie` — build and append `Set-Cookie` response headers (RFC 6265); supports `Max-Age`, `Domain`, `Path`, `Secure`, `HttpOnly`, and `SameSite` (`Strict`/`Lax`/`None`); name and value validated at serialize time (invalid name → `error.InvalidCookieName`, invalid value → `error.InvalidCookieValue`); value emitted raw (symmetric with the `Cookies` read extractor).
+
+### Changed
+
+- **WebSocket `on_message` now delivers whole messages, not raw frames.** Continuation/ping/pong/close frames no longer reach `on_message` (the framework reassembles messages and handles control frames). Handlers that echo `(msg.opcode, msg.payload)` are unaffected.
+- **WebSocket handler API unified (breaking).** The blocking `while (conn.read())` loop is replaced by a callback handler: `onUpgrade(.{ .on_message = fn, .on_open = ?fn, .on_close = ?fn })`. `WsConn.read()` is removed; `WsConn` now exposes `send`/`close`/`state`. The same handler runs on both `app.serve` and `app.serveEvented`. (Pre-1.0 API change.)
 
 ## [0.8.2] - 2026-06-21
 
