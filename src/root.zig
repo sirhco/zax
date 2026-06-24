@@ -78,6 +78,7 @@ pub const Compress = @import("compress.zig").Compress;
 pub const compress = @import("compress.zig").compress;
 pub const RateLimit = @import("ratelimit.zig").RateLimit;
 pub const rateLimit = @import("ratelimit.zig").rateLimit;
+pub const Etag = @import("etag.zig").Etag;
 
 // --- WebSocket (Phase 5) ---
 pub const ws = @import("ws.zig");
