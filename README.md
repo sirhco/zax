@@ -354,6 +354,52 @@ try app.use(zax.rateLimit(App.Context, .{ .capacity = 60, .refill_per_sec = 1.0 
 - **Key truncation:** keys longer than `key_max_len` are silently truncated before lookup.  The default of 64 bytes is sufficient for any IPv6 address.
 - **Comptime memoization caveat:** two `rateLimit` calls with identical `(Ctx, config)` arguments may share one static store.  To guarantee independent buckets per mount point (e.g., different limits for `/api` vs `/admin`), use distinct `config` values.
 
+### Built-in: ETag / conditional requests
+
+`zax.etag(comptime Ctx: type, comptime config: zax.Etag)` returns a global
+middleware that adds an `ETag` to buffered `200` GET/HEAD responses and answers
+matching `If-None-Match` requests with `304 Not Modified`.  Register it with
+`app.use`:
+
+```zig
+const App = zax.App(*const Db);
+
+var app = try App.init(init.gpa, &db, .{});
+try app.use(zax.etag(App.Context, .{}));
+```
+
+**`zax.Etag` config fields** (all comptime, all have defaults):
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `weak` | `bool` | `false` | Emit a weak validator `W/"…"` instead of a strong `"…"` |
+
+**Behavior:**
+
+- **Tagged responses:** only buffered `200 OK` replies to `GET` or `HEAD`
+  requests receive an `ETag` header.  Streaming responses
+  (`streamer`/`pull_streamer`), WebSocket upgrades, non-`200` status codes, and
+  unsafe methods (e.g. `POST`, `PUT`, `DELETE`) pass through untouched — no
+  `ETag` is added and `If-None-Match` is never consulted.
+- **Content hash:** the ETag value is a 16-hex-digit Wyhash of the response body
+  (e.g. `"a3f2c8e1b047d95e"`).  Set `weak = true` to prefix it with `W/` for a
+  weak validator.
+- **If-None-Match → 304:** the header is evaluated using RFC 7232 weak
+  comparison — the `W/` prefix is stripped before comparing opaque tags — so a
+  strong `"abc"` matches a weak `W/"abc"` and vice versa.  The wildcard `*`
+  matches any tag.  Comma-separated lists are supported.  On a match the
+  middleware returns `304 Not Modified` with an empty body; the `etag`,
+  `cache-control`, and `vary` headers from the original response are preserved
+  on the 304.
+- **Handler-set ETag respected:** if the handler already set an `etag` response
+  header, that value is used for both the `ETag` response header and the
+  `If-None-Match` comparison — the body is not re-hashed.
+- **Registration order:** register `etag` **before** `compress` so the hash
+  covers the compressed bytes.  (`compress` sets `Vary: Accept-Encoding`,
+  ensuring each encoding gets its own cache entry.)
+- **Zero heap:** all allocations use the per-request arena — no additional heap
+  usage.
+
 ## Observability
 
 `app.observe(obs)` registers an `zax.Observer` that fires after every routed
