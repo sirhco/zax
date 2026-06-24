@@ -308,3 +308,71 @@ test "etag: empty body gets etag" {
     try testing.expect(hdr(r, "etag") != null);
     try testing.expectEqual(@as(u16, 200), @intFromEnum(r.status));
 }
+
+// ---------------------------------------------------------------------------
+// Compose-with-compress integration test
+// ---------------------------------------------------------------------------
+
+test "etag+compress: etag is over compressed bytes; 304 on INM match" {
+    // Chain order: [etag, compress]
+    //   etag runs first (outer): calls next.run() → compress runs (inner) → handler.
+    //   On unwind: compress post-processes (gzips the body), then etag post-processes
+    //   (hashes the already-gzipped bytes and sets the ETag header).
+    // This means the ETag covers the compressed representation, which is correct:
+    // Vary: Accept-Encoding is set by compress, so each representation gets its own ETag.
+    // gzip output is deterministic for identical input at a fixed level, so the second
+    // request's freshly-computed ETag matches the captured one, yielding 304.
+
+    const compress_mw = @import("compress.zig").compress;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Highly compressible body, well above compress's min_length (1024).
+    const body = "a" ** 4096;
+
+    const C = middleware.Chain(TestCtx);
+    const mws = [_]C.Middleware{
+        etag(TestCtx, .{}),
+        compress_mw(TestCtx, .{}),
+    };
+
+    // Helper: run the 2-mw chain with a fixed handler response.
+    const H = struct {
+        var out: Response = undefined;
+        fn handler(_: *const TestCtx) anyerror!Response {
+            return out;
+        }
+    };
+
+    // --- Allow path: GET with Accept-Encoding: gzip ---
+    H.out = Response.text(body);
+    const req1 = fakeReq(.GET, &.{.{ .name = "Accept-Encoding", .value = "gzip" }});
+    var ctx1 = TestCtx{ .req = &req1, .arena = a };
+    const r1 = try C.run(&mws, &H.handler, &ctx1);
+
+    // compress ran: body should be gzip-encoded
+    try testing.expectEqualStrings("gzip", hdr(r1, "content-encoding").?);
+    // etag ran on the compressed body
+    const tag = hdr(r1, "etag") orelse return error.MissingEtag;
+    try testing.expectEqual(@as(u16, 200), @intFromEnum(r1.status));
+    // Sanity: gzip magic bytes
+    try testing.expect(r1.body.len >= 2 and r1.body[0] == 0x1f and r1.body[1] == 0x8b);
+
+    // --- 304 path: second GET echoes the captured ETag in If-None-Match ---
+    // Same body + same Accept-Encoding → same compressed bytes → same Wyhash → 304.
+    H.out = Response.text(body);
+    const inm_hdr = [_]Header{
+        .{ .name = "Accept-Encoding", .value = "gzip" },
+        .{ .name = "if-none-match", .value = tag },
+    };
+    const req2 = fakeReq(.GET, &inm_hdr);
+    var ctx2 = TestCtx{ .req = &req2, .arena = a };
+    const r2 = try C.run(&mws, &H.handler, &ctx2);
+
+    try testing.expectEqual(@as(u16, 304), @intFromEnum(r2.status));
+    try testing.expectEqualStrings("", r2.body);
+    // ETag is preserved on the 304 response
+    try testing.expectEqualStrings(tag, hdr(r2, "etag").?);
+}
