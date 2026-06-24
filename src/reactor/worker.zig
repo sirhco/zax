@@ -185,14 +185,15 @@ pub const Worker = struct {
         try std.posix.setsockopt(lfd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one));
         try std.posix.setsockopt(lfd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&one));
 
-        // Bind.
-        var sa: std.posix.sockaddr = undefined;
-        const sa_len = ipAddrToSockaddr(addr, &sa);
+        // Bind. Back the sockaddr with `sockaddr.storage` (aligned + sized for
+        // IPv6); a bare `sockaddr` would trap on the alignment cast on Linux.
+        var ss: std.posix.sockaddr.storage = undefined;
+        const sa_len = ipAddrToSockaddr(addr, &ss);
         if (builtin.os.tag == .linux) {
-            const rc = linux.bind(lfd, &sa, sa_len);
+            const rc = linux.bind(lfd, @ptrCast(&ss), sa_len);
             if (linux.errno(rc) != .SUCCESS) return std.posix.unexpectedErrno(linux.errno(rc));
         } else {
-            const rc = std.c.bind(lfd, @ptrCast(&sa), sa_len);
+            const rc = std.c.bind(lfd, @ptrCast(&ss), sa_len);
             if (rc != 0) return std.posix.unexpectedErrno(std.posix.errno(rc));
         }
 
@@ -403,12 +404,14 @@ pub const Worker = struct {
 
     fn acceptLoop(self: *Worker) void {
         while (true) {
-            var sa: std.posix.sockaddr = undefined;
-            var salen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+            // Peer address sink — `sockaddr.storage` so an IPv6 peer fits and
+            // the buffer is correctly aligned (a bare `sockaddr` is 16 B/align 2).
+            var ss: std.posix.sockaddr.storage = undefined;
+            var salen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
             const conn_fd: i32 = if (builtin.os.tag == .linux) blk: {
                 const rc = linux.accept4(
                     @intCast(self.listen_fd),
-                    &sa,
+                    @ptrCast(&ss),
                     &salen,
                     std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
                 );
@@ -427,7 +430,7 @@ pub const Worker = struct {
                 break :blk @as(i32, @intCast(rc));
             } else blk: {
                 // macOS/BSD: no accept4 — use accept + fcntl.
-                const rc = std.c.accept(self.listen_fd, @ptrCast(&sa), &salen);
+                const rc = std.c.accept(self.listen_fd, @ptrCast(&ss), &salen);
                 if (rc < 0) {
                     const e = std.posix.errno(rc);
                     if (e == .AGAIN) break; // EAGAIN == EWOULDBLOCK on Darwin
@@ -897,12 +900,17 @@ const no_deadline: i96 = std.math.maxInt(i96);
 // Address helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a `net.IpAddress` to a `std.posix.sockaddr` for syscall use.
-/// Returns the sockaddr length.
-fn ipAddrToSockaddr(addr: net.IpAddress, out: *std.posix.sockaddr) std.posix.socklen_t {
+/// Convert a `net.IpAddress` into a caller-provided `sockaddr.storage` for
+/// syscall use, returning the sockaddr length. `storage` is used purely as an
+/// aligned (align 8), full-size (128 B) backing buffer — large enough for
+/// `sockaddr.in6` and aligned for the `u32` fields, so the reinterpret casts
+/// below are sound. (A bare `sockaddr` is only 16 B / align 2 — casting it to
+/// `sockaddr.in`/`.in6` traps `incorrect alignment` on Linux and is undersized
+/// for IPv6.)
+fn ipAddrToSockaddr(addr: net.IpAddress, out: *std.posix.sockaddr.storage) std.posix.socklen_t {
     switch (addr) {
         .ip4 => |ip4| {
-            const sa: *std.posix.sockaddr.in = @ptrCast(@alignCast(out));
+            const sa: *std.posix.sockaddr.in = @ptrCast(out);
             sa.* = .{
                 .family = std.posix.AF.INET,
                 // Ip4Address.bytes is in network byte order (big-endian).
@@ -914,7 +922,7 @@ fn ipAddrToSockaddr(addr: net.IpAddress, out: *std.posix.sockaddr) std.posix.soc
             return @sizeOf(std.posix.sockaddr.in);
         },
         .ip6 => |ip6| {
-            const sa: *std.posix.sockaddr.in6 = @ptrCast(@alignCast(out));
+            const sa: *std.posix.sockaddr.in6 = @ptrCast(out);
             sa.* = .{
                 .family = std.posix.AF.INET6,
                 .port = std.mem.nativeToBig(u16, ip6.port),
@@ -933,14 +941,14 @@ fn ipAddrToSockaddr(addr: net.IpAddress, out: *std.posix.sockaddr) std.posix.soc
 
 /// Get the bound port from a listening fd via getsockname.
 fn testGetPort(fd: i32) u16 {
-    var sa: std.posix.sockaddr = undefined;
-    var sa_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    var ss: std.posix.sockaddr.storage = undefined;
+    var sa_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
     if (builtin.os.tag == .linux) {
-        _ = linux.getsockname(@intCast(fd), &sa, &sa_len);
+        _ = linux.getsockname(@intCast(fd), @ptrCast(&ss), &sa_len);
     } else {
-        _ = std.c.getsockname(fd, @ptrCast(&sa), &sa_len);
+        _ = std.c.getsockname(fd, @ptrCast(&ss), &sa_len);
     }
-    const sa_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&sa));
+    const sa_in: *const std.posix.sockaddr.in = @ptrCast(&ss);
     return std.mem.bigToNative(u16, sa_in.port);
 }
 
