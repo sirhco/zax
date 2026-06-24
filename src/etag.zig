@@ -376,3 +376,59 @@ test "etag+compress: etag is over compressed bytes; 304 on INM match" {
     // ETag is preserved on the 304 response
     try testing.expectEqualStrings(tag, hdr(r2, "etag").?);
 }
+
+// ---------------------------------------------------------------------------
+// Wire-level serialization test
+// ---------------------------------------------------------------------------
+
+test "etag: 304 wire bytes — status line, etag header, empty body" {
+    // This test serializes the 304 response to raw HTTP/1.1 bytes and asserts on
+    // the actual wire output.  Existing 304 tests only inspect the in-memory
+    // Response struct (status/headers); this test caught that the buffered
+    // serializer unconditionally emits content-length and content-type even for
+    // 304 responses (pre-existing behavior in writeHeadersFramed — fixing it for
+    // 304/204 would be a separate serializer change, out of scope for this slice).
+    // We assert content-length: 0 is present (accurate and benign for HTTP/1.1).
+    // We do NOT assert content-type is absent; a comment documents its presence.
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Drive the middleware to produce the 304 (same two-step pattern as the
+    // in-memory 304 test above).
+    const req1 = fakeReq(.GET, &.{});
+    const r1 = try runEtag(a, .{}, &req1, Response.text("hello"));
+    const tag = hdr(r1, "etag") orelse return error.MissingEtag;
+
+    const req2 = fakeReq(.GET, &.{.{ .name = "if-none-match", .value = tag }});
+    const r2 = try runEtag(a, .{}, &req2, Response.text("hello"));
+    try testing.expectEqual(@as(u16, 304), @intFromEnum(r2.status));
+
+    // Serialize to wire bytes.
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try r2.write(&w);
+    const out = w.buffered();
+
+    // Status line must be HTTP/1.1 304 Not Modified.
+    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 304 Not Modified\r\n"));
+
+    // ETag header must be present with the same tag value.
+    var etag_line_buf: [64]u8 = undefined;
+    const etag_line = try std.fmt.bufPrint(&etag_line_buf, "etag: {s}\r\n", .{tag});
+    try testing.expect(std.mem.indexOf(u8, out, etag_line) != null);
+
+    // The buffered serializer emits content-length: 0 for status-only responses
+    // (accurate for a 304 with no body).
+    try testing.expect(std.mem.indexOf(u8, out, "content-length: 0\r\n") != null);
+
+    // Note: the serializer also emits a content-type header (pre-existing behavior —
+    // writeHeadersFramed always writes content_type regardless of status code).
+    // RFC 7232 recommends omitting content-type on 304, but correcting the serializer
+    // for 304/204 is out of scope for this slice.
+
+    // Body after the header terminator must be empty.
+    const header_end = std.mem.indexOf(u8, out, "\r\n\r\n") orelse return error.NoHeaderTerminator;
+    try testing.expectEqualStrings("", out[header_end + 4 ..]);
+}

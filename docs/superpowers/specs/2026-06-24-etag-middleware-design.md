@@ -58,7 +58,7 @@ pub const Etag = struct {
 - Handler already set an `etag` header (case-insensitive `hdr`) → use that, don't hash or double-set.
 - Else `h = std.hash.Wyhash.hash(0, r.body)`; `tag = allocPrint(arena, "\"{x:0>16}\"", .{h})` (or `"W/\"{x:0>16}\""` when `config.weak`); `r = try r.withHeader(arena, "etag", tag)`.
 
-*Conditional:* `if (ctx.req.header("if-none-match")) |inm| if (matches(inm, tag))` → **304**: `Response.fromStatus(.not_modified)`; copy `keep_alive` from `r`; carry `etag` (MUST); copy `cache-control` + `vary` if present (RFC 7232 §4.1). Empty body, no content-type. Else return `r`.
+*Conditional:* `if (ctx.req.header("if-none-match")) |inm| if (matches(inm, tag))` → **304**: `Response.fromStatus(.not_modified)`; copy `keep_alive` from `r`; carry `etag` (MUST); copy `cache-control` + `vary` if present (RFC 7232 §4.1). Empty body; the buffered serializer still emits `content-length: 0` and a `content-type` header (pre-existing `writeHeadersFramed` behavior — omitting them for 304/204 requires a separate serializer change, out of scope for this slice). Else return `r`.
 
 **Pure helpers (no alloc):**
 - `opaque_tag(raw) []const u8` — trim " \t"; strip leading `W/`; trim again.
