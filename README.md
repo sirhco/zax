@@ -88,6 +88,8 @@ extractor must come last** (enforced at compile time).
 | `Multipart` | parse `multipart/form-data` request bodies (file uploads) → a zero-copy parts list; `mp.field(name)` (text), `mp.file(name)` (file), `mp.part(name)` (either); must be last |
 | `Headers` | access all request headers — `.get(name)` (first match, case-insensitive), `.has(name)`, `.getAll(arena, name)` (all matches), `.all()`, `.count()` |
 | `Files` | serve files: `files.file(path)` / `files.dir(root, requested)` (traversal-safe) |
+| `RequestId` | the request's correlation id (validated incoming `X-Request-Id` or generated) — opt-in via `Options.request_id`; see [Request IDs](#request-ids) |
+| `WebSocket` | upgrade a connection to WebSocket via `.onUpgrade(handler)`; see [WebSocket](#websocket) |
 
 Handlers return anything that satisfies `IntoResponse`: a `Response`, a `Status`,
 a byte-string, or a custom type with `pub fn intoResponse(self) Response`. A

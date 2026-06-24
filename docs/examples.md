@@ -89,6 +89,41 @@ cd examples/websocket-live && zig build run -- evented  # evented backend
 
 Key file: [`src/main.zig`](../examples/websocket-live/src/main.zig).
 
+## Built-in middleware
+
+zax ships four comptime-configured middleware. Each is a factory `zax.x(Ctx, config)` returning a
+`Chain(Ctx).Middleware`, registered globally with `app.use` (or per-route with `getWith`/`group`).
+Config is comptime; all fields have defaults, so `.{}` is valid. Full config tables are in the
+[README Middleware section](../README.md#middleware).
+
+```zig
+const Ctx = Api.Context; // your App's Context type
+
+// CORS — Access-Control-* headers + automatic OPTIONS preflight.
+try app.use(zax.cors(Ctx, .{ .origins = .{ .list = &.{"https://app.example.com"} }, .credentials = true }));
+
+// gzip — compress eligible buffered responses (skips small/streamed/non-text/already-encoded).
+try app.use(zax.compress(Ctx, .{ .level = .default }));
+
+// Rate limit — token bucket; 429 + X-RateLimit-* / Retry-After. Keys on x-forwarded-for
+// only when the app trusts proxies (Options.trust_forwarded); else on_missing governs.
+try app.use(zax.rateLimit(Ctx, .{ .capacity = 60, .refill_per_sec = 1.0 }));
+
+// ETag — hash buffered 200 GET/HEAD bodies; If-None-Match → 304. Register BEFORE compress
+// so the ETag covers the compressed bytes.
+try app.use(zax.etag(Ctx, .{}));
+try app.use(zax.compress(Ctx, .{}));
+```
+
+Notes:
+
+- **Ordering matters.** Middleware post-process in reverse registration order, so `etag` registered
+  before `compress` hashes the compressed representation (compress sets `Vary: Accept-Encoding`,
+  giving each encoding its own cache entry).
+- **Rate-limit keying** needs `Options.trust_forwarded = true` to read `x-forwarded-for`/`x-real-ip`;
+  without it, `on_missing` picks a coarse shared bucket (`.shared`, default) or pass-through (`.bypass`).
+- **ETag** respects a handler-set `etag` (no re-hash) and skips streaming/upgrade/non-200/unsafe-method responses.
+
 ## See also
 
 - [Getting started](getting-started.md) — set up a project from scratch.

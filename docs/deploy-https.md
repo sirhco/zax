@@ -85,6 +85,11 @@ connections upstream.
 - Zax's `X-Forwarded-For` parsing takes the **first hop** as the originating
   client. Ensure your proxy appends (not overwrites) so spoofed values from
   beyond the proxy don't surface; nginx's `$proxy_add_x_forwarded_for` does this.
+- Behind the proxy you still terminate caching/compression in Zax: add
+  `zax.etag(Ctx, .{})` then `zax.compress(Ctx, .{})` (etag before compress) so
+  conditional requests return `304` and responses are gzipped at the origin.
+  Rate limiting (`zax.rateLimit`) keys on the proxied client IP — it relies on
+  `trust_forwarded = true` and the `X-Forwarded-For` first hop above.
 - In-process TLS (a `TlsStream` wrapping `Io.net.Stream`) is a candidate for a
   future Zax version if/when std ships a TLS server, or via an optional C-crypto
   build flag — out of scope today.

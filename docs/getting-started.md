@@ -108,6 +108,9 @@ must be the **last** parameter (enforced at compile time).
 | `Bytes` | raw request body |
 | `Multipart` | parse `multipart/form-data` bodies (file uploads) into a zero-copy parts list — must be last |
 | `Headers` | access all request headers — `.get(name)` (first match, case-insensitive), `.has(name)`, `.getAll(arena, name)` (all matches) |
+| `Files` | serve files: `files.file(path)` / `files.dir(root, requested)` (traversal-safe) |
+| `RequestId` | the request's correlation id (validated `X-Request-Id` or generated) — opt-in via `Options.request_id` |
+| `WebSocket` | upgrade to WebSocket via `.onUpgrade(handler)` |
 
 Handlers return anything `IntoResponse`: a `Response`, a `Status`, a byte-string,
 or a type with `pub fn intoResponse(self) Response`. A returned error → `500`.
@@ -136,6 +139,19 @@ chain, before the handler, in tuple order.
 `app.group(prefix, .{ &mw })` groups routes under a shared prefix and middleware;
 groups nest. `const api = app.group("/api", .{&auth}); try api.get("/users", h);`
 registers `GET /api/users`, running global → group → handler.
+
+### Built-in middleware
+
+zax ships four comptime-configured middleware (each `zax.x(Ctx, config)`, registered with `app.use`):
+
+| Middleware | Purpose |
+|---|---|
+| `zax.cors` | `Access-Control-*` headers + auto-preflight |
+| `zax.compress` | gzip eligible buffered responses |
+| `zax.rateLimit` | token-bucket throttle → `429` + `X-RateLimit-*` |
+| `zax.etag` | `ETag` on buffered `200` GET/HEAD + `If-None-Match` → `304` |
+
+See the [Middleware section of the README](../README.md#middleware) for config fields and behavior. Register `etag` before `compress` so the ETag covers the compressed bytes.
 
 ### Errors
 

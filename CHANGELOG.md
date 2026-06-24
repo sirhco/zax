@@ -6,25 +6,82 @@ All notable changes to zax are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-24
+
 ### Added
 
 - Built-in `etag` middleware (`zax.etag(Ctx, config)`) — post-processes buffered `200` responses to `GET` and `HEAD` requests: computes a Wyhash content hash and sets an `ETag` response header (strong `"<16hex>"` by default; weak `W/"<16hex>"` when `config.weak = true`). If the handler already set an `etag` header that value is used as-is (no re-hash). Evaluates `If-None-Match` using RFC 7232 weak comparison — supports `*` wildcard and comma-separated lists — and, on a match, returns `304 Not Modified` with an empty body, the `etag` header, and any `cache-control`/`vary` headers the handler set. Streaming responses (`streamer`/`pull_streamer`), WebSocket upgrades, non-`200` responses, and requests with unsafe methods (e.g. `POST`) pass through untouched — no `ETag` is added and `If-None-Match` is ignored. Zero heap beyond the request arena. Register `etag` **before** `compress` so the ETag covers the compressed representation (compress sets `Vary: Accept-Encoding`, giving each encoding its own cache entry).
+
+## [0.17.0] - 2026-06-23
+
+### Added
+
 - Built-in `rateLimit` middleware (`zax.rateLimit(Ctx, config)`) — comptime-configured token-bucket throttle; keyed by the first hop of `x-forwarded-for` (or `x-real-ip` fallback) when the app trusts forwarded headers (`trust_forwarded`); when no key is derivable, `on_missing` selects a coarse shared bucket (`.shared`, default) or unconditional pass-through (`.bypass`); on every allowed response emits `x-ratelimit-limit`, `x-ratelimit-remaining`, and `x-ratelimit-reset`; on throttle returns `429 Too Many Requests` with those three headers plus `retry-after`; zero heap — state lives in a comptime-sized static slot table (`max_keys`, default 1024) guarded by an atomic spinlock; when the table is full the lowest-tokens key is evicted; keys longer than `key_max_len` (default 64, covers IPv6) are truncated.
+
+## [docs] - 2026-06-23
+
+Documentation-only release (untagged — no library change).
+
+### Added
+
 - **Example apps + cookbook + README logo** — four runnable example apps (`todo-api` REST/CRUD with mutable state + metrics, `auth-sessions` cookie sessions + guard middleware, `file-upload` multipart + static serving, `websocket-live` WS echo on both backends), a `docs/examples.md` cookbook, a README logo header, and a CI compile-check that builds every example. No library code change.
+
+## [0.16.0] - 2026-06-23
+
+### Added
+
 - **WebSocket fragmentation, control frames, and message cap** — `on_message` now receives whole reassembled messages (continuation frames joined). The framework auto-replies to pings with pongs and performs the RFC 6455 close handshake (no longer raw TCP close). Reassembled messages are bounded by the new `ws_max_message_size` option (default 1 MiB); over-cap → `1009` close, protocol violations → `1002` close. Single-frame messages stay zero-copy. Both backends. WebSocket core protocol is now feature-complete.
-- **Evented WebSocket support** — WebSocket handlers now run on the evented (reactor) backend (`app.serveEvented`) as well as the threaded backend, with the same handler. The reactor performs the handshake non-blocking and drives the handler per readable event; `conn.send` is non-blocking with bounded outbound buffering (drained on writable; closes on overflow).
-- **WebSocket threaded upgrade + handler API** (`zax.WebSocket` extractor, `zax.WsConn`) — second WebSocket slice. A handler takes the `WebSocket` extractor and calls `onUpgrade(cb)`; the server validates the RFC 6455 handshake, sends `101 Switching Protocols` with the computed `Sec-WebSocket-Accept`, and runs a per-connection handler that receives client frames and can send frames back. `conn.send(opcode, payload)` writes one server frame; `conn.state(T)` reaches app state. Non-upgrade requests to a WebSocket route get `426 Upgrade Required`. Single-threaded per connection.
-- **WebSocket protocol primitives** (`zax.ws`) — first WebSocket slice: a pure RFC 6455 codec with no server integration yet. `acceptKey` computes the `Sec-WebSocket-Accept` handshake value; `parseFrame` decodes and unmasks one masked client frame in place (zero-copy payload slice), validating control-frame structure and reporting `Incomplete` for partial buffers; `writeFrame` serializes one unmasked server frame with the minimal 7/16/64-bit length form. Connection upgrade, takeover, fragmentation reassembly, and control-frame semantics follow in later releases.
-- Built-in `compress` middleware (`zax.compress(Ctx, config)`) — comptime-configured gzip compression for buffered responses; skips streaming responses, bodies below `min_length` (default 1024 bytes), clients not advertising `gzip` in `Accept-Encoding`, already-encoded responses, non-text content types, and cases where compression yields no size reduction; sets `Content-Encoding: gzip` and `Vary: Accept-Encoding` on compressed responses. Compression level configurable: `.fastest`, `.default`, `.best`.
-- Built-in `cors` middleware (`zax.cors(Ctx, config)`) — comptime-configured `Access-Control-*` headers; supports wildcard (`.any`) and exact-match allowlist (`.list`) origin policies; reflects the concrete origin with `Vary: Origin` when using `.list` or when `credentials = true`; configurable `methods`, `allow_headers`, `expose_headers`, `credentials`, and `max_age`. Auto-preflight: `OPTIONS` requests are answered with `204` and allow-headers without registering an `OPTIONS` route (dispatch runs the global chain for unrouted OPTIONS preflights).
-- `Headers` extractor — zero-copy, case-insensitive access to every request header via `.get(name)`, `.has(name)`, `.getAll(arena, name)` (all values, arena-allocated slice), `.all()`, and `.count()`.
-- `Multipart` extractor — parse `multipart/form-data` request bodies (file uploads) into a zero-copy list of parts (`mp.field` / `mp.file` / `mp.parts`); bounded by `max_body_size` and a 1024-part cap (malformed → 400, too many parts → 413).
-- `SetCookie` / `Response.withCookie` / `Response.expireCookie` — build and append `Set-Cookie` response headers (RFC 6265); supports `Max-Age`, `Domain`, `Path`, `Secure`, `HttpOnly`, and `SameSite` (`Strict`/`Lax`/`None`); name and value validated at serialize time (invalid name → `error.InvalidCookieName`, invalid value → `error.InvalidCookieValue`); value emitted raw (symmetric with the `Cookies` read extractor).
 
 ### Changed
 
 - **WebSocket `on_message` now delivers whole messages, not raw frames.** Continuation/ping/pong/close frames no longer reach `on_message` (the framework reassembles messages and handles control frames). Handlers that echo `(msg.opcode, msg.payload)` are unaffected.
+
+## [0.15.0] - 2026-06-22
+
+### Added
+
+- **Evented WebSocket support** — WebSocket handlers now run on the evented (reactor) backend (`app.serveEvented`) as well as the threaded backend, with the same handler. The reactor performs the handshake non-blocking and drives the handler per readable event; `conn.send` is non-blocking with bounded outbound buffering (drained on writable; closes on overflow).
+
+### Changed
+
 - **WebSocket handler API unified (breaking).** The blocking `while (conn.read())` loop is replaced by a callback handler: `onUpgrade(.{ .on_message = fn, .on_open = ?fn, .on_close = ?fn })`. `WsConn.read()` is removed; `WsConn` now exposes `send`/`close`/`state`. The same handler runs on both `app.serve` and `app.serveEvented`. (Pre-1.0 API change.)
+
+## [0.14.0] - 2026-06-22
+
+### Added
+
+- **WebSocket threaded upgrade + handler API** (`zax.WebSocket` extractor, `zax.WsConn`) — second WebSocket slice. A handler takes the `WebSocket` extractor and calls `onUpgrade(cb)`; the server validates the RFC 6455 handshake, sends `101 Switching Protocols` with the computed `Sec-WebSocket-Accept`, and runs a per-connection handler that receives client frames and can send frames back. `conn.send(opcode, payload)` writes one server frame; `conn.state(T)` reaches app state. Non-upgrade requests to a WebSocket route get `426 Upgrade Required`. Single-threaded per connection.
+
+## [0.13.0] - 2026-06-22
+
+### Added
+
+- **WebSocket protocol primitives** (`zax.ws`) — first WebSocket slice: a pure RFC 6455 codec with no server integration yet. `acceptKey` computes the `Sec-WebSocket-Accept` handshake value; `parseFrame` decodes and unmasks one masked client frame in place (zero-copy payload slice), validating control-frame structure and reporting `Incomplete` for partial buffers; `writeFrame` serializes one unmasked server frame with the minimal 7/16/64-bit length form. Connection upgrade, takeover, fragmentation reassembly, and control-frame semantics follow in later releases.
+
+## [0.12.0] - 2026-06-22
+
+### Added
+
+- Built-in `compress` middleware (`zax.compress(Ctx, config)`) — comptime-configured gzip compression for buffered responses; skips streaming responses, bodies below `min_length` (default 1024 bytes), clients not advertising `gzip` in `Accept-Encoding`, already-encoded responses, non-text content types, and cases where compression yields no size reduction; sets `Content-Encoding: gzip` and `Vary: Accept-Encoding` on compressed responses. Compression level configurable: `.fastest`, `.default`, `.best`.
+
+## [0.11.0] - 2026-06-21
+
+### Added
+
+- Built-in `cors` middleware (`zax.cors(Ctx, config)`) — comptime-configured `Access-Control-*` headers; supports wildcard (`.any`) and exact-match allowlist (`.list`) origin policies; reflects the concrete origin with `Vary: Origin` when using `.list` or when `credentials = true`; configurable `methods`, `allow_headers`, `expose_headers`, `credentials`, and `max_age`. Auto-preflight: `OPTIONS` requests are answered with `204` and allow-headers without registering an `OPTIONS` route (dispatch runs the global chain for unrouted OPTIONS preflights).
+
+## [0.10.0] - 2026-06-21
+
+### Added
+
+- `SetCookie` / `Response.withCookie` / `Response.expireCookie` — build and append `Set-Cookie` response headers (RFC 6265); supports `Max-Age`, `Domain`, `Path`, `Secure`, `HttpOnly`, and `SameSite` (`Strict`/`Lax`/`None`); name and value validated at serialize time (invalid name → `error.InvalidCookieName`, invalid value → `error.InvalidCookieValue`); value emitted raw (symmetric with the `Cookies` read extractor).
+
+## [0.9.0] - 2026-06-21
+
+### Added
+
+- `Headers` extractor — zero-copy, case-insensitive access to every request header via `.get(name)`, `.has(name)`, `.getAll(arena, name)` (all values, arena-allocated slice), `.all()`, and `.count()`.
+- `Multipart` extractor — parse `multipart/form-data` request bodies (file uploads) into a zero-copy list of parts (`mp.field` / `mp.file` / `mp.parts`); bounded by `max_body_size` and a 1024-part cap (malformed → 400, too many parts → 413).
 
 ## [0.8.2] - 2026-06-21
 
