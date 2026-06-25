@@ -973,6 +973,16 @@ fn setNoDelay(handle: net.Socket.Handle) void {
     ) catch {};
 }
 
+/// Arm a generous `SO_RCVTIMEO` on a TEST client socket so a server that never
+/// responds surfaces as a bounded error instead of an infinite `recv` hang.
+/// The full suite finishes in seconds, so a 30 s ceiling only ever fires on a
+/// genuine stall (e.g. a CI-runner-specific deadlock) — turning a 6-hour CI
+/// hang into a fast, named test failure. Best-effort; test-only.
+fn armRecvTimeout(handle: net.Socket.Handle) void {
+    const tv = std.posix.timeval{ .sec = 30, .usec = 0 };
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
 fn nowNs(io: Io) i96 {
     return Io.Timestamp.now(io, .awake).toNanoseconds();
 }
@@ -1163,6 +1173,7 @@ fn readResp(r: *Io.Reader, out: []u8) []const u8 {
 fn doRequest(io: Io, port: u16, raw: []const u8, resp_buf: []u8) []const u8 {
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var rb: [64 * 1024]u8 = undefined;
     var cr = cs.reader(io, &rb);
@@ -1234,6 +1245,7 @@ test "keep-alive: multiple requests reuse one connection" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);
     var wb: [512]u8 = undefined;
@@ -1278,6 +1290,7 @@ test "keep-alive: Connection: close ends the connection" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);
     var wb: [512]u8 = undefined;
@@ -1312,6 +1325,7 @@ test "keep-alive: chunked request body is decoded and connection reused" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);
@@ -1876,6 +1890,7 @@ test "timeout: slow header (slowloris) returns 408 then closes" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
 
     var wb: [128]u8 = undefined;
@@ -1910,6 +1925,7 @@ test "timeout: idle keep-alive connection is closed after idle_timeout" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
 
     var wb: [128]u8 = undefined;
@@ -2039,6 +2055,7 @@ test "streaming: connection-close streamed body over a real connection" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var wb: [128]u8 = undefined;
     var cw = cs.writer(io, &wb);
@@ -2088,6 +2105,7 @@ test "sse: event stream over a real connection" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var wb: [128]u8 = undefined;
     var cw = cs.writer(io, &wb);
@@ -2742,6 +2760,7 @@ test "streaming: persistent pull-stream uses chunked framing and keeps connectio
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);
@@ -2793,6 +2812,7 @@ test "streaming: persistent push-stream uses chunked framing and keeps connectio
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);
@@ -2865,6 +2885,7 @@ fn sevCloseFd(fd: i32) void {
 
 /// Connect fd to localhost:port (blocking).  Returns false on failure.
 fn sevConnect(fd: i32, port: u16) bool {
+    armRecvTimeout(fd);
     var sa_in = std.posix.sockaddr.in{
         .family = std.posix.AF.INET,
         .port = std.mem.nativeToBig(u16, port),
@@ -3269,6 +3290,7 @@ test "threaded pull-stream backoff: chunk(0) x2 then data completes correctly" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);
@@ -3308,6 +3330,7 @@ test "threaded pull-stream idle cap: truncates without chunked terminator" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);
@@ -3348,6 +3371,7 @@ test "threaded pull-stream repoll_ms=0: no-sleep path still completes" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);
@@ -3557,6 +3581,7 @@ test "end-to-end: websocket upgrade, handshake, and echo" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);
@@ -3633,6 +3658,7 @@ test "end-to-end: websocket fragmentation, ping, and close (threaded)" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);
@@ -3725,6 +3751,7 @@ test "observe: upgrade request is recorded with status 101" {
 
     var caddr: net.IpAddress = .{ .ip4 = .loopback(port) };
     var cs = caddr.connect(io, .{ .mode = .stream }) catch unreachable;
+    armRecvTimeout(cs.socket.handle);
     defer cs.close(io);
     var rb: [4096]u8 = undefined;
     var cr = cs.reader(io, &rb);

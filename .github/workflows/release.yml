@@ -1,0 +1,96 @@
+name: Release
+
+# Tag-triggered build + release pipeline. Push an annotated tag `vX.Y.Z` and this
+# gates on the test suite, cross-compiles the demo server (ReleaseFast) for the
+# common targets, and publishes a GitHub Release whose notes come from the
+# matching `## [X.Y.Z]` section of CHANGELOG.md.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write   # required to create/update Releases
+
+jobs:
+  test:
+    name: test gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test --summary all
+
+  build:
+    name: build (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Build each target on a matching host so libc-linked targets have their
+        # SDK (cross-compiling macOS from Linux needs the macOS SDK; avoid it).
+        include:
+          - os: ubuntu-latest
+            targets: x86_64-linux aarch64-linux
+          - os: macos-latest
+            targets: aarch64-macos x86_64-macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Cross-compile demo (ReleaseFast)
+        run: |
+          set -e
+          mkdir -p dist
+          for t in ${{ matrix.targets }}; do
+            echo "== building $t =="
+            rm -rf zig-out/bin
+            zig build -Dtarget="$t" -Doptimize=ReleaseFast
+            cp zig-out/bin/zax "dist/zax-demo-$t"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Extract changelog notes
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v ver="[$ver]" '
+            $0 ~ "^## \\"ver {grab=1; next}
+            grab && /^## \[/ {exit}
+            grab {print}
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            printf "Release %s.\n" "$GITHUB_REF_NAME" > notes.md
+          fi
+          echo "---- release notes ----"; cat notes.md
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+              --notes-file notes.md --verify-tag dist/*
+          fi
