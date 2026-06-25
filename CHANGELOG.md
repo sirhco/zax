@@ -6,6 +6,20 @@ All notable changes to zax are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-25
+
+### Added
+
+- **Release pipeline** (`.github/workflows/release.yml`) — pushing a `vX.Y.Z` tag gates on the test suite, cross-compiles the demo server (ReleaseFast) for `x86_64`/`aarch64` Linux and macOS (host-matched build matrix), and publishes a GitHub Release whose notes are taken from the matching `## [X.Y.Z]` section of this changelog.
+
+### Fixed
+
+- **Evented backend: `incorrect alignment` panic on 64-bit Linux.** `ipAddrToSockaddr` cast a 16-byte, 2-aligned `std.posix.sockaddr` to `*sockaddr.in`/`.in6` (4-aligned, and `.in6` is 28 bytes); on x86_64-linux this trapped at `bind`/`accept` time. The sockaddr sinks now use an aligned, full-size `sockaddr.storage`. (macOS's layout masked it.)
+
+### Changed
+
+- **CI:** upgraded `mlugg/setup-zig` v1 → v2 (v1's mirror stopped resolving Zig 0.16.0, failing every run), added `timeout-minutes` to jobs, and hardened the concurrent tests against thread-pool starvation (`Io.Threaded` `async_limit = .unlimited`) that deadlocked the suite on low-core CI runners. CI is green on Linux and macOS again.
+
 ## [0.18.0] - 2026-06-24
 
 ### Added
