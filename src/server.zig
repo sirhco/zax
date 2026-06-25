@@ -1185,7 +1185,10 @@ fn doRequest(io: Io, port: u16, raw: []const u8, resp_buf: []u8) []const u8 {
 }
 
 test "end-to-end: routes, extractors, and graceful drain" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1231,7 +1234,10 @@ fn startTestApp(io: Io, app: *TestApp, port: u16) Io.Future(void) {
 }
 
 test "keep-alive: multiple requests reuse one connection" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1276,7 +1282,10 @@ test "keep-alive: multiple requests reuse one connection" {
 }
 
 test "keep-alive: Connection: close ends the connection" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1310,7 +1319,10 @@ test "keep-alive: Connection: close ends the connection" {
 }
 
 test "keep-alive: chunked request body is decoded and connection reused" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1353,7 +1365,10 @@ test "keep-alive: chunked request body is decoded and connection reused" {
 }
 
 test "keep-alive: malformed chunked body is rejected with 400" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1375,7 +1390,10 @@ test "keep-alive: malformed chunked body is rejected with 400" {
 }
 
 test "security: CL+TE request smuggling attempt rejected with 400" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1421,7 +1439,10 @@ test "security: CL+TE request smuggling attempt rejected with 400" {
 }
 
 test "security: duplicate Transfer-Encoding rejected with 400" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1479,7 +1500,10 @@ fn wrapV1(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Response {
 }
 
 test "per-route middleware: scoped to its route + short-circuits" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1509,7 +1533,10 @@ test "per-route middleware: scoped to its route + short-circuits" {
 }
 
 test "per-route middleware: order is global -> route -> handler" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1531,7 +1558,10 @@ test "per-route middleware: order is global -> route -> handler" {
 }
 
 test "per-route middleware: postWith/putWith/deleteWith register the intended method" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1569,7 +1599,10 @@ test "per-route middleware: postWith/putWith/deleteWith register the intended me
 }
 
 test "per-route middleware: empty tuple behaves like a plain route" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1645,7 +1678,10 @@ test "contrast: Json handler does allocate (discriminates the alloc check)" {
 }
 
 test "forwarded: trusted reads X-Forwarded-Proto, untrusted ignores it" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
     var db = Db{ .msg = "" };
@@ -1697,7 +1733,10 @@ fn jsonErrorRenderer(_: anyerror, info: err_mod.ErrorInfo, ctx: *const TestApp.C
 }
 
 test "errors: extractor failures map to 4xx, handler errors to mapped status" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1725,7 +1764,10 @@ test "errors: extractor failures map to 4xx, handler errors to mapped status" {
 }
 
 test "errors: on_error hook renders custom JSON bodies" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1749,7 +1791,10 @@ test "errors: on_error hook renders custom JSON bodies" {
 }
 
 test "errors: 404/405 go through the renderer and 405 carries Allow" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1780,7 +1825,10 @@ test "errors: 404/405 go through the renderer and 405 carries Allow" {
 }
 
 test "middleware: auth short-circuit and post-process header injection" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1833,7 +1881,10 @@ test "msTimeout: 0 disables, n builds a duration" {
 }
 
 test "limits: oversized body returns 413" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1854,7 +1905,10 @@ test "limits: oversized body returns 413" {
 }
 
 test "limits: oversized header block returns 431" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1876,7 +1930,10 @@ test "limits: oversized header block returns 431" {
 }
 
 test "timeout: slow header (slowloris) returns 408 then closes" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1911,7 +1968,10 @@ test "timeout: slow header (slowloris) returns 408 then closes" {
 }
 
 test "timeout: idle keep-alive connection is closed after idle_timeout" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1954,7 +2014,10 @@ fn formCookieHandler(c: Cookies, a: @import("extract/alloc.zig").Alloc, body: Fo
 }
 
 test "input parity: Form + Cookies over a real connection" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -1987,7 +2050,10 @@ fn multipartHandler(a: @import("extract/alloc.zig").Alloc, mp: Multipart) Respon
 }
 
 test "input parity: Multipart over a real connection" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2041,7 +2107,10 @@ fn streamHandler(a: @import("extract/alloc.zig").Alloc) !Response {
 }
 
 test "streaming: connection-close streamed body over a real connection" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2091,7 +2160,10 @@ fn sseHandler(a: @import("extract/alloc.zig").Alloc) !Response {
 }
 
 test "sse: event stream over a real connection" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2136,7 +2208,10 @@ fn serveAsset(p: @import("extract/path.zig").Path(PathRest), files: Files) !Resp
 }
 
 test "files: serve a file and reject traversal over a real connection" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2164,7 +2239,10 @@ test "files: serve a file and reject traversal over a real connection" {
 }
 
 test "responses: redirect over a real connection" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2197,7 +2275,10 @@ fn fallbackTagMw(ctx: *const TestApp.Context, next: *TestApp.Next) anyerror!Resp
 }
 
 test "fallback: custom 404 handler for unmatched routes" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2220,7 +2301,10 @@ test "fallback: custom 404 handler for unmatched routes" {
 }
 
 test "fallback: SPA-style 200 + middleware applies; 405 unaffected" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2266,7 +2350,10 @@ fn obsCapture(ctx: *anyopaque, rec: observe_mod.AccessRecord) void {
 }
 
 test "observe: hook fires for matched and 404 with method/path/status" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2304,7 +2391,10 @@ fn metricsTestHandler(a: @import("extract/alloc.zig").Alloc) !Response {
 }
 
 test "metrics: end-to-end via observer + /metrics handler" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2337,7 +2427,10 @@ fn echoTail(p: Path(struct { path: []const u8 })) Response {
 }
 
 test "wildcard: catch-all captures the path tail end-to-end" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2371,7 +2464,10 @@ test "wildcard: catch-all captures the path tail end-to-end" {
 }
 
 test "group: prefixes routes; non-prefixed path 404s" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
     var db = Db{ .msg = "" };
@@ -2390,7 +2486,10 @@ test "group: prefixes routes; non-prefixed path 404s" {
 }
 
 test "group: group middleware applies in order global -> group -> route -> handler" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
     var db = Db{ .msg = "" };
@@ -2411,7 +2510,10 @@ test "group: group middleware applies in order global -> group -> route -> handl
 }
 
 test "group: nested groups compose prefix and middleware" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
     var db = Db{ .msg = "" };
@@ -2432,7 +2534,10 @@ test "group: nested groups compose prefix and middleware" {
 }
 
 test "group: shared middleware short-circuits group routes only" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
     var db = Db{ .msg = "" };
@@ -2454,7 +2559,10 @@ test "group: shared middleware short-circuits group routes only" {
 }
 
 test "group: non-GET verb registers under the group prefix" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
     var db = Db{ .msg = "" };
@@ -2473,7 +2581,10 @@ test "group: non-GET verb registers under the group prefix" {
 }
 
 test "group: empty pattern registers the group root" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
     var db = Db{ .msg = "" };
@@ -2539,7 +2650,10 @@ test "Options: tcp_nodelay defaults on (opt-out)" {
 }
 
 test "request id: generated, echoed, and exposed to handler" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
     var db = Db{ .msg = "" };
@@ -2568,7 +2682,10 @@ test "request id: generated, echoed, and exposed to handler" {
 }
 
 test "request id: disabled by default -> no header, empty value" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
     var db = Db{ .msg = "" };
@@ -2610,7 +2727,10 @@ fn inFlightHandler(s: State(*InFlightState)) !Response {
 }
 
 test "max_in_flight: cap holds under concurrent load" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2659,7 +2779,10 @@ test "max_in_flight: cap holds under concurrent load" {
 }
 
 test "max_in_flight: default (0) is unbounded — all requests succeed" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2745,7 +2868,10 @@ fn twoChunksPullHandler(a: @import("extract/alloc.zig").Alloc) !Response {
 }
 
 test "streaming: persistent pull-stream uses chunked framing and keeps connection alive" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2797,7 +2923,10 @@ test "streaming: persistent pull-stream uses chunked framing and keeps connectio
 }
 
 test "streaming: persistent push-stream uses chunked framing and keeps connection alive" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -2983,7 +3112,10 @@ test "serveEvented: returns EventedUnsupported on non-Linux" {
     };
     if (reactor_supported) return error.SkipZigTest;
 
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3276,7 +3408,10 @@ fn zeroOnceThenOkHandler(a: @import("extract/alloc.zig").Alloc) !Response {
 }
 
 test "threaded pull-stream backoff: chunk(0) x2 then data completes correctly" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3315,7 +3450,10 @@ test "threaded pull-stream backoff: chunk(0) x2 then data completes correctly" {
 }
 
 test "threaded pull-stream idle cap: truncates without chunked terminator" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3356,7 +3494,10 @@ test "threaded pull-stream idle cap: truncates without chunked terminator" {
 }
 
 test "threaded pull-stream repoll_ms=0: no-sleep path still completes" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3403,7 +3544,10 @@ fn headersGetAllHandler(a: Alloc, h: Headers) !Response {
 }
 
 test "Headers extractor: get() echoes first matching header value" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3424,7 +3568,10 @@ test "Headers extractor: get() echoes first matching header value" {
 }
 
 test "Headers extractor: getAll() counts duplicate headers" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3449,7 +3596,10 @@ fn setCookieHandler(a: Alloc) anyerror!Response {
 }
 
 test "e2e: handler sets a cookie via withCookie" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3470,7 +3620,10 @@ test "e2e: handler sets a cookie via withCookie" {
 }
 
 test "e2e: cors preflight 204 and actual request gets allow-origin" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3500,7 +3653,10 @@ test "e2e: cors preflight 204 and actual request gets allow-origin" {
 }
 
 test "e2e: OPTIONS on GET-only route without CORS still returns 405 with allow header" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3531,7 +3687,10 @@ fn smallHandler() Response {
 }
 
 test "e2e: gzip compresses a large text response when accepted" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3567,7 +3726,10 @@ fn wsEchoHandler(sock: @import("extract/websocket.zig").WebSocket) Response {
 }
 
 test "end-to-end: websocket upgrade, handshake, and echo" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3644,7 +3806,10 @@ test "end-to-end: websocket upgrade, handshake, and echo" {
 }
 
 test "end-to-end: websocket fragmentation, ping, and close (threaded)" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -3734,7 +3899,10 @@ test "end-to-end: websocket fragmentation, ping, and close (threaded)" {
 }
 
 test "observe: upgrade request is recorded with status 101" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
+    // .async_limit = .unlimited: a real thread per concurrent task regardless of
+    // host cores. The default (cpu_count-1) runs excess io.async tasks inline on
+    // the caller, deadlocking high-concurrency tests on low-core CI runners.
+    var threaded = Io.Threaded.init(testing.allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
 
