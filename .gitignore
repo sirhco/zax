@@ -12,3 +12,6 @@ trace-*.log
 # Example app build artifacts
 examples/*/.zig-cache/
 examples/*/zig-out/
+
+# Local-only planning artifacts (spec/plan docs from the dev workflow)
+docs/superpowers/
