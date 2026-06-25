@@ -152,19 +152,8 @@ pub fn build(b: *std.Build) void {
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
-    // Opt-in verbose test runner for diagnosing CI hangs: prints each test name
-    // (unbuffered) before it runs, so a hung test is named in the streamed log.
-    // `zig build test -Dverbose-tests=true`. Default keeps the server-protocol
-    // runner (+ --summary, leak detection).
-    const verbose_tests = b.option(bool, "verbose-tests", "Print each test name as it runs (CI hang diagnosis)") orelse false;
-    const test_runner: ?std.Build.Step.Compile.TestRunner = if (verbose_tests)
-        .{ .path = b.path("test_runner.zig"), .mode = .simple }
-    else
-        null;
-
     const mod_tests = b.addTest(.{
         .root_module = mod,
-        .test_runner = test_runner,
     });
 
     // A run step that will run the test executable.
@@ -175,7 +164,6 @@ pub fn build(b: *std.Build) void {
     // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
-        .test_runner = test_runner,
     });
 
     // A run step that will run the second test executable.

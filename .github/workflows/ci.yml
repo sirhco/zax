@@ -19,11 +19,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      # -Dverbose-tests streams each test name before it runs (custom simple
-      # runner) so a hung test is named in the live log. Diagnostic for the
-      # macOS-runner hang; revert to plain `zig build test --summary all` once
-      # the culprit is fixed.
-      - run: zig build test -Dverbose-tests=true
+      - run: zig build test --summary all
 
   bench-build:
     name: bench build-check
